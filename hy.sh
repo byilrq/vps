@@ -551,7 +551,7 @@ linux_update() {
 menu() {
     clear
     echo "#############################################################"
-    echo -e "#         ${RED}Hysteria 2 一键安装脚本${PLAIN}       #"
+    echo -e "#         ${tianlan}Hysteria 2 一键安装脚本${PLAIN}       #"
     echo "#############################################################"
     echo ""
     echo -e " ${GREEN}1.${PLAIN} ${GREEN}安装 Hysteria 2${PLAIN}"
@@ -564,7 +564,7 @@ menu() {
     echo -e " ${GREEN}7.${PLAIN} 安装&更新 Hysieria 2 内核方式1（官方）"
     echo -e " ${GREEN}8.${PLAIN} 更新 Hysieria 2 内核方式2（脚本）"
     echo -e " ${GREEN}9.${PLAIN} 修改 系统时区为上海"
-    echo -e " ${GREEN}10.${tianlan} 系统更新到最新"   
+    echo -e " ${GREEN}10.${tianlan} 更新系统"   
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
