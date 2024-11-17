@@ -1,7 +1,8 @@
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/hy.sh && bash hy.sh
 
-配置后
+脚本可上传到服务器后root/ hy.sh,同路径下使用bash hy.sh.
 
+配置后
 V2N使用方法：
 
 1.使用自定义配置服务器
