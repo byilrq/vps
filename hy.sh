@@ -503,7 +503,7 @@ update_core1(){
 update_core2(){
     systemctl stop hysteria
     rm -f /usr/local/bin/hysteria
-    wget -N https://raw.githubusercontent.com/byilrq/hy2-install/main/hy2/install_server.sh
+    wget -N https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh
     bash install_server.sh
     rm -f install_server.sh
     green "Hysteria 内核已更新到最新版本！"
