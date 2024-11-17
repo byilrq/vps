@@ -1,5 +1,4 @@
-自用魔改
-系统工具---安装V3
+自用魔改+ 系统大保健工具
 ```shell
 curl -sS -O https://kejilion.pro/kejilion.sh && chmod +x kejilion.sh && ./kejilion.sh
 ```
