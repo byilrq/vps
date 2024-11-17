@@ -6,6 +6,11 @@ RED="\033[31m"
 GREEN="\033[32m"
 YELLOW="\033[33m"
 PLAIN="\033[0m"
+hui='\e[37m'
+lan='\033[34m'
+zi='\033[35m'
+tianlan='\033[96m'
+
 
 red(){
     echo -e "\033[31m\033[01m$1\033[0m"
@@ -518,6 +523,30 @@ showstatus(){
     systemctl status hysteria-server.service
 }
 
+linux_update() {
+	echo -e "${green}正在系统更新...${green}"
+	if command -v dnf &>/dev/null; then
+		dnf -y update
+	elif command -v yum &>/dev/null; then
+		yum -y update
+	elif command -v apt &>/dev/null; then
+		fix_dpkg
+		DEBIAN_FRONTEND=noninteractive apt update -y
+		DEBIAN_FRONTEND=noninteractive apt full-upgrade -y
+	elif command -v apk &>/dev/null; then
+		apk update && apk upgrade
+	elif command -v pacman &>/dev/null; then
+		pacman -Syu --noconfirm
+	elif command -v zypper &>/dev/null; then
+		zypper refresh
+		zypper update
+	elif command -v opkg &>/dev/null; then
+		opkg update
+	else
+		echo "未知的包管理器!"
+		return
+	fi
+}
 
 menu() {
     clear
@@ -535,6 +564,7 @@ menu() {
     echo -e " ${GREEN}7.${PLAIN} 安装&更新 Hysieria 2 内核方式1（官方）"
     echo -e " ${GREEN}8.${PLAIN} 更新 Hysieria 2 内核方式2（脚本）"
     echo -e " ${GREEN}9.${PLAIN} 修改 系统时区为上海"
+    echo -e " ${GREEN}10.${tianlan} 系统更新到最新"   
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -549,6 +579,7 @@ menu() {
         7 ) update_core1 ;;
         8 ) update_core2 ;;
         9 ) change_tz ;;     
+        10 ) linux_update ;;
         * ) exit 1 ;;
     esac
 }
