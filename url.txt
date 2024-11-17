@@ -1,0 +1,18 @@
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/hy.sh && bash hy.sh
+
+配置后
+
+V2N使用方法：
+
+1.使用自定义配置服务器
+2.地址读取yaml文件
+3.core类型选hy2
+4.Socks端口填  yaml文件中的端口；
+
+小火箭：
+地址：IP
+端口填一个  UDP范围内的端口；
+TLS：填www.bing.com
+快速打开：选上
+带宽
+心跳：15
