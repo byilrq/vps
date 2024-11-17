@@ -541,8 +541,8 @@ menu() {
         2 ) unsthysteria ;;
         3 ) hysteriaswitch ;;
         4 ) changeconf ;;
-        5 ) showstatus ;;
-        6 ) showconf ;;
+        5) showconf ;;
+        6 ) showstatus ;;
         7 ) update_core1 ;;
         8 ) update_core2 ;;
         9 ) change_tz ;;     
