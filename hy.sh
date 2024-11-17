@@ -222,10 +222,13 @@ insthysteria(){
     fi
     ${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
 
-    wget -N https://raw.githubusercontent.com/byilrq/hy2-install/main/hy2/install_server.sh
-    bash install_server.sh
-    rm -f install_server.sh
-
+   # wget -N https://raw.githubusercontent.com/byilrq/hy2-install/main/hy2/install_server.sh
+   # bash install_server.sh
+   # rm -f install_server.sh
+   
+    update_core1
+    red "安装使用的是Hysteria 2 官方一键脚本"
+    
     if [[ -f "/usr/local/bin/hysteria" ]]; then
         green "Hysteria 2 安装成功！"
     else
@@ -529,7 +532,7 @@ menu() {
     echo -e " ${GREEN}4.${PLAIN} 修改 Hysteria 2 配置"
     echo -e " ${GREEN}5.${PLAIN} 显示 Hysteria 2 配置文件"
     echo -e " ${GREEN}6.${PLAIN} 查询 Hysieria 2 运行状态"
-    echo -e " ${GREEN}7.${PLAIN} 更新 Hysieria 2 内核方式1（官方）"
+    echo -e " ${GREEN}7.${PLAIN} 安装&更新 Hysieria 2 内核方式1（官方）"
     echo -e " ${GREEN}8.${PLAIN} 更新 Hysieria 2 内核方式2（脚本）"
     echo -e " ${GREEN}9.${PLAIN} 修改 系统时区为上海"
     echo " ---------------------------------------------------"
