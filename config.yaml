@@ -1,0 +1,27 @@
+listen: :443
+
+tls:
+  cert: /etc/hysteria/cert.crt
+  key: /etc/hysteria/private.key
+
+quic:
+  initStreamReceiveWindow: 8388608
+  maxStreamReceiveWindow: 8388608
+  initConnReceiveWindow: 20971520
+  maxConnReceiveWindow: 20971520
+  maxIdleTimeout: 90s 
+  maxIncomingStreams: 1024 
+  disablePathMTUDiscovery: false 
+
+auth:
+  type: password
+  password: e0bf9981f18b9093
+
+speedTest: true
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://maimai.sega.jp
+    rewriteHost: true
+
