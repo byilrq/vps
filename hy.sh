@@ -548,6 +548,60 @@ linux_update() {
 	fi
 }
 
+set_dns_ui() {
+
+
+send_stats "优化DNS"
+while true; do
+	clear
+	echo "优化DNS地址"
+	echo "------------------------"
+	echo "当前DNS地址"
+	cat /etc/resolv.conf
+	echo "------------------------"
+	echo ""
+	echo "1. 国外DNS优化: "
+	echo " v4: 1.1.1.1 8.8.8.8"
+	echo " v6: 2606:4700:4700::1111 2001:4860:4860::8888"
+	echo "2. 国内DNS优化: "
+	echo " v4: 223.5.5.5 183.60.83.19"
+	echo " v6: 2400:3200::1 2400:da00::6666"
+	echo "3. 手动编辑DNS配置"
+	echo "------------------------"
+	echo "0. 返回上一级"
+	echo "------------------------"
+	read -e -p "请输入你的选择: " Limiting
+	case "$Limiting" in
+	  1)
+		local dns1_ipv4="1.1.1.1"
+		local dns2_ipv4="8.8.8.8"
+		local dns1_ipv6="2606:4700:4700::1111"
+		local dns2_ipv6="2001:4860:4860::8888"
+		set_dns
+		send_stats "国外DNS优化"
+		;;
+	  2)
+		local dns1_ipv4="223.5.5.5"
+		local dns2_ipv4="183.60.83.19"
+		local dns1_ipv6="2400:3200::1"
+		local dns2_ipv6="2400:da00::6666"
+		set_dns
+		send_stats "国内DNS优化"
+		;;
+	  3)
+		install nano
+		nano /etc/resolv.conf
+		send_stats "手动编辑DNS配置"
+		;;
+	  *)
+		break
+		;;
+	esac
+done
+
+}
+
+
 menu() {
     clear
     echo "#############################################################"
@@ -565,6 +619,7 @@ menu() {
     echo -e " ${GREEN}8.${PLAIN} 更新 Hysieria 2 内核方式2（脚本）"
     echo -e " ${GREEN}9.${PLAIN} 修改 系统时区为上海"
     echo -e " ${GREEN}10.${tianlan} 更新系统"   
+    echo -e " ${GREEN}11.${tianlan} 更换DNS"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -580,6 +635,7 @@ menu() {
         8 ) update_core2 ;;
         9 ) change_tz ;;     
         10 ) linux_update ;;
+        11 ) set_dns_ui ;;
         * ) exit 1 ;;
     esac
 }
