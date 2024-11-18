@@ -468,12 +468,26 @@ change_tz(){
     timedatectl
 }
 
+generate_random_string() {
+    local length=${1:-16}  # Default length is 16 if not specified
+    local random_string
+    random_string=$(tr -dc '[:alnum:][:punct:]' </dev/urandom | head -c "$length")
+    
+    # Set text color (example: green)
+    local color="\033[1;32m"
+    local reset="\033[0m"
+    
+    # Print with color
+    echo -e "${color}${random_string}${reset}"
+}
+
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
     echo -e " ${GREEN}1.${PLAIN} 修改端口"
     echo -e " ${GREEN}2.${PLAIN} 修改密码"
     echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
     echo -e " ${GREEN}4.${PLAIN} 修改伪装网站"
+    echo -e " ${GREEN}5.${PLAIN} 产生随机密码"
     echo ""
     read -p " 请选择操作 [1-5]：" confAnswer
     case $confAnswer in
@@ -481,7 +495,7 @@ changeconf(){
         2 ) changepasswd ;;
         3 ) change_cert ;;
         4 ) changeproxysite ;;
-        5 ) change_tz ;;
+        5 ) generate_random_string ;;
         * ) exit 1 ;;
     esac
 }
