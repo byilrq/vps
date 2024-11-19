@@ -198,8 +198,9 @@ inst_jump(){
 }
 
 inst_pwd(){
+    local length=${1:-16}              # Default length is 16 if not specified
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" auth_pwd
-    [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+    [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length")
     yellow "使用在 Hysteria 2 节点的密码为：$auth_pwd"
 }
 
