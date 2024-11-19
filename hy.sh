@@ -199,7 +199,7 @@ inst_jump(){
 
 inst_pwd(){
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" auth_pwd
-    [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c "$length")
+    [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
     yellow "使用在 Hysteria 2 节点的密码为：$auth_pwd"
 }
 
