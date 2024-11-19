@@ -423,7 +423,7 @@ changepasswd(){
     local length=${1:-16}  # Default length is 16 if not specified   
 
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" passwd
-    [[ -z $passwd ]] && passwd=$(tr -dc 'A-Za-z0-9!@$%^&*' </dev/urandom | head -c "$length")
+    [[ -z $passwd ]] && passwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length")
  # 产生的随机密码好用    
     # Print with color
     echo -e "${color}${oldpasswd}${reset}"
