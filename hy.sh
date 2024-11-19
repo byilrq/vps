@@ -428,8 +428,7 @@ changepasswd(){
     # Print with color
     echo -e "${color}${oldpasswd}${reset}"
     sed -i "/password:/s/$oldpasswd/$passwd/" /etc/hysteria/config.yaml
-    #sed -i "1s#$oldpasswd#$passwd#g" /etc/hysteria/config.yaml
-    #sed -i "1s#$oldpasswd#$passwd#g" /root/hy/hy-client.yaml
+    sed -i "/password:/s/$oldpasswd/$passwd/" /root/hy/hy-client.yaml
 
     echo -e "${color}${passwd}${reset}"
     green "Hysteria 2 节点密码已成功修改为：$passwd"
