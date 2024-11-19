@@ -199,7 +199,7 @@ inst_jump(){
 
 inst_pwd(){
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" auth_pwd
-    [[ -z $auth_pwd ]] && auth_pwd=$(date +%s%N | md5sum | cut -c 1-16)
+    [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c "$length")
     yellow "使用在 Hysteria 2 节点的密码为：$auth_pwd"
 }
 
@@ -419,18 +419,22 @@ changepasswd(){
     # Set text color (example: green)
     local color="\033[1;32m"
     local reset="\033[0m"
-    
-    oldpasswd=$(cat /etc/hysteria/config.yaml 2>/dev/null | sed -n 15p | awk '{print $2}')
-    local length=${1:-16}  # Default length is 16 if not specified
+   #  oldpasswd=$(awk '/password:/ {print $2}' /etc/hysteria/config.yaml)
+    oldpasswd=$(cat /etc/hysteria/config.yaml 2>/dev/null | sed -n 18p | awk '{print $2}')
+    local length=${1:-16}  # Default length is 16 if not specified   #  产生16位的随机数
 
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" passwd
     [[ -z $passwd ]] && passwd=$(tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c "$length")
-    
+ # 产生的随机密码好用    
     # Print with color
+    echo -e "${color}${oldpasswd}${reset}"
     echo -e "${color}${passwd}${reset}"
+
     
-    sed -i "1s#$oldpasswd#$passwd#g" /etc/hysteria/config.yaml
-    sed -i "1s#$oldpasswd#$passwd#g" /root/hy/hy-client.yaml
+    sed -i "s/password: $oldpasswd/password: $passwd/" /etc/hysteria/config.yaml
+    sed -i "s/password: $oldpasswd/password: $passwd/" /etc/hysteria/config.yaml
+    #sed -i "1s#$oldpasswd#$passwd#g" /etc/hysteria/config.yaml
+    #sed -i "1s#$oldpasswd#$passwd#g" /root/hy/hy-client.yaml
 
     echo -e "${color}${passwd}${reset}"
     green "Hysteria 2 节点密码已成功修改为：$passwd"
