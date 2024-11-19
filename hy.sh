@@ -198,9 +198,8 @@ inst_jump(){
 }
 
 inst_pwd(){
-    local length=${1:-16}              # Default length is 16 if not specified
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" auth_pwd
-    [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length")
+    [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
     yellow "使用在 Hysteria 2 节点的密码为：$auth_pwd"
 }
 
@@ -415,27 +414,57 @@ changeport(){
     showconf
 }
 
-changepasswd(){
+changepasswd() {
 
-    # Set text color (example: green)
+    # 设置颜色
     local color="\033[1;32m"
     local reset="\033[0m"
-    oldpasswd=$(awk '/password:/ {print $2}' /etc/hysteria/config.yaml)
-    local length=${1:-16}  # Default length is 16 if not specified   
 
+    # 配置文件路径
+    local config_file="/etc/hysteria/config.yaml"
+
+    # 检查配置文件是否存在
+    if [[ ! -f $config_file ]]; then
+        echo -e "${color}配置文件不存在，请检查路径！${reset}" >&2
+        exit 1
+    fi
+
+    # 备份配置文件
+    cp "$config_file" "${config_file}.bak"
+
+    # 提取旧密码
+    oldpasswd=$(awk '/auth:/,/password:/ {if ($1 ~ /password:/) print $2}' "$config_file" | xargs)
+    if [[ -z $oldpasswd ]]; then
+        echo -e "${color}无法提取旧密码，请检查配置文件内容！${reset}" >&2
+        exit 1
+    fi
+
+    # 生成随机密码或获取用户输入
+    local length=${1:-16}  # 默认长度 16
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" passwd
-    [[ -z $passwd ]] && passwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length")
- # 产生的随机密码好用    
-    # Print with color
-    echo -e "${color}${oldpasswd}${reset}"
-    sed -i "/password:/s/$oldpasswd/$passwd/" /etc/hysteria/config.yaml
-    sed -i "/password:/s/$oldpasswd/$passwd/" /root/hy/hy-client.yaml
+    passwd=${passwd:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length")}
 
-    echo -e "${color}${passwd}${reset}"
-    green "Hysteria 2 节点密码已成功修改为：$passwd"
-    yellow "请手动更新客户端配置文件以使用节点"
-    showconf
+    # 输出旧密码和新密码
+    echo -e "${color}旧密码：${oldpasswd}${reset}"
+    echo -e "${color}新密码：${passwd}${reset}"
+
+    # 替换密码字段
+    sed -i "/auth:/,/password:/s/^ *password: .*/  password: $passwd/" "$config_file"
+
+    # 确认替换成功
+    if grep -q "password: $passwd" "$config_file"; then
+        green "Hysteria 2 节点密码已成功修改为：$passwd"
+        yellow "请手动更新客户端配置文件以使用节点"
+    else
+        echo -e "${color}密码更新失败，请检查配置文件！${reset}" >&2
+        exit 1
+    fi
 }
+
+# 辅助函数
+green() { echo -e "\033[1;32m$1\033[0m"; }
+yellow() { echo -e "\033[1;33m$1\033[0m"; }
+
 
 change_cert(){
     old_cert=$(cat /etc/hysteria/config.yaml | grep cert | awk -F " " '{print $2}')
@@ -474,26 +503,12 @@ change_tz(){
     timedatectl
 }
 
-generate_random_string() {
-    local length=${1:-16}  # Default length is 16 if not specified
-    local random_string
-    random_string=$(tr -dc '[:alnum:][:punct:]' </dev/urandom | head -c "$length")
-    
-    # Set text color (example: green)
-    local color="\033[1;32m"
-    local reset="\033[0m"
-    
-    # Print with color
-    echo -e "${color}${random_string}${reset}"
-}
-
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
     echo -e " ${GREEN}1.${PLAIN} 修改端口"
     echo -e " ${GREEN}2.${PLAIN} 修改密码"
     echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
     echo -e " ${GREEN}4.${PLAIN} 修改伪装网站"
-    echo -e " ${GREEN}5.${PLAIN} 产生随机密码"
     echo ""
     read -p " 请选择操作 [1-5]：" confAnswer
     case $confAnswer in
@@ -501,7 +516,7 @@ changeconf(){
         2 ) changepasswd ;;
         3 ) change_cert ;;
         4 ) changeproxysite ;;
-        5 ) generate_random_string ;;
+        5 ) change_tz ;;
         * ) exit 1 ;;
     esac
 }
