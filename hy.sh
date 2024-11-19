@@ -422,19 +422,17 @@ changepasswd(){
     
     oldpasswd=$(cat /etc/hysteria/config.yaml 2>/dev/null | sed -n 15p | awk '{print $2}')
     local length=${1:-16}  # Default length is 16 if not specified
-    local random_string
 
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" passwd
-    [[ -z $passwd ]] && passwd=$(tr -dc '[:alnum:][:punct:]' </dev/urandom | head -c "$length")
+    [[ -z $passwd ]] && passwd=$(tr -dc 'A-Za-z0-9!@#$%^&*' </dev/urandom | head -c "$length")
     
     # Print with color
     echo -e "${color}${passwd}${reset}"
     
     sed -i "1s#$oldpasswd#$passwd#g" /etc/hysteria/config.yaml
     sed -i "1s#$oldpasswd#$passwd#g" /root/hy/hy-client.yaml
-    sed -i "3s#$oldpasswd#$passwd#g" /root/hy/hy-client.json
 
-    echo -e "${color}${random_string}${reset}"
+    echo -e "${color}${passwd}${reset}"
     green "Hysteria 2 节点密码已成功修改为：$passwd"
     yellow "请手动更新客户端配置文件以使用节点"
     showconf
