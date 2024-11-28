@@ -227,13 +227,10 @@ insthysteria(){
     fi
     ${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
 
-   # wget -N https://raw.githubusercontent.com/byilrq/hy2-install/main/hy2/install_server.sh
-   # bash install_server.sh
-   # rm -f install_server.sh
-   
-    update_core1
-    red "安装使用的是Hysteria 2 官方一键脚本"
-    
+    wget -N https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh
+    bash install_server.sh
+    rm -f install_server.sh
+      
     if [[ -f "/usr/local/bin/hysteria" ]]; then
         green "Hysteria 2 安装成功！"
     else
@@ -509,6 +506,8 @@ changeconf(){
     echo -e " ${GREEN}2.${PLAIN} 修改密码"
     echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
     echo -e " ${GREEN}4.${PLAIN} 修改伪装网站"
+    echo -e " ${GREEN}5.${PLAIN} 修改时区"
+    echo -e " ${GREEN}6.${PLAIN} 修改DNS"
     echo ""
     read -p " 请选择操作 [1-5]：" confAnswer
     case $confAnswer in
@@ -517,6 +516,7 @@ changeconf(){
         3 ) change_cert ;;
         4 ) changeproxysite ;;
         5 ) change_tz ;;
+        6 ) set_dns_ui ;;
         * ) exit 1 ;;
     esac
 }
@@ -583,6 +583,220 @@ linux_update() {
 	fi
 }
 
+swap_cache() {
+    echo "=== 硬盘缓存设置工具 ==="
+
+    # 检查是否是 root 用户
+    if [ "$EUID" -ne 0 ]; then
+        echo "错误：请以 root 权限运行此脚本。"
+        exit 1
+    fi
+
+    # 检测当前的 Swap 配置
+    echo "检测当前 Swap 缓存配置..."
+    current_swap=$(free -m | awk '/Swap:/ {print $2}')
+    echo "当前 Swap 缓存大小为：${current_swap} MB"
+    echo ""
+
+    # 获取用户输入的缓存大小
+    read -p "请输入要设置的 Swap 缓存大小（单位：MB，建议值 >= 512）： " size_mb
+
+    # 验证输入是否为正整数
+    if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [ "$size_mb" -lt 1 ]; then
+        echo "错误：请输入有效的正整数（单位：MB）。"
+        exit 1
+    fi
+
+    # 确认用户输入
+    echo "准备设置 Swap 缓存大小为 ${size_mb} MB..."
+    read -p "是否继续操作？(y/n): " confirm
+    if [[ "$confirm" != "y" ]]; then
+        echo "操作已取消。"
+        exit 0
+    fi
+
+    # 停用现有的 Swap 文件（如果存在）
+    if swapon --show | grep -q "/swapfile"; then
+        echo "检测到现有 Swap 文件，正在停用..."
+        swapoff /swapfile
+        echo "已停用现有 Swap 文件。"
+        echo "正在删除旧的 Swap 文件..."
+        rm -f /swapfile
+    fi
+
+    # 创建新的 Swap 文件
+    echo "正在创建新的 Swap 文件 (${size_mb} MB)..."
+    fallocate -l "${size_mb}M" /swapfile
+    if [ $? -ne 0 ]; then
+        echo "错误：无法创建 Swap 文件，请检查磁盘空间或权限。"
+        exit 1
+    fi
+
+    # 设置权限和格式化
+    chmod 600 /swapfile
+    echo "正在格式化 Swap 文件..."
+    mkswap /swapfile
+
+    # 启用新的 Swap
+    echo "正在启用 Swap 文件..."
+    swapon /swapfile
+
+    # 更新 /etc/fstab 以支持开机自动挂载
+    if ! grep -q "^/swapfile" /etc/fstab; then
+        echo "正在配置开机自动挂载..."
+        echo "/swapfile none swap sw 0 0" >> /etc/fstab
+    fi
+
+    # 显示新的 Swap 配置
+    echo "新的 Swap 文件已启用。当前 Swap 配置："
+    swapon --show
+    free -h
+
+    echo "操作完成！新的 Swap 缓存大小为 ${size_mb} MB。"
+}
+
+besttrace() {
+wget -qO- git.io/besttrace | bash
+}
+
+linux_ps() {
+
+	clear
+
+	local cpu_info=$(lscpu | awk -F': +' '/Model name:/ {print $2; exit}')
+
+	local cpu_usage_percent=$(awk '{u=$2+$4; t=$2+$4+$5; if (NR==1){u1=u; t1=t;} else printf "%.0f\n", (($2+$4-u1) * 100 / (t-t1))}' \
+		<(grep 'cpu ' /proc/stat) <(sleep 1; grep 'cpu ' /proc/stat))
+
+	local cpu_cores=$(nproc)
+
+	local cpu_freq=$(cat /proc/cpuinfo | grep "MHz" | head -n 1 | awk '{printf "%.1f GHz\n", $4/1000}')
+
+	local mem_info=$(free -b | awk 'NR==2{printf "%.2f/%.2f MB (%.2f%%)", $3/1024/1024, $2/1024/1024, $3*100/$2}')
+
+	local disk_info=$(df -h | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}')
+
+	local ipinfo=$(curl -s ipinfo.io)
+	local country=$(echo "$ipinfo" | grep 'country' | awk -F': ' '{print $2}' | tr -d '",')
+	local city=$(echo "$ipinfo" | grep 'city' | awk -F': ' '{print $2}' | tr -d '",')
+	local isp_info=$(echo "$ipinfo" | grep 'org' | awk -F': ' '{print $2}' | tr -d '",')
+
+	local load=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}')
+	local dns_addresses=$(awk '/^nameserver/{printf "%s ", $2} END {print ""}' /etc/resolv.conf)
+
+
+	local cpu_arch=$(uname -m)
+
+	local hostname=$(uname -n)
+
+	local kernel_version=$(uname -r)
+
+	local congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control)
+	local queue_algorithm=$(sysctl -n net.core.default_qdisc)
+
+	local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')
+
+	local current_time=$(date "+%Y-%m-%d %I:%M %p")
+
+
+	local swap_info=$(free -m | awk 'NR==3{used=$3; total=$2; if (total == 0) {percentage=0} else {percentage=used*100/total}; printf "%dMB/%dMB (%d%%)", used, total, percentage}')
+
+	local runtime=$(cat /proc/uptime | awk -F. '{run_days=int($1 / 86400);run_hours=int(($1 % 86400) / 3600);run_minutes=int(($1 % 3600) / 60); if (run_days > 0) printf("%d天 ", run_days); if (run_hours > 0) printf("%d时 ", run_hours); printf("%d分\n", run_minutes)}')
+
+
+	echo ""
+	echo -e "系统信息查询"
+	echo -e "${tianlan}-------------"
+	echo -e "${tianlan}主机名:       ${hui}$hostname"
+	echo -e "${tianlan}系统版本:     ${hui}$os_info"
+	echo -e "${tianlan}Linux版本:    ${hui}$kernel_version"
+	echo -e "${tianlan}-------------"
+	echo -e "${tianlan}CPU架构:      ${hui}$cpu_arch"
+	echo -e "${tianlan}CPU型号:      ${hui}$cpu_info"
+	echo -e "${tianlan}CPU核心数:    ${hui}$cpu_cores"
+	echo -e "${tianlan}CPU频率:      ${hui}$cpu_freq"
+	echo -e "${tianlan}-------------"
+	echo -e "${tianlan}CPU占用:      ${hui}$cpu_usage_percent%"
+	echo -e "${tianlan}系统负载:     ${hui}$load"
+	echo -e "${tianlan}物理内存:     ${hui}$mem_info"
+	echo -e "${tianlan}虚拟内存:     ${hui}$swap_info"
+	echo -e "${tianlan}硬盘占用:     ${hui}$disk_info"
+	echo -e "${tianlan}-------------"
+	echo -e "${tianlan}$output"
+	echo -e "${tianlan}-------------"
+	echo -e "${tianlan}网络算法:     ${hui}$congestion_algorithm $queue_algorithm"
+	echo -e "${tianlan}-------------"
+	echo -e "${tianlan}运营商:       ${hui}$isp_info"
+	if [ -n "$ipv4_address" ]; then
+		echo -e "${tianlan}IPv4地址:     ${hui}$ipv4_address"
+	fi
+
+	if [ -n "$ipv6_address" ]; then
+		echo -e "${tianlan}IPv6地址:     ${hui}$ipv6_address"
+	fi
+	echo -e "${tianlan}DNS地址:      ${hui}$dns_addresses"
+	echo -e "${tianlan}地理位置:     ${hui}$country $city"
+	echo -e "${tianlan}系统时间:     ${hui}$timezone $current_time"
+	echo -e "${tianlan}-------------"
+	echo -e "${tianlan}运行时长:     ${hui}$runtime"
+	echo
+
+
+
+}
+
+set_dns_ui() {
+root_use
+send_stats "优化DNS"
+while true; do
+	clear
+	echo "优化DNS地址"
+	echo "------------------------"
+	echo "当前DNS地址"
+	cat /etc/resolv.conf
+	echo "------------------------"
+	echo ""
+	echo "1. 国外DNS优化: "
+	echo " v4: 1.1.1.1 8.8.8.8"
+	echo " v6: 2606:4700:4700::1111 2001:4860:4860::8888"
+	echo "2. 国内DNS优化: "
+	echo " v4: 223.5.5.5 183.60.83.19"
+	echo " v6: 2400:3200::1 2400:da00::6666"
+	echo "3. 手动编辑DNS配置"
+	echo "------------------------"
+	echo "0. 返回上一级"
+	echo "------------------------"
+	read -e -p "请输入你的选择: " Limiting
+	case "$Limiting" in
+	  1)
+		local dns1_ipv4="1.1.1.1"
+		local dns2_ipv4="8.8.8.8"
+		local dns1_ipv6="2606:4700:4700::1111"
+		local dns2_ipv6="2001:4860:4860::8888"
+		set_dns
+		send_stats "国外DNS优化"
+		;;
+	  2)
+		local dns1_ipv4="223.5.5.5"
+		local dns2_ipv4="183.60.83.19"
+		local dns1_ipv6="2400:3200::1"
+		local dns2_ipv6="2400:da00::6666"
+		set_dns
+		send_stats "国内DNS优化"
+		;;
+	  3)
+		install nano
+		nano /etc/resolv.conf
+		send_stats "手动编辑DNS配置"
+		;;
+	  *)
+		break
+		;;
+	esac
+done
+
+}
+
 
 menu() {
     clear
@@ -601,7 +815,9 @@ menu() {
     echo -e " ${GREEN}8.${PLAIN} 更新 Hysieria 2 内核方式2（脚本）"
     echo -e " ${GREEN}9.${PLAIN} 修改 系统时区为上海"
     echo -e " ${GREEN}10.${tianlan} 更新系统"   
-    echo -e " ${GREEN}11.${tianlan} 更换DNS"  
+    echo -e " ${GREEN}11.${tianlan} 测三网回程"  
+    echo -e " ${GREEN}12.${tianlan} 设置缓存"  
+    echo -e " ${GREEN}13.${tianlan} 系统查询"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -617,7 +833,9 @@ menu() {
         8 ) update_core2 ;;
         9 ) change_tz ;;     
         10 ) linux_update ;;
-        11 ) set_dns_ui ;;
+        11 ) besttrace ;;
+        12) swap_cache;;
+        13)  linux_ps;;
         * ) exit 1 ;;
     esac
 }
