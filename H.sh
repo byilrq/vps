@@ -508,6 +508,7 @@ changeconf(){
     echo -e " ${GREEN}4.${PLAIN} 修改伪装网站"
     echo -e " ${GREEN}5.${PLAIN} 修改时区"
     echo -e " ${GREEN}6.${PLAIN} 修改DNS"
+    echo -e " ${GREEN}7.${tianlan} 设置缓存"  
     echo ""
     read -p " 请选择操作 [1-5]：" confAnswer
     case $confAnswer in
@@ -517,9 +518,11 @@ changeconf(){
         4 ) changeproxysite ;;
         5 ) change_tz ;;
         6 ) set_dns_ui ;;
+        7 ) swap_cache ;;
         * ) exit 1 ;;
     esac
 }
+
 
 showconf(){
     yellow "Hysteria 2 服务端 YAML 配置文件 config.yaml 内容如下，并保存到 /etc/hysteria/config.yaml"
@@ -798,26 +801,154 @@ done
 }
 
 
+bbrv3() {
+		  root_use
+		  send_stats "bbrv3管理"
+
+		  local cpu_arch=$(uname -m)
+		  if [ "$cpu_arch" = "aarch64" ]; then
+			bash <(curl -sL jhb.ovh/jb/bbrv3arm.sh)
+			break_end
+			linux_Settings
+		  fi
+
+		  if dpkg -l | grep -q 'linux-xanmod'; then
+			while true; do
+				  clear
+				  local kernel_version=$(uname -r)
+				  echo "您已安装xanmod的BBRv3内核"
+				  echo "当前内核版本: $kernel_version"
+
+				  echo ""
+				  echo "内核管理"
+				  echo "------------------------"
+				  echo "1. 更新BBRv3内核              2. 卸载BBRv3内核"
+				  echo "------------------------"
+				  echo "0. 返回上一级选单"
+				  echo "------------------------"
+				  read -e -p "请输入你的选择: " sub_choice
+
+				  case $sub_choice in
+					  1)
+						apt purge -y 'linux-*xanmod1*'
+						update-grub
+
+						# wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+						wget -qO - ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+
+						# 步骤3：添加存储库
+						echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
+
+						# version=$(wget -q https://dl.xanmod.org/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
+						local version=$(wget -q ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
+
+						apt update -y
+						apt install -y linux-xanmod-x64v$version
+
+						echo "XanMod内核已更新。重启后生效"
+						rm -f /etc/apt/sources.list.d/xanmod-release.list
+						rm -f check_x86-64_psabi.sh*
+
+						server_reboot
+
+						  ;;
+					  2)
+						apt purge -y 'linux-*xanmod1*'
+						update-grub
+						echo "XanMod内核已卸载。重启后生效"
+						server_reboot
+						  ;;
+					  0)
+						  break  # 跳出循环，退出菜单
+						  ;;
+
+					  *)
+						  break  # 跳出循环，退出菜单
+						  ;;
+
+				  esac
+			done
+		else
+
+		  clear
+		  echo "设置BBR3加速"
+		  echo "------------------------------------------------"
+		  echo "仅支持Debian/Ubuntu"
+		  echo "请备份数据，将为你升级Linux内核开启BBR3"
+		  echo "VPS是512M内存的，请提前添加1G虚拟内存，防止因内存不足失联！"
+		  echo "------------------------------------------------"
+		  read -e -p "确定继续吗？(Y/N): " choice
+
+		  case "$choice" in
+			[Yy])
+			if [ -r /etc/os-release ]; then
+				. /etc/os-release
+				if [ "$ID" != "debian" ] && [ "$ID" != "ubuntu" ]; then
+					echo "当前环境不支持，仅支持Debian和Ubuntu系统"
+					break_end
+					linux_Settings
+				fi
+			else
+				echo "无法确定操作系统类型"
+				break_end
+				linux_Settings
+			fi
+
+			check_swap
+			install wget gnupg
+
+			# wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+			wget -qO - ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+
+			# 步骤3：添加存储库
+			echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
+
+			# version=$(wget -q https://dl.xanmod.org/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
+			local version=$(wget -q ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
+
+			apt update -y
+			apt install -y linux-xanmod-x64v$version
+
+			bbr_on
+
+			echo "XanMod内核安装并BBR3启用成功。重启后生效"
+			rm -f /etc/apt/sources.list.d/xanmod-release.list
+			rm -f check_x86-64_psabi.sh*
+			server_reboot
+
+			  ;;
+			[Nn])
+			  echo "已取消"
+			  ;;
+			*)
+			  echo "无效的选择，请输入 Y 或 N。"
+			  ;;
+		  esac
+		fi
+
+}
+
+
+
 menu() {
     clear
     echo "#############################################################"
     echo -e "#         ${tianlan}Hysteria 2 一键安装脚本${PLAIN}       #"
     echo "#############################################################"
     echo ""
-    echo -e " ${GREEN}1.${PLAIN} ${GREEN}安装 Hysteria 2${PLAIN}"
+    echo -e " ${GREEN}1.${tianlan} ${GREEN}安装 Hysteria 2${PLAIN}"
     echo -e " ${GREEN}2.${PLAIN} ${RED}卸载 Hysteria 2${PLAIN}"
     echo " ---------------------------------------------------"
-    echo -e " ${GREEN}3.${PLAIN} 关闭、开启、重启 Hysteria 2"
-    echo -e " ${GREEN}4.${PLAIN} 修改 Hysteria 2 配置"
-    echo -e " ${GREEN}5.${PLAIN} 显示 Hysteria 2 配置文件"
-    echo -e " ${GREEN}6.${PLAIN} 查询 Hysieria 2 运行状态"
-    echo -e " ${GREEN}7.${PLAIN} 安装&更新 Hysieria 2 内核方式1（官方）"
-    echo -e " ${GREEN}8.${PLAIN} 更新 Hysieria 2 内核方式2（脚本）"
-    echo -e " ${GREEN}9.${PLAIN} 修改 系统时区为上海"
-    echo -e " ${GREEN}10.${tianlan} 更新系统"   
-    echo -e " ${GREEN}11.${tianlan} 测三网回程"  
-    echo -e " ${GREEN}12.${tianlan} 设置缓存"  
-    echo -e " ${GREEN}13.${tianlan} 系统查询"  
+    echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hysteria 2"
+    echo -e " ${GREEN}4.${tianlan} 修改 Hysteria 2 配置"
+    echo -e " ${GREEN}5.${tianlan} 显示 Hysteria 2 配置文件"
+    echo -e " ${GREEN}6.${tianlan} 查询 Hysieria 2 运行状态"
+    echo -e " ${GREEN}7.${tianlan} 更新内核方式1（官方）"
+    echo -e " ${GREEN}8.${tianlan} 更新内核方式2（脚本）"
+    echo -e " ${GREEN}9.${tianlan} 安装BBR3"   
+    echo -e " ${GREEN}10.${tianlan} 测三网回程"  
+    echo -e " ${GREEN}11.${tianlan} 系统查询"  
+    echo -e " ${GREEN}12.${tianlan} 系统更新"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -831,11 +962,10 @@ menu() {
         6 ) showstatus ;;
         7 ) update_core1 ;;
         8 ) update_core2 ;;
-        9 ) change_tz ;;     
-        10 ) linux_update ;;
-        11 ) besttrace ;;
-        12) swap_cache;;
-        13)  linux_ps;;
+        9 ) bbrv3 ;;
+        10 ) besttrace ;;
+        11)  linux_ps;;
+        12)  linux_update;;
         * ) exit 1 ;;
     esac
 }
