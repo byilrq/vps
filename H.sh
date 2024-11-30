@@ -500,28 +500,7 @@ change_tz(){
     timedatectl
 }
 
-changeconf(){
-    green "Hysteria 2 配置变更选择如下:"
-    echo -e " ${GREEN}1.${PLAIN} 修改端口"
-    echo -e " ${GREEN}2.${PLAIN} 修改密码"
-    echo -e " ${GREEN}3.${PLAIN} 修改证书类型"
-    echo -e " ${GREEN}4.${PLAIN} 修改伪装网站"
-    echo -e " ${GREEN}5.${PLAIN} 修改时区"
-    echo -e " ${GREEN}6.${PLAIN} 修改DNS"
-    echo -e " ${GREEN}7.${tianlan} 设置缓存"  
-    echo ""
-    read -p " 请选择操作 [1-5]：" confAnswer
-    case $confAnswer in
-        1 ) changeport ;;
-        2 ) changepasswd ;;
-        3 ) change_cert ;;
-        4 ) changeproxysite ;;
-        5 ) change_tz ;;
-        6 ) set_dns_ui ;;
-        7 ) swap_cache ;;
-        * ) exit 1 ;;
-    esac
-}
+
 
 
 showconf(){
@@ -536,6 +515,7 @@ showconf(){
 }
 
 update_core1(){
+        green "官方更新方式必须先脚本安装后使用，否则会失败。"        
         systemctl stop hysteria-server.service
         rm -f /usr/local/bin/hysteria
         bash <(curl -fsSL https://get.hy2.sh/)
@@ -547,13 +527,13 @@ update_core1(){
 }
 
 update_core2(){
-    systemctl stop hysteria
+    systemctl stop hysteria-server.service
     rm -f /usr/local/bin/hysteria
     wget -N https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh
     bash install_server.sh
     rm -f install_server.sh
     green "Hysteria 内核已更新到最新版本！"
-    systemctl start hysteria
+    systemctl restart hysteria-server.service
     green "Hysteria 内核已经重新启动"
 }
 
@@ -928,6 +908,84 @@ bbrv3() {
 
 }
 
+# Function to set IPv4/IPv6 priority
+set_ip_priority() {
+    while true; do
+        clear
+        echo "设置v4/v6优先级"
+        echo "------------------------"
+        local ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6)
+
+        if [ "$ipv6_disabled" -eq 1 ]; then
+            echo -e "当前网络优先级设置: ${gl_huang}IPv4${gl_bai} 优先"
+        else
+            echo -e "当前网络优先级设置: ${gl_huang}IPv6${gl_bai} 优先"
+        fi
+        echo ""
+        echo "------------------------"
+        echo "1. IPv4 优先          2. IPv6 优先          3. IPv6 修复工具          0. 退出"
+        echo "------------------------"
+        read -e -p "选择优先的网络: " choice
+
+        case $choice in
+            1)
+                sysctl -w net.ipv6.conf.all.disable_ipv6=1 > /dev/null 2>&1
+                echo "已切换为 IPv4 优先"
+                send_stats "已切换为 IPv4 优先"
+                ;;
+
+            2)
+                sysctl -w net.ipv6.conf.all.disable_ipv6=0 > /dev/null 2>&1
+                echo "已切换为 IPv6 优先"
+                send_stats "已切换为 IPv6 优先"
+                ;;
+
+            3)
+                clear
+                bash <(curl -L -s jhb.ovh/jb/v6.sh)
+                echo "该功能由jhb大神提供，感谢他！"
+                send_stats "IPv6 修复"
+                ;;
+
+            0)
+                echo "退出..."
+                break
+                ;;
+
+            *)
+                echo "无效选择，请重新选择。"
+                ;;
+        esac
+    done
+}
+
+
+changeconf(){
+    green "Hysteria 2 配置变更选择如下:"
+    echo -e " ${GREEN}1.${tianlan} 修改端口"
+    echo -e " ${GREEN}2.${tianlan} 修改密码"
+    echo -e " ${GREEN}3.${tianlan} 修改证书类型"
+    echo -e " ${GREEN}4.${tianlan} 修改伪装网站"
+    echo -e " ${GREEN}5.${tianlan} 修改时区"
+    echo -e " ${GREEN}6.${tianlan} 修改DNS"
+    echo -e " ${GREEN}7.${tianlan} 设置缓存" 
+    echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级" 
+    echo -e " ${GREEN}9.${tianlan} 安装BBR3"   
+    echo ""
+    read -p " 请选择操作 [1-5]：" confAnswer
+    case $confAnswer in
+        1 ) changeport ;;
+        2 ) changepasswd ;;
+        3 ) change_cert ;;
+        4 ) changeproxysite ;;
+        5 ) change_tz ;;
+        6 ) set_dns_ui ;;
+        7 ) swap_cache ;;
+        8 ) set_ip_priority ;;
+        9 ) bbrv3 ;;
+        * ) exit 1 ;;
+    esac
+}
 
 
 menu() {
@@ -940,15 +998,14 @@ menu() {
     echo -e " ${GREEN}2.${PLAIN} ${RED}卸载 Hysteria 2${PLAIN}"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hysteria 2"
-    echo -e " ${GREEN}4.${tianlan} 修改 Hysteria 2 配置"
-    echo -e " ${GREEN}5.${tianlan} 显示 Hysteria 2 配置文件"
-    echo -e " ${GREEN}6.${tianlan} 查询 Hysieria 2 运行状态"
+    echo -e " ${GREEN}4.${tianlan} 修改 系统配置"
+    echo -e " ${GREEN}5.${tianlan} 显示 配置文件"
+    echo -e " ${GREEN}6.${tianlan} 查询 运行状态"
     echo -e " ${GREEN}7.${tianlan} 更新内核方式1（官方）"
     echo -e " ${GREEN}8.${tianlan} 更新内核方式2（脚本）"
-    echo -e " ${GREEN}9.${tianlan} 安装BBR3"   
-    echo -e " ${GREEN}10.${tianlan} 测三网回程"  
-    echo -e " ${GREEN}11.${tianlan} 系统查询"  
-    echo -e " ${GREEN}12.${tianlan} 系统更新"  
+    echo -e " ${GREEN}9.${tianlan} 回程测试"  
+    echo -e " ${GREEN}10.${tianlan} 系统查询"  
+    echo -e " ${GREEN}11.${tianlan} 系统更新"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -962,10 +1019,9 @@ menu() {
         6 ) showstatus ;;
         7 ) update_core1 ;;
         8 ) update_core2 ;;
-        9 ) bbrv3 ;;
-        10 ) besttrace ;;
-        11)  linux_ps;;
-        12)  linux_update;;
+        9 ) besttrace ;;
+        10)  linux_ps;;
+        11)  linux_update;;
         * ) exit 1 ;;
     esac
 }
