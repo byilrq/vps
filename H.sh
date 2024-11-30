@@ -10,6 +10,10 @@ hui='\e[37m'
 lan='\033[34m'
 zi='\033[35m'
 tianlan='\033[96m'
+skyblue() {
+    echo -e "\033[1;36m$1\033[0m"
+}
+
 
 
 red(){
@@ -456,13 +460,52 @@ changepasswd() {
         echo -e "${color}密码更新失败，请检查配置文件！${reset}" >&2
         exit 1
     fi
+    systemctl restart hysteria-server.service
+    green "新密码已经启用，hy2重启"
+    update_hysteria_link "$oldpasswd" "$passwd"
 }
 
-# 辅助函数
-green() { echo -e "\033[1;32m$1\033[0m"; }
-yellow() { echo -e "\033[1;33m$1\033[0m"; }
+##更新密码后重新打印链接和二维码###
 
+update_hysteria_link() {
+    local oldpasswd=$1
+    local passwd=$2
+    local link_file="/root/hy/ur2.txt"
+    local link
+    local new_link
 
+    # 读取现有的链接
+    link=$(cat "$link_file")
+
+    # 确保链接内容非空
+    if [[ -z "$link" ]]; then
+        echo "Error: Link file is empty."
+        return 1
+    fi
+
+    # 使用 sed 替换旧密码为新密码
+    # 注意：使用不同的分隔符 '#' 避免与密码中的 '/' 等符号冲突
+    new_link=$(echo "$link" | sed "s#\(hysteria2://\)[^@]*@#\1$passwd@#"
+
+    # 如果替换失败，输出错误
+    if [[ "$new_link" == "$link" ]]; then
+        echo "Error: Password replacement failed."
+        return 1
+    fi
+
+    # 将新的链接写入文件
+    echo "$new_link" > "$link_file"
+
+    # 打印替换后的链接
+    skyblue "Hysteria 2 新的链接如下"
+    skyblue "$(cat "$link_file")"
+
+    # 输出二维码
+    skyblue "Hysteria 2 二维码如下"
+    qrencode -o - -t ANSIUTF8 "$new_link"
+}
+
+############################
 change_cert(){
     old_cert=$(cat /etc/hysteria/config.yaml | grep cert | awk -F " " '{print $2}')
     old_key=$(cat /etc/hysteria/config.yaml | grep key | awk -F " " '{print $2}')
