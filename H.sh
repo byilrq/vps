@@ -10,11 +10,12 @@ hui='\e[37m'
 lan='\033[34m'
 zi='\033[35m'
 tianlan='\033[96m'
+
+#定义颜色函数，使用方式如下
+#skyblue "用于在终端中以红色加粗的方式输出文本"
 skyblue() {
     echo -e "\033[1;36m$1\033[0m"
 }
-
-
 
 red(){
     echo -e "\033[31m\033[01m$1\033[0m"
@@ -27,6 +28,11 @@ green(){
 yellow(){
     echo -e "\033[33m\033[01m$1\033[0m"
 }
+## orange "这是橙色加粗的文本"
+orange(){
+    echo -e "\033[38;5;214m\033[01m$1\033[0m"
+}
+
 
 # 判断系统及定义系统安装依赖方式
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora")
@@ -507,16 +513,6 @@ update_hysteria_link() {
     skyblue "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$new_link"
 }
-
-# 需要定义的颜色函数
-green() {
-    echo -e "\033[32m$1\033[0m"
-}
-
-yellow() {
-    echo -e "\033[33m$1\033[0m"
-}
-
 
 ############################
 change_cert(){
