@@ -3,4 +3,4 @@
 
 如果 VPS 与 GitHub Release 连接不畅， 可以手动将 H.sh 传输到root/上进行安装。
 
-安装连接：url
+bbr3安装了效果明显，不要配置带宽设置
