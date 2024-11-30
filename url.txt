@@ -5,7 +5,7 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main
 配置后
 V2N使用方法：
 
-1.使用自定义配置服务器
+1.使用自定义配置服务器https://github.com/byilrq/vps/tree/main
 2.地址读取yaml文件
 3.core类型选hy2
 4.Socks端口填  yaml文件中的端口；
@@ -16,10 +16,8 @@ V2N使用方法：
 TLS：填www.bing.com
 快速打开：选上
 带宽
-心跳：15
+心跳：10
 
-将里面的内容删除，来到我给大家提供的配置文件，这里改成你vps的ip地址，端口我这里是443，带宽速率建议在手机上重新测试一遍，我这里视频演示就按电脑上测的速率写了，密码要和服务器对应，如果你用的是ca证书，这里填入你的域名，insecure为false，如果你是自签证书，这里填入伪装网址，insecure要改成true
-我给大家提供的这个singbox配置文件分流规则是类似v2rayN的绕过大陆模式，如果你有其他分流需求，请自行参考sinbox的官方文档进行配置
-
-https://bulianglin.com/archives/hysteria2.html
+sni: 如果你用的是ca证书，这里填入你的域名,如果你是自签证书，这里填入www.bing.com;(有的协议填伪装域名)
+insecure: 如果你用的是ca证书,insecure为false;如果你是自签证书，insecure要改成true
 
