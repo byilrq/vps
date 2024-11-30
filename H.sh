@@ -466,6 +466,7 @@ changepasswd() {
 }
 
 ##更新密码后重新打印链接和二维码###
+#!/bin/bash
 
 update_hysteria_link() {
     local oldpasswd=$1
@@ -485,7 +486,10 @@ update_hysteria_link() {
 
     # 使用 sed 替换旧密码为新密码
     # 注意：使用不同的分隔符 '#' 避免与密码中的 '/' 等符号冲突
-    new_link=$(echo "$link" | sed "s#\(hysteria2://\)[^@]*@#\1$passwd@#"
+    new_link=$(echo "$link" | sed "s#\(hysteria2://\)[^@]*@#\1$passwd@#")
+
+    # 打印替换后的链接进行调试
+    # echo "New link: '$new_link'"
 
     # 如果替换失败，输出错误
     if [[ "$new_link" == "$link" ]]; then
@@ -496,14 +500,23 @@ update_hysteria_link() {
     # 将新的链接写入文件
     echo "$new_link" > "$link_file"
 
-    # 打印替换后的链接
-    skyblue "Hysteria 2 新的链接如下"
+    # 输出新的链接
     skyblue "$(cat "$link_file")"
 
     # 输出二维码
     skyblue "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$new_link"
 }
+
+# 需要定义的颜色函数
+green() {
+    echo -e "\033[32m$1\033[0m"
+}
+
+yellow() {
+    echo -e "\033[33m$1\033[0m"
+}
+
 
 ############################
 change_cert(){
@@ -555,6 +568,7 @@ showconf(){
     green "$(cat /root/hy/ur2.txt)"
     yellow "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur2.txt)"
+    systemctl restart hysteria-server.service
 }
 
 update_core1(){
