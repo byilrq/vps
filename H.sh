@@ -464,8 +464,6 @@ changepasswd() {
     systemctl restart hysteria-server.service
     green "新密码已经启用，hy2重启"
     update_hysteria_link "$oldpasswd" "$passwd"
-
-    update_hysteria_link
 }
 
 ##更新密码后重新打印链接和二维码###
