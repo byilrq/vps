@@ -328,9 +328,7 @@ transport:
     hopInterval: 15s 
 EOF
   
-    ur1="hysteria2://$auth_pwd@$last_ip:$last_port/?insecure=1&sni=$hy_domain#Misaka-Hysteria2"
     ur2="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
-    echo $ur1 > /root/hy/ur1.txt
     echo $ur2 > /root/hy/ur2.txt
 
     systemctl daemon-reload
@@ -352,7 +350,7 @@ EOF
     yellow "Hysteria 2 分享二维码如下："
     qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur2.txt)"
  }
-/etc/hysteria/config.yaml
+
 
 unsthysteria(){
     systemctl stop hysteria-server.service >/dev/null 2>&1
@@ -559,19 +557,20 @@ change_tz(){
 
 
 
-
+#显示配置文件和链接二维码
 showconf(){
     yellow "Hysteria 2 服务端 YAML 配置文件 config.yaml 内容如下，并保存到 /etc/hysteria/config.yaml"
     green "$(cat /etc/hysteria/config.yaml)"
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下，并保存到 /root/hy/hy-client.yaml"
     green "$(cat /root/hy/hy-client.yaml)"
-    yellow "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur2.txt"
+    skyblue "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur2.txt"
     green "$(cat /root/hy/ur2.txt)"
-    yellow "Hysteria 2 二维码如下"
+    skyblue "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur2.txt)"
     systemctl restart hysteria-server.service
 }
 
+#更新内核方式1
 update_core1(){
         green "官方更新方式必须先脚本安装后使用，否则会失败。"        
         systemctl stop hysteria-server.service
