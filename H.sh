@@ -464,7 +464,7 @@ changepasswd() {
     update_hysteria_link "$oldpasswd" "$passwd"
 }
 
-##更新密码后重新打印链接和二维码###
+##更新密码后重新打印链接和二维码#################################
 #!/bin/bash
 
 update_hysteria_link() {
@@ -517,7 +517,7 @@ yellow() {
 }
 
 
-############################
+###########################################################################################
 change_cert(){
     old_cert=$(cat /etc/hysteria/config.yaml | grep cert | awk -F " " '{print $2}')
     old_key=$(cat /etc/hysteria/config.yaml | grep key | awk -F " " '{print $2}')
@@ -557,20 +557,20 @@ change_tz(){
 
 
 
-#显示配置文件和链接二维码
+#########################################显示配置文件和链接二维码######################################
 showconf(){
     yellow "Hysteria 2 服务端 YAML 配置文件 config.yaml 内容如下，并保存到 /etc/hysteria/config.yaml"
     green "$(cat /etc/hysteria/config.yaml)"
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下，并保存到 /root/hy/hy-client.yaml"
     green "$(cat /root/hy/hy-client.yaml)"
-    skyblue "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur2.txt"
+    skyblue "Hysteria 2 节点分享链接如下"
     green "$(cat /root/hy/ur2.txt)"
     skyblue "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur2.txt)"
     systemctl restart hysteria-server.service
 }
 
-#更新内核方式1
+############################################更新内核方式1
 update_core1(){
         green "官方更新方式必须先脚本安装后使用，否则会失败。"        
         systemctl stop hysteria-server.service
