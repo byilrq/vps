@@ -10,12 +10,12 @@ hui='\e[37m'
 lan='\033[34m'
 zi='\033[35m'
 tianlan='\033[96m'
-
-#定义颜色函数，使用方式如下
-#skyblue "用于在终端中以红色加粗的方式输出文本"
+chen="\033[38;5;214m\033[01m$1\033[0m"
 skyblue() {
     echo -e "\033[1;36m$1\033[0m"
 }
+
+
 
 red(){
     echo -e "\033[31m\033[01m$1\033[0m"
@@ -28,11 +28,6 @@ green(){
 yellow(){
     echo -e "\033[33m\033[01m$1\033[0m"
 }
-## orange "这是橙色加粗的文本"
-orange(){
-    echo -e "\033[38;5;214m\033[01m$1\033[0m"
-}
-
 
 # 判断系统及定义系统安装依赖方式
 REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora")
@@ -469,6 +464,8 @@ changepasswd() {
     systemctl restart hysteria-server.service
     green "新密码已经启用，hy2重启"
     update_hysteria_link "$oldpasswd" "$passwd"
+
+    update_hysteria_link
 }
 
 ##更新密码后重新打印链接和二维码###
@@ -513,6 +510,16 @@ update_hysteria_link() {
     skyblue "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$new_link"
 }
+
+# 需要定义的颜色函数
+green() {
+    echo -e "\033[32m$1\033[0m"
+}
+
+yellow() {
+    echo -e "\033[33m$1\033[0m"
+}
+
 
 ############################
 change_cert(){
@@ -1044,11 +1051,11 @@ changeconf(){
 menu() {
     clear
     echo "#############################################################"
-    echo -e "#         ${tianlan}Hysteria 2 一键安装脚本${PLAIN}       #"
+    echo -e "#         ${tianlan}Hysteria 2 一键安装脚本      #"
     echo "#############################################################"
     echo ""
-    echo -e " ${GREEN}1.${tianlan}安装 Hysteria 2"
-    echo -e " ${GREEN}2.${RED}卸载 Hysteria 2"
+    echo -e " ${GREEN}1.${GREEN}安装 Hysteria 2"
+    echo -e " ${GREEN}2.${zi}卸载 Hysteria 2"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hysteria 2"
     echo -e " ${GREEN}4.${tianlan} 修改 系统配置"
