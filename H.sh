@@ -1037,7 +1037,9 @@ changeconf(){
     echo -e " ${GREEN}7.${tianlan} 设置缓存" 
     echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级" 
     echo -e " ${GREEN}9.${tianlan} 安装BBR3"
-    echo -e " ${GREEN}10.${tianlan} 设置定时重启"   
+    echo -e " ${GREEN}10.${tianlan} 设置定时重启"  
+    echo " ---------------------------------------------------"
+    echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
     read -p " 请选择操作 [1-5]：" confAnswer
     case $confAnswer in
