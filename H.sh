@@ -1017,6 +1017,14 @@ set_ip_priority() {
     done
 }
 
+cron() {
+    wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/mdadm -O /etc/cron.d/mdadm
+    if [ $? -eq 0 ]; then
+        echo "文件下载成功！"
+    else
+        echo "文件下载失败！"
+    fi
+}
 
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
@@ -1028,7 +1036,8 @@ changeconf(){
     echo -e " ${GREEN}6.${tianlan} 修改DNS"
     echo -e " ${GREEN}7.${tianlan} 设置缓存" 
     echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级" 
-    echo -e " ${GREEN}9.${tianlan} 安装BBR3"   
+    echo -e " ${GREEN}9.${tianlan} 安装BBR3"
+    echo -e " ${GREEN}10.${tianlan} 设置定时重启"   
     echo ""
     read -p " 请选择操作 [1-5]：" confAnswer
     case $confAnswer in
@@ -1041,6 +1050,7 @@ changeconf(){
         7 ) swap_cache ;;
         8 ) set_ip_priority ;;
         9 ) bbrv3 ;;
+	10 ) cron ;;
         * ) exit 1 ;;
     esac
 }
