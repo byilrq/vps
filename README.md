@@ -5,6 +5,8 @@
 
 bbr3安装了效果明显，不要配置带宽设置
 
+4837的线路上海电信基本要跑满，跑不满不行。落地点需要近一点。最好就是IIJ。
+
 1. HyperSpeed
 bash <(wget -qO- https://bench.im/hyperspeed)
 
