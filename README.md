@@ -24,3 +24,8 @@ wget -qO- git.io/besttrace | bash
 
 6.三网测速脚本
 bash <(curl -Lso- https://git.io/superspeed_uxh)
+
+7.融合怪
+bash <(curl -sL https://raw.githubusercontent.com/i-abc/Speedtest/main/speedtest.sh)
+大陆电信 IPv4 多线程测速
+大陆电信 IPv4 单线程测速
