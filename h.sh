@@ -952,9 +952,8 @@ bbrv3() {
 			echo "XanMod内核安装并BBR3启用成功。重启后生效"
 			rm -f /etc/apt/sources.list.d/xanmod-release.list
 			rm -f check_x86-64_psabi.sh*
-			reboot
-
-			  ;;
+			
+	                  ;;
 			[Nn])
 			  echo "已取消"
 			  ;;
@@ -1024,6 +1023,8 @@ cron() {
     else
         echo "文件下载失败！"
     fi
+    echo -e "#     ${tianlan}系统重启      #"
+    reboot
 }
 
 changeconf(){
