@@ -1,4 +1,4 @@
-wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/H.sh && bash H.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/h.sh && bash h.sh
 
 脚本可上传到服务器后root/ hy.sh,同路径下使用bash hy.sh.
 
