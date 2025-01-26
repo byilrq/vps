@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# 更新系统
+sudo apt update && sudo apt upgrade -y
+
+# 安装 Nginx
+sudo apt install nginx -y
+
+# 添加 PHP 8.2 PPA
+sudo apt install software-properties-common -y
+sudo add-apt-repository ppa:ondrej/php -y
+sudo apt update
+
+# 安装 PHP 8.2 和常用扩展
+sudo apt install php8.2 php8.2-fpm php8.2-cli php8.2-mysql php8.2-curl php8.2-gd php8.2-mbstring php8.2-xml php8.2-zip -y
+
+# 配置 PHP-FPM
+sudo sed -i 's/;cgi.fix_pathinfo=1/cgi.fix_pathinfo=0/' /etc/php/8.2/fpm/php.ini
+sudo systemctl restart php8.2-fpm
+
+# 配置 Nginx 支持 PHP
+sudo tee /etc/nginx/sites-available/default <<EOF
+server {
+    listen 80 default_server;
+    listen [::]:80 default_server;
+
+    root /var/www/html;
+    index index.php index.html index.htm;
+
+    server_name _;
+
+    location / {
+        try_files \$uri \$uri/ =404;
+    }
+
+    location ~ \.php$ {
+        include snippets/fastcgi-php.conf;
+        fastcgi_pass unix:/var/run/php/php8.2-fpm.sock;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
+        include fastcgi_params;
+    }
+
+    location ~ /\.ht {
+        deny all;
+    }
+}
+EOF
+
+# 测试 Nginx 配置
+sudo nginx -t
+
+# 重启 Nginx
+sudo systemctl restart nginx
+
+# 创建测试 PHP 文件
+echo "<?php phpinfo(); ?>" | sudo tee /var/www/html/index.php
+
+# 设置防火墙允许 HTTP 和 HTTPS
+sudo ufw allow 'Nginx Full'
+
+# 输出完成信息
+echo "Nginx 和 PHP 8.2 安装完成，并且已配置为支持 PHP 网站和反向代理。"
+echo "你可以通过访问 http://your_server_ip/index.php 来测试 PHP 是否正常工作。"
