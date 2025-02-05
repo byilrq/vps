@@ -1027,6 +1027,35 @@ cron() {
     reboot
 }
 
+ssh_port() {
+  local new_port=$1
+
+  # 检查是否传入了端口参数
+  if [ -z "$new_port" ]; then
+    echo "请提供新的端口号"
+    return 1
+  fi
+
+  # 检查是否是 root 用户
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "请使用 root 权限运行此脚本"
+    return 1
+  fi
+
+  # 修改 sshd_config 文件
+  SSH_CONFIG="/etc/ssh/sshd_config"
+  if grep -q "^#Port 22" "$SSH_CONFIG"; then
+    sed -i "s/^#Port 22/Port $new_port/" "$SSH_CONFIG"
+  else
+    sed -i "s/^Port 22/Port $new_port/" "$SSH_CONFIG"
+  fi
+
+  # 重启 SSH 服务
+  systemctl restart ssh
+
+  echo "SSH 端口已经修改为 $new_port"
+}
+
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
     echo -e " ${GREEN}1.${tianlan} 修改端口"
@@ -1039,6 +1068,7 @@ changeconf(){
     echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级" 
     echo -e " ${GREEN}9.${tianlan} 安装BBR3"
     echo -e " ${GREEN}10.${tianlan} 设置定时重启"  
+    echo -e " ${GREEN}11.${tianlan} 修改SSH端口"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -1054,6 +1084,7 @@ changeconf(){
         8 ) set_ip_priority ;;
         9 ) bbrv3 ;;
 	10 ) cron ;;
+ 	11 ) ssh_port ;;
         * ) exit 1 ;;
     esac
 }
