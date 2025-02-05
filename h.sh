@@ -1068,7 +1068,7 @@ changeconf(){
     echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级" 
     echo -e " ${GREEN}9.${tianlan} 安装BBR3"
     echo -e " ${GREEN}10.${tianlan} 设置定时重启"  
-    echo -e " ${GREEN}11.${tianlan} 修改SSH端口"  
+    echo -e " ${GREEN}11.${tianlan} 修改SSH端口2222"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -1084,7 +1084,7 @@ changeconf(){
         8 ) set_ip_priority ;;
         9 ) bbrv3 ;;
 	10 ) cron ;;
- 	11 ) ssh_port ;;
+ 	11 ) ssh_port 2222 ;;
         * ) exit 1 ;;
     esac
 }
