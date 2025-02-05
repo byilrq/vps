@@ -1052,8 +1052,14 @@ ssh_port() {
 
   # 重启 SSH 服务
   systemctl restart ssh
-  echo "SSH 端口已经修改为 $new_port"
+
+  if [ $? -eq 0 ]; then
+    echo "SSH 端口已经修改为 $new_port"
+  else
+    echo "重启 SSH 服务失败，请检查错误日志"
+  fi
 }
+
 
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
@@ -1083,8 +1089,8 @@ changeconf(){
         8 ) set_ip_priority ;;
         9 ) bbrv3 ;;
 	10 ) cron ;;
- 	11 ) ssh_port 2222 ;;
-        * ) exit 1 ;;
+        11 ) ssh_port 2222 ;;  # 修改SSH端口为2222
+        * ) echo "无效选项，退出脚本"; exit 1 ;;
     esac
 }
 
