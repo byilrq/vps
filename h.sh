@@ -1060,7 +1060,13 @@ ssh_port() {
   fi
 }
 
+#IP质量检测
+ipquality() {
+    echo "检查 IP 质量中..."
+    curl -sL https://Check.Place | bash -s - -I
+}
 
+#修改配置
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
     echo -e " ${GREEN}1.${tianlan} 修改端口"
@@ -1111,8 +1117,9 @@ menu() {
     echo -e " ${GREEN}7.${tianlan} 更新内核方式1（官方）"
     echo -e " ${GREEN}8.${tianlan} 更新内核方式2（脚本）"
     echo -e " ${GREEN}9.${tianlan} 回程测试"  
-    echo -e " ${GREEN}10.${tianlan} 系统查询"  
-    echo -e " ${GREEN}11.${tianlan} 系统更新"  
+    echo -e " ${GREEN}10.${tianlan} IP质量检测"  
+    echo -e " ${GREEN}11.${tianlan} 系统查询"  
+    echo -e " ${GREEN}12.${tianlan} 系统更新" 
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -1127,8 +1134,9 @@ menu() {
         7 ) update_core1 ;;
         8 ) update_core2 ;;
         9 ) besttrace ;;
-        10)  linux_ps;;
-        11)  linux_update;;
+        10 ) ipquality ;;
+        11)  linux_ps;;
+        12)  linux_update;;
         * ) exit 1 ;;
     esac
 }
