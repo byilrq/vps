@@ -416,15 +416,20 @@ changeport(){
     showconf
 }
 
+#修改配置密码
+
 changepasswd() {
+
+    # 颜色
     local color="\033[1;32m"
     local reset="\033[0m"
 
+    # 路径
     local config_file="/etc/hysteria/config.yaml"
     local client_file="/root/hy/hy-client.yaml"
     local link_file="/root/hy/ur2.txt"
 
-    # 检查关键文件
+    # 基础检查
     if [[ ! -f $config_file ]]; then
         echo -e "${color}配置文件不存在：$config_file${reset}" >&2
         return 1
@@ -434,7 +439,7 @@ changepasswd() {
         return 1
     fi
     if [[ ! -f $link_file ]]; then
-        echo -e "${color}链接文件不存在：$link_file${reset}" >&2
+        echo -e "${color}分享链接文件不存在：$link_file${reset}" >&2
         return 1
     fi
 
@@ -448,39 +453,45 @@ changepasswd() {
         return 1
     fi
 
-    # 生成新密码
-    local length=${1:-16}
+    # 新密码
+    local length=${1:-16}  # 默认 16 位
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" passwd
     passwd=${passwd:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length")}
 
     echo -e "${color}旧密码：${oldpasswd}${reset}"
     echo -e "${color}新密码：${passwd}${reset}"
 
-    # 1) 更新服务端 config.yaml 的 password
+    # 1) 更新服务端 config.yaml 中的 password 字段
     sed -i "/auth:/,/password:/s/^ *password: .*/  password: $passwd/" "$config_file"
+    if ! grep -q "password: $passwd" "$config_file"; then
+        echo -e "${color}密码写入 ${config_file} 失败，请检查！${reset}" >&2
+        return 1
+    fi
 
-    # 2) 更新客户端 hy-client.yaml 的 auth
+    # 2) 更新客户端 hy-client.yaml 中的 auth 行
     if grep -q "^auth: " "$client_file"; then
         sed -i "s/^auth: .*/auth: $passwd/" "$client_file"
     else
+        # 万一没有 auth 行，就追加一行
         echo "auth: $passwd" >> "$client_file"
     fi
 
-    # 3) 更新分享链接中的密码（只改密码，不动其他任何字符）
+    # 3) 更新分享链接中的密码（只改密码，不动任何端口和参数）
     update_hysteria_link "$oldpasswd" "$passwd" "$link_file"
 
-    # 重启服务
+    # 4) 重启服务
     systemctl restart hysteria-server.service
     if [[ $? -eq 0 ]]; then
-        echo -e "${color}新密码已经启用，Hysteria 2 已重启${reset}"
+        green "新密码已经启用，Hysteria 2 已重启"
     else
-        echo -e "${color}服务重启失败，请检查！${reset}" >&2
+        echo -e "${color}服务重启失败，请手动检查 systemctl status hysteria-server.service${reset}" >&2
         return 1
     fi
 
     green "Hysteria 2 节点密码已成功修改为：$passwd"
-    yellow "showconf 中显示的客户端配置与二维码已同步更新"
+    yellow "showconf 显示的客户端配置和二维码已同步为新密码"
 }
+
 
 
 ##更新密码后重新打印链接和二维码###
@@ -488,37 +499,38 @@ update_hysteria_link() {
     local oldpasswd="$1"
     local newpasswd="$2"
     local link_file="${3:-/root/hy/ur2.txt}"
+    local link
+    local new_link
 
+    # 读取现有链接
     if [[ ! -f "$link_file" ]]; then
         echo "Error: 链接文件不存在：$link_file"
         return 1
     fi
-
-    local link
     link=$(cat "$link_file")
-
     if [[ -z "$link" ]]; then
         echo "Error: 链接文件为空：$link_file"
         return 1
     fi
 
-    # 只替换 hysteria2:// 和 @ 之间的密码，其余全部保持不变
-    local new_link
+    # 只替换 hysteria2:// 和 @ 之间的内容为新密码
+    # 例：hysteria2://旧密码@ → hysteria2://新密码@
     new_link=$(echo "$link" | sed "s#\(hysteria2://\)[^@]*@#\1${newpasswd}@#")
 
-    # 如果替换失败（完全没变化），给个提醒
     if [[ "$new_link" == "$link" ]]; then
-        echo "Warning: 链接中未发现可替换的密码段，可能链接格式不符合预期。"
+        echo "Warning: 链接中未发现可替换的密码段，可能格式不符预期。"
         return 1
     fi
 
+    # 写回文件
     echo "$new_link" > "$link_file"
 
-    # 打印 & QR
+    # 输出新的链接和二维码
     skyblue "$new_link"
     skyblue "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$new_link"
 }
+
 
 
 ############################
