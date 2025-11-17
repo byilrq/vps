@@ -417,107 +417,100 @@ changeport(){
 }
 
 changepasswd() {
-
-    # 设置颜色
     local color="\033[1;32m"
     local reset="\033[0m"
 
-    # 配置文件路径
     local config_file="/etc/hysteria/config.yaml"
+    local client_file="/root/hy/hy-client.yaml"
+    local link_file="/root/hy/ur2.txt"
 
-    # 检查配置文件是否存在
+    # 检查文件是否存在
     if [[ ! -f $config_file ]]; then
-        echo -e "${color}配置文件不存在，请检查路径！${reset}" >&2
-        exit 1
+        echo -e "${color}配置文件不存在：$config_file${reset}" >&2
+        return 1
+    fi
+    if [[ ! -f $client_file ]]; then
+        echo -e "${color}客户端配置不存在：$client_file${reset}" >&2
+        return 1
     fi
 
-    # 备份配置文件
+    # 备份服务端配置
     cp "$config_file" "${config_file}.bak"
 
-    # 提取旧密码
+    # 取旧密码（auth: 到 password: 之间）
     oldpasswd=$(awk '/auth:/,/password:/ {if ($1 ~ /password:/) print $2}' "$config_file" | xargs)
     if [[ -z $oldpasswd ]]; then
-        echo -e "${color}无法提取旧密码，请检查配置文件内容！${reset}" >&2
-        exit 1
+        echo -e "${color}无法提取旧密码，请检查 ${config_file}！${reset}" >&2
+        return 1
     fi
 
-    # 生成随机密码或获取用户输入
-    local length=${1:-16}  # 默认长度 16
+    # 生成新密码
+    local length=${1:-16}
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" passwd
     passwd=${passwd:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c "$length")}
 
-    # 输出旧密码和新密码
     echo -e "${color}旧密码：${oldpasswd}${reset}"
     echo -e "${color}新密码：${passwd}${reset}"
 
-    # 替换密码字段
+    # 1) 更新服务端配置里的 password
     sed -i "/auth:/,/password:/s/^ *password: .*/  password: $passwd/" "$config_file"
 
-    # 确认替换成功
-    if grep -q "password: $passwd" "$config_file"; then
-        green "Hysteria 2 节点密码已成功修改为：$passwd"
-        yellow "请手动更新客户端配置文件以使用节点"
+    # 2) 更新客户端配置里的 auth 行
+    #    原来是：auth: 老密码
+    if grep -q "^auth: " "$client_file"; then
+        sed -i "s/^auth: .*/auth: $passwd/" "$client_file"
     else
-        echo -e "${color}密码更新失败，请检查配置文件！${reset}" >&2
-        exit 1
+        # 万一客户端文件里没有这行，就追加一行
+        echo "auth: $passwd" >> "$client_file"
     fi
+
+    # 3) 根据客户端配置重新生成分享链接和二维码
+    update_hysteria_link "$passwd" "$client_file" "$link_file"
+
+    # 重启服务
     systemctl restart hysteria-server.service
-    green "新密码已经启用，hy2重启"
-    update_hysteria_link "$oldpasswd" "$passwd"
+    if [[ $? -eq 0 ]]; then
+        echo -e "${color}新密码已经启用，Hysteria 2 已重启${reset}"
+    else
+        echo -e "${color}服务重启失败，请检查！${reset}"
+    fi
+
+    green "Hysteria 2 节点密码已成功修改为：$passwd"
+    yellow "showconf 中显示的客户端配置与二维码已同步更新"
 }
+
 
 ##更新密码后重新打印链接和二维码###
-#!/bin/bash
-
 update_hysteria_link() {
-    local oldpasswd=$1
-    local passwd=$2
-    local link_file="/root/hy/ur2.txt"
-    local link
-    local new_link
+    local passwd="$1"
+    local client_file="${2:-/root/hy/hy-client.yaml}"
+    local link_file="${3:-/root/hy/ur2.txt}"
 
-    # 读取现有的链接
-    link=$(cat "$link_file")
-
-    # 确保链接内容非空
-    if [[ -z "$link" ]]; then
-        echo "Error: Link file is empty."
+    # 从客户端配置中读取 server 和 sni
+    if [[ ! -f "$client_file" ]]; then
+        echo "Error: 客户端配置不存在：$client_file"
         return 1
     fi
 
-    # 使用 sed 替换旧密码为新密码
-    # 注意：使用不同的分隔符 '#' 避免与密码中的 '/' 等符号冲突
-    new_link=$(echo "$link" | sed "s#\(hysteria2://\)[^@]*@#\1$passwd@#")
+    local server=$(awk '/^server:/{print $2}' "$client_file")
+    local sni=$(awk '/sni:/{print $2}' "$client_file")
 
-    # 打印替换后的链接进行调试
-    # echo "New link: '$new_link'"
-
-    # 如果替换失败，输出错误
-    if [[ "$new_link" == "$link" ]]; then
-        echo "Error: Password replacement failed."
+    if [[ -z "$server" || -z "$sni" ]]; then
+        echo "Error: 无法从 $client_file 中读取 server 或 sni"
         return 1
     fi
 
-    # 将新的链接写入文件
-    echo "$new_link" > "$link_file"
+    # 构造新链接（格式可以按你原来习惯改）
+    local link="hysteria2://$passwd@$server/?sni=$sni&peer=$server&insecure=1#H"
 
-    # 输出新的链接
-    skyblue "$(cat "$link_file")"
+    # 写入文件
+    echo "$link" > "$link_file"
 
-    # 输出二维码
+    # 打印 & QR
+    skyblue "$link"
     skyblue "Hysteria 2 二维码如下"
-    qrencode -o - -t ANSIUTF8 "$new_link"
+    qrencode -o - -t ANSIUTF8 "$link"
 }
-
-# 需要定义的颜色函数
-green() {
-    echo -e "\033[32m$1\033[0m"
-}
-
-yellow() {
-    echo -e "\033[33m$1\033[0m"
-}
-
 
 ############################
 change_cert(){
