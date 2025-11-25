@@ -851,135 +851,202 @@ while true; do
 done
 
 }
-
-
+# 安装BBRV3
 bbrv3() {
-		  root_use
-		  send_stats "bbrv3管理"
+    clear
+    echo -e "${gl_kjlan}=== 安装 XanMod 内核与 BBR v3 ===${gl_bai}"
+    echo "视频教程: https://www.bilibili.com/video/BV14K421x7BS"
+    echo "------------------------------------------------"
+    echo "支持系统: Debian/Ubuntu (x86_64 & ARM64)"
+    echo -e "${gl_huang}警告: 将升级 Linux 内核，请提前备份重要数据！${gl_bai}"
+    echo "------------------------------------------------"
+    read -e -p "确定继续安装吗？(Y/N): " choice
 
-		  local cpu_arch=$(uname -m)
-		  if [ "$cpu_arch" = "aarch64" ]; then
-			bash <(curl -sL jhb.ovh/jb/bbrv3arm.sh)
-			break_end
-			linux_Settings
-		  fi
+    case "$choice" in
+        [Yy])
+            ;;
+        *)
+            echo "已取消安装"
+            return 1
+            ;;
+    esac
+    
+    # 检测 CPU 架构
+    local cpu_arch=$(uname -m)
+    
+    # ARM 架构特殊处理
+    if [ "$cpu_arch" = "aarch64" ]; then
+        echo -e "${gl_kjlan}检测到 ARM64 架构，使用专用安装脚本${gl_bai}"
 
-		  if dpkg -l | grep -q 'linux-xanmod'; then
-			while true; do
-				  clear
-				  local kernel_version=$(uname -r)
-				  echo "您已安装xanmod的BBRv3内核"
-				  echo "当前内核版本: $kernel_version"
+        install_package curl coreutils || return 1
 
-				  echo ""
-				  echo "内核管理"
-				  echo "------------------------"
-				  echo "1. 更新BBRv3内核              2. 卸载BBRv3内核"
-				  echo "------------------------"
-				  echo "0. 返回上一级选单"
-				  echo "------------------------"
-				  read -e -p "请输入你的选择: " sub_choice
+        local tmp_dir
+        tmp_dir=$(mktemp -d 2>/dev/null)
+        if [ -z "$tmp_dir" ]; then
+            echo -e "${gl_hong}错误: 无法创建临时目录用于下载 ARM64 脚本${gl_bai}"
+            return 1
+        fi
 
-				  case $sub_choice in
-					  1)
-						apt purge -y 'linux-*xanmod1*'
-						update-grub
+        local script_url="https://jhb.ovh/jb/bbrv3arm.sh"
+        local sha256_url="${script_url}.sha256"
+        local sha512_url="${script_url}.sha512"
+        local script_path="${tmp_dir}/bbrv3arm.sh"
+        local sha256_path="${tmp_dir}/bbrv3arm.sh.sha256"
+        local sha512_path="${tmp_dir}/bbrv3arm.sh.sha512"
 
-						# wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
-						wget -qO - ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+        echo "日志: 正在下载 ARM64 安装脚本到临时目录 ${tmp_dir}"
 
-						# 步骤3：添加存储库
-						echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
+        if ! curl -fsSL "$script_url" -o "$script_path"; then
+            echo -e "${gl_hong}错误: ARM64 安装脚本下载失败${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
 
-						# version=$(wget -q https://dl.xanmod.org/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
-						local version=$(wget -q ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
+        if ! curl -fsSL "$sha256_url" -o "$sha256_path"; then
+            echo -e "${gl_hong}错误: 未能获取发布方提供的 SHA256 校验文件${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
 
-						apt update -y
-						apt install -y linux-xanmod-x64v$version
+        if ! curl -fsSL "$sha512_url" -o "$sha512_path"; then
+            echo -e "${gl_hong}错误: 未能获取发布方提供的 SHA512 校验文件${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
 
-						echo "XanMod内核已更新。重启后生效"
-						rm -f /etc/apt/sources.list.d/xanmod-release.list
-						rm -f check_x86-64_psabi.sh*
+        local expected_sha256 expected_sha512 actual_sha256 actual_sha512
+        expected_sha256=$(awk 'NR==1 {print $1}' "$sha256_path")
+        expected_sha512=$(awk 'NR==1 {print $1}' "$sha512_path")
 
-						server_reboot
+        if [ -z "$expected_sha256" ] || [ -z "$expected_sha512" ]; then
+            echo -e "${gl_hong}错误: 校验文件内容无效${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
 
-						  ;;
-					  2)
-						apt purge -y 'linux-*xanmod1*'
-						update-grub
-						echo "XanMod内核已卸载。重启后生效"
-						server_reboot
-						  ;;
-					  0)
-						  break  # 跳出循环，退出菜单
-						  ;;
+        actual_sha256=$(sha256sum "$script_path" | awk '{print $1}')
+        actual_sha512=$(sha512sum "$script_path" | awk '{print $1}')
 
-					  *)
-						  break  # 跳出循环，退出菜单
-						  ;;
+        if [ "$expected_sha256" != "$actual_sha256" ]; then
+            echo -e "${gl_hong}错误: SHA256 校验失败，已中止${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
 
-				  esac
-			done
-		else
+        if [ "$expected_sha512" != "$actual_sha512" ]; then
+            echo -e "${gl_hong}错误: SHA512 校验失败，已中止${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
 
-		  clear
-		  echo "设置BBR3加速"
-		  echo "------------------------------------------------"
-		  echo "仅支持Debian/Ubuntu"
-		  echo "请备份数据，将为你升级Linux内核开启BBR3"
-		  echo "VPS是512M内存的，请提前添加1G虚拟内存，防止因内存不足失联！"
-		  echo "------------------------------------------------"
-		  read -e -p "确定继续吗？(Y/N): " choice
+        echo -e "${gl_lv}SHA256 与 SHA512 校验通过${gl_bai}"
+        echo -e "${gl_huang}安全提示:${gl_bai} ARM64 脚本已下载至 ${script_path}"
+        echo "如需，您可在继续前使用 cat/less 等命令手动审查脚本内容。"
+        read -s -r -p "审查完成后按 Enter 继续执行（Ctrl+C 取消）..." _
+        echo ""
 
-		  case "$choice" in
-			[Yy])
-			if [ -r /etc/os-release ]; then
-				. /etc/os-release
-				if [ "$ID" != "debian" ] && [ "$ID" != "ubuntu" ]; then
-					echo "当前环境不支持，仅支持Debian和Ubuntu系统"
-					break_end
-					linux_Settings
-				fi
-			else
-				echo "无法确定操作系统类型"
-				break_end
-				linux_Settings
-			fi
+        if bash "$script_path"; then
+            rm -rf "$tmp_dir"
+            echo -e "${gl_lv}ARM BBR v3 安装完成${gl_bai}"
+            return 0
+        else
+            echo -e "${gl_hong}安装失败${gl_bai}"
+            rm -rf "$tmp_dir"
+            return 1
+        fi
+    fi
+    
+    # x86_64 架构安装流程
+    # 检查系统支持
+    if [ -r /etc/os-release ]; then
+        . /etc/os-release
+        if [ "$ID" != "debian" ] && [ "$ID" != "ubuntu" ]; then
+            echo -e "${gl_hong}错误: 仅支持 Debian 和 Ubuntu 系统${gl_bai}"
+            return 1
+        fi
+    else
+        echo -e "${gl_hong}错误: 无法确定操作系统类型${gl_bai}"
+        return 1
+    fi
+    
+    # 环境准备
+    check_disk_space 3
+    check_swap
+    install_package wget gnupg
+    
+    # 添加 XanMod GPG 密钥
+    echo "正在添加 XanMod 仓库密钥..."
+    wget -qO - ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/archive.key | \
+        gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${gl_hong}密钥下载失败，尝试官方源...${gl_bai}"
+        wget -qO - https://dl.xanmod.org/archive.key | \
+            gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+    fi
+    
+    local xanmod_repo_file="/etc/apt/sources.list.d/xanmod-release.list"
 
-			check_swap
-			install wget gnupg
+    # 添加 XanMod 仓库
+    echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | \
+        tee "$xanmod_repo_file" > /dev/null
+    
+    # 检测 CPU 架构版本
+    echo "正在检测 CPU 支持的最优内核版本..."
+    local version=$(wget -q ${gh_proxy}raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh && \
+                   chmod +x check_x86-64_psabi.sh && \
+                   ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
+    
+    if [ -z "$version" ]; then
+        echo -e "${gl_huang}自动检测失败，使用默认版本 v3${gl_bai}"
+        version="3"
+    fi
+    
+    echo -e "${gl_lv}将安装: linux-xanmod-x64v${version}${gl_bai}"
+    
+    # 安装 XanMod 内核
+    apt-get update
+    apt-get install -y linux-xanmod-x64v$version
+    
+    if [ $? -ne 0 ]; then
+        echo -e "${gl_hong}内核安装失败！${gl_bai}"
+        rm -f "$xanmod_repo_file"
+        rm -f check_x86-64_psabi.sh*
+        return 1
+    fi
 
-			# wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
-			wget -qO - ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
+    # 清理临时文件
+    rm -f check_x86-64_psabi.sh*
 
-			# 步骤3：添加存储库
-			echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' | tee /etc/apt/sources.list.d/xanmod-release.list
+    echo -e "${gl_lv}XanMod 内核安装成功！${gl_bai}"
+    echo -e "${gl_huang}提示: 请先重启系统加载新内核，然后再配置 BBR${gl_bai}"
+    echo -e "${gl_kjlan}后续更新: 可执行 ${gl_bai}sudo apt update && sudo apt upgrade${gl_kjlan} 以获取最新内核${gl_bai}"
 
-			# version=$(wget -q https://dl.xanmod.org/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
-			local version=$(wget -q ${gh_proxy}https://raw.githubusercontent.com/kejilion/sh/main/check_x86-64_psabi.sh && chmod +x check_x86-64_psabi.sh && ./check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+')
+    read -e -p "是否保留 XanMod 软件源以便后续自动获取更新？(Y/n): " keep_repo
+    case "${keep_repo:-Y}" in
+        [Nn])
+            echo -e "${gl_huang}移除软件源后将无法通过 apt upgrade 自动获取内核更新，如需更新需重新添加仓库。${gl_bai}"
+            read -e -p "确认仍要移除 XanMod 软件源吗？(Y/N): " remove_repo
+            case "$remove_repo" in
+                [Yy])
+                    rm -f "$xanmod_repo_file"
+                    echo -e "${gl_huang}已按要求移除 XanMod 软件源。${gl_bai}"
+                    ;;
+                *)
+                    echo -e "${gl_lv}已保留 XanMod 软件源。${gl_bai}"
+                    ;;
+            esac
+            ;;
+        *)
+            echo -e "${gl_lv}已保留 XanMod 软件源，系统可通过 apt upgrade 获取未来的内核更新。${gl_bai}"
+            ;;
+    esac
 
-			apt update -y
-			apt install -y linux-xanmod-x64v$version
-
-			bbr_on
-
-			echo "XanMod内核安装并BBR3启用成功。重启后生效"
-			rm -f /etc/apt/sources.list.d/xanmod-release.list
-			rm -f check_x86-64_psabi.sh*
-			
-	                  ;;
-			[Nn])
-			  echo "已取消"
-			  ;;
-			*)
-			  echo "无效的选择，请输入 Y 或 N。"
-			  ;;
-		  esac
-		fi
-
+    return 0
 }
 
-# Function to set IPv4/IPv6 priority
+
+# 设置IPv4/IPv6 优先级
 set_ip_priority() {
     while true; do
         clear
