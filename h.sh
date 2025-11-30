@@ -1481,6 +1481,58 @@ ipquality() {
     curl -sL https://Check.Place | bash -s - -I
 }
 
+#封锁境内IP访问
+cnipban() {
+    echo ">>> 设置禁止访问中国IP的出站规则（不限制入站）..."
+
+    # 1. 安装依赖
+    if command -v apt >/dev/null 2>&1; then
+        apt update -qq
+        apt install -y ipset iptables wget >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y ipset iptables wget >/dev/null 2>&1
+    fi
+
+    # 2. 创建 ipset 集合
+    ipset destroy china_ips 2>/dev/null || true
+    ipset create china_ips hash:net maxelem 200000
+
+    # 3. 下载中国IP列表（使用 CIDR 格式）
+    # 可以换源，比如 ipdeny.com / zxinc.org 等，这里示范一个常见源：
+    tmpfile="/tmp/china_ips.txt"
+    echo ">>> 正在下载中国IP CIDR列表..."
+    wget -q -O "$tmpfile" "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt"
+
+    if [ ! -s "$tmpfile" ]; then
+        echo "下载中国IP列表失败，退出。"
+        ipset destroy china_ips
+        return 1
+    fi
+
+    # 4. 导入到 ipset
+    echo ">>> 正在导入到 ipset（可能稍微需要几秒）..."
+    while read -r cidr; do
+        [ -z "$cidr" ] && continue
+        ipset add china_ips "$cidr" 2>/dev/null || true
+    done < "$tmpfile"
+
+    # 5. 添加 iptables 规则：禁止 OUTPUT 到 china_ips
+    # 先删除旧规则（如果有）
+    iptables -D OUTPUT -m set --match-set china_ips dst -j DROP 2>/dev/null || true
+
+    # 再添加新规则
+    iptables -I OUTPUT -m set --match-set china_ips dst -j DROP
+
+    echo ">>> 已添加 iptables 规则：禁止访问 china_ips 出站。"
+
+    # 6. 显示规则确认
+    echo "当前有关的 iptables OUTPUT 规则："
+    iptables -L OUTPUT -n --line-numbers | grep china_ips || echo "未找到？请手动检查 iptables -L OUTPUT -n"
+
+    echo ">>> 完成。现在 VPS 无法主动连接中国IP，但入站不受影响。"
+}
+
+
 #修改配置
 changeconf(){
     green "Hysteria 2 配置变更选择如下:"
@@ -1495,6 +1547,7 @@ changeconf(){
     echo -e " ${GREEN}9.${tianlan} 安装BBR3"
     echo -e " ${GREEN}10.${tianlan} 设置定时重启"  
     echo -e " ${GREEN}11.${tianlan} 修改SSH端口2222"  
+	echo -e " ${GREEN}12.${tianlan} 禁止国内IP"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -1509,8 +1562,9 @@ changeconf(){
         7 ) swap_cache ;;
         8 ) set_ip_priority ;;
         9 ) bbrv3 ;;
-	10 ) cron ;;
+	    10 ) cron ;;
         11 ) ssh_port 2222 ;;  # 修改SSH端口为2222
+		12 ) cnipban ;;  # 
         * ) echo "无效选项，退出脚本"; exit 1 ;;
     esac
 }
