@@ -1483,54 +1483,128 @@ ipquality() {
 
 #封锁境内IP访问
 cnipban() {
-    echo ">>> 设置禁止访问中国IP的出站规则（不限制入站）..."
+  # 可选颜色（你原脚本里已有就会覆盖这些）
+  CYAN=${CYAN:-"\033[36m"}
+  GREEN=${GREEN:-"\033[32m"}
+  YELLOW=${YELLOW:-"\033[33m"}
+  RED=${RED:-"\033[31m"}
+  RESET=${RESET:-"\033[0m"}
 
-    # 1. 安装依赖
-    if command -v apt >/dev/null 2>&1; then
-        apt update -qq
-        apt install -y ipset iptables wget >/dev/null 2>&1
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y ipset iptables wget >/dev/null 2>&1
+  echo -e "${CYAN}>>> 海外VPS 出口中国IP访问控制设置${RESET}"
+  echo -e "${YELLOW}说明：${RESET}"
+  echo -e "  - 仅限制【出站流量】访问中国IP"
+  echo -e "  - 入站访问（别人连你服务器）不受影响"
+  echo -e "  - SSH/代理等已有连接会被保留，不会被踢下线\n"
+
+  if [ "$EUID" -ne 0 ]; then
+    echo -e "${RED}错误：需要 root 权限执行${RESET}"
+    return 1
+  fi
+
+  read -rp "是否启用【禁止访问中国IP的出站规则】？(Y=启用 / N=关闭并清除设置) [y/N]: " yn
+
+  # ==============================
+  # 关闭模式：移除规则 + 删除 ipset
+  # ==============================
+  if [[ ! "$yn" =~ ^[Yy]$ ]]; then
+    echo -e "${YELLOW}>>> 关闭模式：移除出口限制 & 清理 china_ips...${RESET}"
+
+    # 删除 OUTPUT 中所有使用 china_ips 的规则
+    while iptables -C OUTPUT -m set --match-set china_ips dst -j DROP 2>/dev/null; do
+      iptables -D OUTPUT -m set --match-set china_ips dst -j DROP 2>/dev/null || break
+    done
+    while iptables -C OUTPUT -m conntrack --ctstate NEW -m set --match-set china_ips dst -j DROP 2>/dev/null; do
+      iptables -D OUTPUT -m conntrack --ctstate NEW -m set --match-set china_ips dst -j DROP 2>/dev/null || break
+    done
+
+    # 不强制删除 ESTABLISHED/RELATED / DNS / 80/443 放行规则，
+    # 因为这些一般都是安全且有用的，不一定是这个功能专用。
+
+    # 删除 ipset 集合
+    if ipset list china_ips >/dev/null 2>&1; then
+      ipset destroy china_ips
+      echo -e "${GREEN}[√] 已删除 ipset 集合 china_ips${RESET}"
+    else
+      echo -e "${YELLOW}[!] 未找到 ipset china_ips（可能之前未成功创建）${RESET}"
     fi
 
-    # 2. 创建 ipset 集合
-    ipset destroy china_ips 2>/dev/null || true
-    ipset create china_ips hash:net maxelem 200000
+    echo -e "${GREEN}>>> 出口中国IP限制已关闭。${RESET}"
+    echo -e "${YELLOW}当前 OUTPUT 规则（前20行）：${RESET}"
+    iptables -L OUTPUT -n --line-numbers | sed -n '1,20p'
+    return 0
+  fi
 
-    # 3. 下载中国IP列表（使用 CIDR 格式）
-    # 可以换源，比如 ipdeny.com / zxinc.org 等，这里示范一个常见源：
-    tmpfile="/tmp/china_ips.txt"
-    echo ">>> 正在下载中国IP CIDR列表..."
-    wget -q -O "$tmpfile" "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt"
+  # ==============================
+  # 启用模式：创建 ipset + 添加规则
+  # ==============================
+  echo -e "${CYAN}>>> 启用模式：创建 china_ips 并添加出口限制规则...${RESET}"
 
-    if [ ! -s "$tmpfile" ]; then
-        echo "下载中国IP列表失败，退出。"
-        ipset destroy china_ips
-        return 1
-    fi
+  # 安装依赖
+  if command -v apt >/dev/null 2>&1; then
+    apt update -qq >/dev/null 2>&1
+    apt install -y ipset iptables wget >/dev/null 2>&1
+  elif command -v yum >/dev/null 2>&1; then
+    yum install -y ipset iptables wget -q >/dev/null 2>&1
+  fi
 
-    # 4. 导入到 ipset
-    echo ">>> 正在导入到 ipset（可能稍微需要几秒）..."
-    while read -r cidr; do
-        [ -z "$cidr" ] && continue
-        ipset add china_ips "$cidr" 2>/dev/null || true
-    done < "$tmpfile"
+  if ! command -v ipset >/dev/null 2>&1 || ! command -v iptables >/dev/null 2>&1; then
+    echo -e "${RED}错误：未找到 ipset 或 iptables，无法继续${RESET}"
+    return 1
+  fi
 
-    # 5. 添加 iptables 规则：禁止 OUTPUT 到 china_ips
-    # 先删除旧规则（如果有）
-    iptables -D OUTPUT -m set --match-set china_ips dst -j DROP 2>/dev/null || true
+  # 创建/重建 ipset 集合
+  ipset destroy china_ips 2>/dev/null || true
+  ipset create china_ips hash:net maxelem 200000
 
-    # 再添加新规则
-    iptables -I OUTPUT -m set --match-set china_ips dst -j DROP
+  # 下载中国IP列表
+  tmpfile="/tmp/china_ip_list.txt"
+  echo -e "${CYAN}>>> 正在下载中国IP CIDR列表...${RESET}"
+  wget -q -O "$tmpfile" "https://raw.githubusercontent.com/17mon/china_ip_list/master/china_ip_list.txt"
 
-    echo ">>> 已添加 iptables 规则：禁止访问 china_ips 出站。"
+  if [ ! -s "$tmpfile" ]; then
+    echo -e "${RED}错误：下载中国IP列表失败，退出${RESET}"
+    ipset destroy china_ips
+    return 1
+  fi
 
-    # 6. 显示规则确认
-    echo "当前有关的 iptables OUTPUT 规则："
-    iptables -L OUTPUT -n --line-numbers | grep china_ips || echo "未找到？请手动检查 iptables -L OUTPUT -n"
+  echo -e "${CYAN}>>> 正在导入 IP 段到 ipset china_ips（可能需要几秒）...${RESET}"
+  while read -r cidr; do
+    [ -z "$cidr" ] && continue
+    ipset add china_ips "$cidr" 2>/dev/null || true
+  done < "$tmpfile"
 
-    echo ">>> 完成。现在 VPS 无法主动连接中国IP，但入站不受影响。"
+  # ========= iptables 规则部分 =========
+
+  # 1) 先放行 已建立/相关 连接（防止 SSH/代理被踢）
+  iptables -C OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+  iptables -I OUTPUT 1 -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+  # 2) 放行 DNS（53），否则域名解析会失效
+  iptables -C OUTPUT -p udp --dport 53 -j ACCEPT 2>/dev/null || \
+  iptables -I OUTPUT 2 -p udp --dport 53 -j ACCEPT
+  iptables -C OUTPUT -p tcp --dport 53 -j ACCEPT 2>/dev/null || \
+  iptables -I OUTPUT 3 -p tcp --dport 53 -j ACCEPT
+
+  # 3) 放行常见 Web/代理出站端口（按需可调整）
+  iptables -C OUTPUT -p tcp -m multiport --dports 80,443,8080,8443 -j ACCEPT 2>/dev/null || \
+  iptables -I OUTPUT 4 -p tcp -m multiport --dports 80,443,8080,8443 -j ACCEPT
+
+  # 4) 删除旧的 china_ips DROP 规则（如果存在）
+  iptables -D OUTPUT -m conntrack --ctstate NEW -m set --match-set china_ips dst -j DROP 2>/dev/null || true
+  iptables -D OUTPUT -m set --match-set china_ips dst -j DROP 2>/dev/null || true
+
+  # 5) 添加新的 DROP 规则：仅拦截到中国IP的“新建连接”
+  iptables -A OUTPUT -m conntrack --ctstate NEW -m set --match-set china_ips dst -j DROP
+
+  echo -e "${GREEN}>>> 已启用：禁止到中国IP的【新建出站连接】，现有连接不受影响${RESET}"
+  echo -e "${YELLOW}当前 OUTPUT 规则（前20行）：${RESET}"
+  iptables -L OUTPUT -n --line-numbers | sed -n '1,20p'
+
+  echo -e "${YELLOW}提示：${RESET}"
+  echo -e "  - 如需关闭此功能，可再次运行本函数并选择 N"
+  echo -e "  - 如需持久化规则，请结合 iptables-persistent 或 firewalld 自行保存"
 }
+
 
 
 #修改配置
