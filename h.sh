@@ -740,11 +740,8 @@ linux_ps() {
 	# local dns_addresses=$(awk '/^nameserver/{printf "%s ", $2} END {print ""}' /etc/resolv.conf)
 	# 显示真实的dns
 local dns_addresses=$(resolvectl status 2>/dev/null | awk '
-/DNS Servers:/ {
+/^ *DNS Servers:/ {
     for (i=3;i<=NF;i++) printf "%s ", $i
-}
-/Fallback DNS Servers:/ {
-    for (i=4;i<=NF;i++) printf "%s ", $i
 }
 END {print ""}')
 
