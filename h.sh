@@ -809,103 +809,438 @@ END {print ""}')
 # -----------------------------------------
 #  设置DNS并锁死 resolv.conf	
 # -----------------------------------------
-
 set_dns_ui() {
+  echo -e "${CYAN}>>> 修改系统DNS地址...${RESET}"
 
-    # 必须用 root 执行
-    if [ "$EUID" -ne 0 ]; then
-        echo "⚠ 请使用 root 运行：sudo -i 然后再执行 set_dns_ui"
-        return 1
+  # 检查权限
+  if [ $EUID -ne 0 ]; then
+    echo -e "${RED}错误: 此功能需要root权限执行${RESET}"
+    return 1
+  fi
+
+  # 常用DNS服务器列表
+  common_dns=(
+    # IPv4
+    "8.8.8.8|Google Public DNS (IPv4)"
+    "8.8.4.4|Google Public DNS 备用 (IPv4)"
+    "1.1.1.1|Cloudflare DNS (IPv4)"
+    "1.0.0.1|Cloudflare DNS 备用 (IPv4)"
+    "208.67.222.222|OpenDNS (IPv4)"
+    "208.67.220.220|OpenDNS 备用 (IPv4)"
+    "9.9.9.9|Quad9 DNS (IPv4)"
+    "149.112.112.112|Quad9 DNS 备用 (IPv4)"
+    "94.140.14.14|AdGuard DNS (IPv4)"
+    "94.140.15.15|AdGuard DNS 备用 (IPv4)"
+    "223.5.5.5|阿里 AliDNS (IPv4)"
+    "223.6.6.6|阿里 AliDNS 备用 (IPv4)"
+    "119.29.29.29|腾讯 DNSPod (IPv4)"
+    "180.76.76.76|百度 BaiduDNS (IPv4)"
+    # IPv6
+    "2001:4860:4860::8888|Google Public DNS (IPv6)"
+    "2001:4860:4860::8844|Google Public DNS 备用 (IPv6)"
+    "2606:4700:4700::1111|Cloudflare DNS (IPv6)"
+    "2606:4700:4700::1001|Cloudflare DNS 备用 (IPv6)"
+    "2620:119:35::35|OpenDNS (IPv6)"
+    "2620:119:53::53|OpenDNS 备用 (IPv6)"
+    "2620:fe::fe|Quad9 DNS (IPv6)"
+    "2a10:50c0::ad1:ff|AdGuard DNS (IPv6)"
+    "2400:3200::1|阿里 AliDNS (IPv6)"
+    "2400:da00::6666|百度 BaiduDNS (IPv6)"
+  )
+
+  # 全局变量，用于接收子函数返回的 IP 列表
+  SELECTED_IPS=()
+
+  # 显示当前DNS配置
+  echo -e "${YELLOW}当前DNS配置:${RESET}"
+  if [ -f /etc/resolv.conf ]; then
+    grep -E '^nameserver' /etc/resolv.conf | while read line; do
+      echo -e "  ${GREEN}✓${RESET} $line"
+    done
+  fi
+
+  # 使用循环包裹菜单，实现子菜单返回上一级
+  while true; do
+    # 每次循环清空选择
+    SELECTED_IPS=()
+
+    echo -e "\n${CYAN}请选择操作方式:${RESET}"
+    echo -e "  ${GREEN}1${RESET}) 自动测试并手动选择 (支持多选，含IPv6)"
+    echo -e "  ${GREEN}2${RESET}) 手动输入DNS地址 (支持连续输入，含IPv6)"
+    echo -e "  ${GREEN}3${RESET}) 从常用DNS列表选择 (支持多选，含IPv6)"
+    echo -e "  ${YELLOW}0.${RESET} 取消操作/返回"
+
+    read -p "请输入选择 [0-3]: " choice
+
+    case $choice in
+    1)
+      auto_test_dns
+      ;;
+    2)
+      manual_input_dns
+      ;;
+    3)
+      select_from_list
+      ;;
+    0)
+      echo -e "${YELLOW}已取消DNS修改操作${RESET}"
+      SKIP_PAUSE=true
+      return 0
+      ;;
+    *)
+      echo -e "${RED}无效选择，请重新输入${RESET}"
+      continue
+      ;;
+    esac
+
+    # 检查是否有选中的 IP
+    if [ ${#SELECTED_IPS[@]} -eq 0 ]; then
+      echo -e "${YELLOW}未选择任何 DNS，返回上一级菜单...${RESET}"
+      continue # 继续循环
     fi
 
-    echo -e "\n🚀 开始执行【海外 VPS DNS 优化 + 永久锁死】\n"
+    # 如果选择了IP，则跳出循环，继续执行应用逻辑
+    break
+  done
 
-    # -----------------------------------------
-    # 1️⃣ 应急 DNS（强制网络立即恢复）
-    # -----------------------------------------
-    echo -e "📡 [1/6] 设置应急 DNS（1.1.1.1 + 8.8.8.8）……"
-cat > /etc/resolv.conf << 'EOF'
-nameserver 1.1.1.1
-nameserver 8.8.8.8
-EOF
+  # === 数组去重 ===
+  SELECTED_IPS=($(printf "%s\n" "${SELECTED_IPS[@]}" | awk '!a[$0]++'))
 
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    sleep 2
-    echo -e "✅ 应急 DNS 已生效！\n"
+  echo -e "\n${CYAN}准备应用新的 DNS 配置: ${SELECTED_IPS[*]}${RESET}"
 
+  # --- 1. 备份配置 ---
+  local backup_file="/etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S)"
+  local backup_systemd=""
 
-    # -----------------------------------------
-    # 2️⃣ 修复 apt 并安装 systemd-resolved
-    # -----------------------------------------
-    echo -e "📦 [2/6] 安装 systemd-resolved……"
-    export DEBIAN_FRONTEND=noninteractive
-    apt-get clean >/dev/null 2>&1
-    apt update --fix-missing -qq >/dev/null 2>&1
-    apt install -y systemd-resolved libnss-resolve >/dev/null 2>&1 ||
-    apt install -y --reinstall systemd-resolved >/dev/null 2>&1
+  # 尝试备份
+  if cp -P /etc/resolv.conf "$backup_file" 2>/dev/null; then
+    echo -e "${GREEN}[√] 已备份原配置到: $backup_file${RESET}"
+  else
+    touch "$backup_file"
+    echo -e "${YELLOW}[!] 原配置不存在或无法备份，将创建新配置...${RESET}"
+  fi
 
+  # 如果存在 systemd-resolved，也备份它的配置
+  if [ -f /etc/systemd/resolved.conf ]; then
+    backup_systemd="/etc/systemd/resolved.conf.backup.$(date +%Y%m%d_%H%M%S)"
+    cp /etc/systemd/resolved.conf "$backup_systemd" 2>/dev/null
+  fi
 
-    # -----------------------------------------
-    # 3️⃣ 写入最优海外 DNS 配置
-    # -----------------------------------------
-    echo -e "⚙️ [3/6] 写入 Cloudflare + Google DNS 配置……"
-cat > /etc/systemd/resolved.conf << 'EOF'
-[Resolve]
-DNS=1.1.1.1 8.8.8.8
-FallbackDNS=1.0.0.1 8.8.4.4
-DNSSEC=no
-DNSOverTLS=no
-MulticastDNS=no
-LLMNR=no
-Cache=yes
-EOF
+  # --- 2. 写入新配置 (先清理后应用) ---
+  write_dns_config "${SELECTED_IPS[@]}"
 
+  # --- 3. 验证与回滚 ---
+  if verify_dns_config; then
+    echo -e "${GREEN}[√] DNS修改成功且验证通过${RESET}"
+    echo -e "${YELLOW}新的DNS配置:${RESET}"
+    grep -E '^nameserver' /etc/resolv.conf | while read line; do
+      echo -e "  ${GREEN}✓${RESET} $line"
+    done
 
-    # -----------------------------------------
-    # 4️⃣ 启用 systemd 的 stub-resolv.conf
-    # -----------------------------------------
-    echo -e "🔧 [4/6] 切换为 127.0.0.53 本地 DNS……"
-    chattr -i /etc/resolv.conf 2>/dev/null || true
-    ln -sf /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null ||
-    cp -f /run/systemd/resolve/stub-resolv.conf /etc/resolv.conf 2>/dev/null
+    # 验证成功，删除备份文件
+    echo -e "${CYAN}>>> 正在清理备份文件...${RESET}"
+    [ -f "$backup_file" ] && rm -f "$backup_file"
+    [ -n "$backup_systemd" ] && [ -f "$backup_systemd" ] && rm -f "$backup_systemd"
+    echo -e "${GREEN}[√] 备份文件已删除${RESET}"
 
+  else
+    echo -e "${RED}[×] DNS配置验证失败，正在还原配置...${RESET}"
 
-    # -----------------------------------------
-    # 5️⃣ 重启 resolved
-    # -----------------------------------------
-    echo -e "🔄 [5/6] 重启 systemd-resolved ……"
-    systemctl enable --now systemd-resolved >/dev/null 2>&1
-    sleep 2
-
-
-    # -----------------------------------------
-    # 6️⃣ DNS 测试并锁死 resolv.conf
-    # -----------------------------------------
-    echo -e "🔍 [6/6] 测试 DNS 解析……"
-    sleep 2
-
-    if dig +short cloudflare.com @127.0.0.53 | grep -q "[0-9]"; then
-        echo -e "🎉 DNS 测试成功！准备锁死 resolv.conf……"
-
-        chattr -i /etc/resolv.conf 2>/dev/null || true
-        echo "nameserver 127.0.0.53" > /etc/resolv.conf
-        chattr +i /etc/resolv.conf 2>/dev/null && \
-            echo -e "🔥 锁死成功！DNS 永久固定，不会再被云厂商修改。\n"
-    else
-        echo -e "⚠️ DNS 测试失败，本次不锁死 resolv.conf。\n"
+    # 还原 resolv.conf
+    if [ -f "$backup_file" ]; then
+      chattr -i /etc/resolv.conf 2>/dev/null
+      rm -f /etc/resolv.conf
+      cp -P "$backup_file" /etc/resolv.conf 2>/dev/null || cp "$backup_file" /etc/resolv.conf
+      echo -e "${YELLOW}[!] 已还原 /etc/resolv.conf${RESET}"
     fi
 
-    # 显示当前 DNS 状态
-    echo -e "📡 当前 DNS 设置：\n"
-    resolvectl status 2>/dev/null | grep -A 2 "DNS Servers" || cat /etc/resolv.conf
+    # 还原 systemd-resolved
+    if [ -n "$backup_systemd" ] && [ -f "$backup_systemd" ]; then
+      cp "$backup_systemd" /etc/systemd/resolved.conf
+      systemctl restart systemd-resolved 2>/dev/null
+      echo -e "${YELLOW}[!] 已还原 /etc/systemd/resolved.conf${RESET}"
+    fi
 
-    echo -e "\n🧪 测试解析 cloudflare.com：\n"
-    dig +short cloudflare.com | head -5
-
-    echo -e "\n🎊 已完成！海外 VPS DNS = Cloudflare + Google，速度最优、重启不变！\n"
+    return 1
+  fi
 }
 
-# 安装BBRV3
+auto_test_dns() {
+  echo -e "${CYAN}>>> 正在测试常用DNS速度 (含IPv6)...${RESET}"
+
+  # 测试的DNS服务器 (混合v4和v6)
+  local test_dns=(
+    "8.8.8.8|Google IPv4"
+    "1.1.1.1|Cloudflare IPv4"
+    "208.67.222.222|OpenDNS IPv4"
+    "9.9.9.9|Quad9 IPv4"
+    "223.5.5.5|AliDNS IPv4"
+    "119.29.29.29|DNSPod IPv4"
+    "2001:4860:4860::8888|Google IPv6"
+    "2606:4700:4700::1111|Cloudflare IPv6"
+    "2400:3200::1|AliDNS IPv6"
+  )
+
+  declare -a dns_results
+  local count=0
+
+  for dns_info in "${test_dns[@]}"; do
+    IFS='|' read -r dns_ip dns_name <<<"$dns_info"
+    echo -ne "  测试 ${YELLOW}$dns_name${RESET} ($dns_ip)... "
+
+    # 判断IPv4还是IPv6选择ping命令
+    local ping_cmd="ping"
+    if [[ "$dns_ip" == *":"* ]]; then
+      # IPv6
+      if command -v ping6 &>/dev/null; then
+        ping_cmd="ping6"
+      else
+        ping_cmd="ping -6"
+      fi
+    fi
+
+    # 使用ping测试延迟
+    # 增加 LC_ALL=C 确保 grep 'avg' 能匹配到英文输出
+    if ping_result=$(LC_ALL=C $ping_cmd -c 2 -W 2 "$dns_ip" 2>/dev/null | grep -i 'avg'); then
+      avg_latency=$(echo "$ping_result" | awk -F'/' '{print $5}')
+      echo -e "${GREEN}${avg_latency}ms${RESET}"
+      dns_results[$count]="$avg_latency|$dns_ip|$dns_name"
+    else
+      echo -e "${RED}超时/不可达${RESET}"
+      dns_results[$count]="9999|$dns_ip|$dns_name"
+    fi
+
+    count=$((count + 1))
+  done
+
+  # Separate results
+  local v4_list=()
+  local v6_list=()
+  for res in "${dns_results[@]}"; do
+    IFS='|' read -r lat ip nm <<<"$res"
+    if [[ "$ip" == *":"* ]]; then
+      v6_list+=("$res")
+    else
+      v4_list+=("$res")
+    fi
+  done
+
+  # Sort
+  local sorted_v4=()
+  local sorted_v6=()
+  if [ ${#v4_list[@]} -gt 0 ]; then
+    IFS=$'\n' sorted_v4=($(printf "%s\n" "${v4_list[@]}" | sort -n -t'|' -k1))
+    unset IFS
+  fi
+  if [ ${#v6_list[@]} -gt 0 ]; then
+    IFS=$'\n' sorted_v6=($(printf "%s\n" "${v6_list[@]}" | sort -n -t'|' -k1))
+    unset IFS
+  fi
+
+  local valid_options=()
+  local display_index=1
+
+  # Display IPv4
+  echo -e "\n${CYAN}IPv4 DNS 延迟排名:${RESET}"
+  local v4_count=0
+  for item in "${sorted_v4[@]}"; do
+    IFS='|' read -r latency ip name <<<"$item"
+    if [ "$latency" != "9999" ]; then
+      echo -e "  ${GREEN}${display_index}${RESET}. ${BOLD}$name${RESET} ($ip) - ${YELLOW}${latency}ms${RESET}"
+      valid_options[$display_index]="$ip"
+      display_index=$((display_index + 1))
+      v4_count=$((v4_count + 1))
+    fi
+  done
+  [ $v4_count -eq 0 ] && echo -e "  ${GRAY}无可用 IPv4 结果${RESET}"
+
+  # Display IPv6
+  echo -e "\n${CYAN}IPv6 DNS 延迟排名:${RESET}"
+  local v6_count=0
+  for item in "${sorted_v6[@]}"; do
+    IFS='|' read -r latency ip name <<<"$item"
+    if [ "$latency" != "9999" ]; then
+      echo -e "  ${GREEN}${display_index}${RESET}. ${BOLD}$name${RESET} ($ip) - ${YELLOW}${latency}ms${RESET}"
+      valid_options[$display_index]="$ip"
+      display_index=$((display_index + 1))
+      v6_count=$((v6_count + 1))
+    fi
+  done
+  [ $v6_count -eq 0 ] && echo -e "  ${GRAY}无可用 IPv6 结果${RESET}"
+
+  # Check if any valid
+  if [ ${#valid_options[@]} -eq 0 ]; then
+    echo -e "${RED}所有DNS测试均超时，请检查网络连接${RESET}"
+    return 1
+  fi
+
+  echo -e "\n${YELLOW}提示：可以输入多个编号进行组合（例如：1 3）(输入 0 退出)${RESET}"
+  read -p "请输入要使用的DNS编号 (用空格分隔): " user_choices
+
+  # 处理用户输入
+  for choice in $user_choices; do
+    if [ "$choice" == "0" ]; then return 0; fi
+    if [ -n "${valid_options[$choice]}" ]; then
+      SELECTED_IPS+=("${valid_options[$choice]}")
+    fi
+  done
+}
+
+manual_input_dns() {
+  echo -e "${CYAN}>>> 手动输入DNS地址${RESET}"
+  echo -e "${YELLOW}提示：支持输入多个IP地址(IPv4/IPv6)，用空格分隔 (输入 0 返回)${RESET}" # [修改] 提示文本
+
+  read -p "请输入DNS服务器地址: " input_dns
+  if [ "$input_dns" == "0" ]; then return 0; fi
+
+  for ip in $input_dns; do
+    if validate_ip "$ip"; then
+      SELECTED_IPS+=("$ip")
+    else
+      echo -e "${RED}忽略无效的IP地址格式: $ip${RESET}"
+    fi
+  done
+}
+
+select_from_list() {
+  echo -e "${CYAN}>>> 从常用DNS列表选择${RESET}"
+
+  echo -e "${YELLOW}常用DNS服务器列表:${RESET}"
+  for i in "${!common_dns[@]}"; do
+    IFS='|' read -r ip name <<<"${common_dns[$i]}"
+    echo -e "  ${GREEN}$((i + 1))${RESET}) $name - ${YELLOW}$ip${RESET}"
+  done
+
+  echo -e "\n${YELLOW}提示：可以输入多个编号进行组合（例如：1 2）(输入 0 退出)${RESET}"
+  read -p "请选择DNS服务器编号 [用空格分隔]: " user_choices
+
+  for choice in $user_choices; do
+    if [ "$choice" == "0" ]; then return 0; fi
+
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#common_dns[@]}" ]; then
+      index=$((choice - 1))
+      IFS='|' read -r selected_ip selected_name <<<"${common_dns[$index]}"
+      SELECTED_IPS+=("$selected_ip")
+    else
+      echo -e "${RED}忽略无效选择: $choice${RESET}"
+    fi
+  done
+}
+
+# 辅助函数 (支持IPv4和IPv6)
+validate_ip() {
+  local ip=$1
+  # IPv4 check
+  if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    return 0
+  # IPv6 check (simplified regex)
+  elif [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]]; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+write_dns_config() {
+  local dns_list=("$@")
+
+  echo -e "${CYAN}正在重写 /etc/resolv.conf 以确保无多余DNS残留...${RESET}"
+
+  # 1. 强制覆盖 /etc/resolv.conf
+  # 尝试解锁文件
+  chattr -i /etc/resolv.conf 2>/dev/null
+
+  # [核心操作] 强制删除原文件/软链接
+  rm -f /etc/resolv.conf
+
+  # 创建新文件
+  touch /etc/resolv.conf
+  chmod 644 /etc/resolv.conf
+
+  # 写入文件头
+  cat >/etc/resolv.conf <<EOF
+# Generated by VPS Management Script
+# Last update: $(date)
+EOF
+
+  # 循环写入所有选中的 IP
+  for ip in "${dns_list[@]}"; do
+    echo "nameserver $ip" >>/etc/resolv.conf
+  done
+
+  echo -e "${GREEN}[√] /etc/resolv.conf 已重写为静态文件${RESET}"
+
+  # 2. 如果检测到 systemd-resolved，也同步修改其配置
+  if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+    echo -e "${CYAN}检测到 systemd-resolved，正在同步 Global 配置...${RESET}"
+
+    local dns_string="${dns_list[*]}"
+
+    # 彻底清理旧配置
+    sed -i '/^DNS=/d' /etc/systemd/resolved.conf
+    sed -i '/^#DNS=/d' /etc/systemd/resolved.conf
+    sed -i '/^FallbackDNS=/d' /etc/systemd/resolved.conf
+    sed -i '/^#FallbackDNS=/d' /etc/systemd/resolved.conf
+
+    # 插入新配置
+    if grep -q "\[Resolve\]" /etc/systemd/resolved.conf; then
+      sed -i "/\[Resolve\]/a DNS=$dns_string" /etc/systemd/resolved.conf
+      sed -i "/\[Resolve\]/a FallbackDNS=8.8.8.8 1.1.1.1" /etc/systemd/resolved.conf
+    else
+      echo "[Resolve]" >>/etc/systemd/resolved.conf
+      echo "DNS=$dns_string" >>/etc/systemd/resolved.conf
+      echo "FallbackDNS=8.8.8.8 1.1.1.1" >>/etc/systemd/resolved.conf
+    fi
+
+    systemctl restart systemd-resolved
+    echo -e "${GREEN}[√] systemd-resolved 全局配置已更新${RESET}"
+  fi
+
+  # 3. 询问锁定
+  echo -e "${YELLOW}是否锁定 DNS 配置文件以防止系统重启或 DHCP 再次修改?${RESET}"
+  read -p "锁定 /etc/resolv.conf? [y/N]: " lock_choice
+  if [[ "$lock_choice" =~ ^[Yy]$ ]]; then
+    if command -v chattr >/dev/null 2>&1; then
+      chattr +i /etc/resolv.conf
+      echo -e "${GREEN}[√] 文件已锁定 (+i)${RESET}"
+    else
+      echo -e "${RED}[!] 错误：未找到 chattr 命令，无法锁定${RESET}"
+    fi
+  fi
+}
+
+verify_dns_config() {
+  echo -e "\n${CYAN}>>> 验证DNS配置...${RESET}"
+
+  if [ ! -f /etc/resolv.conf ]; then
+    echo -e "${RED}错误: /etc/resolv.conf 文件不存在${RESET}"
+    return 1
+  fi
+
+  local dns_servers=$(grep -E '^nameserver' /etc/resolv.conf | awk '{print $2}')
+  if [ -z "$dns_servers" ]; then
+    # 如果是 systemd-resolved，resolv.conf 可能是存根，需要检查 resolvectl
+    if systemctl is-active systemd-resolved >/dev/null 2>&1; then
+      echo -e "${GRAY}使用 systemd-resolved，尝试解析验证...${RESET}"
+    else
+      echo -e "${RED}错误: 未找到有效的DNS服务器配置${RESET}"
+      return 1
+    fi
+  fi
+
+  # 进行实际解析测试
+  echo -ne "  正在测试解析 google.com ... "
+  if nslookup -timeout=5 google.com >/dev/null 2>&1 || ping -c 1 -W 2 google.com >/dev/null 2>&1; then
+    echo -e "${GREEN}成功${RESET}"
+    return 0
+  else
+    echo -e "${RED}失败${RESET}"
+    return 1
+  fi
+}
+# -----------------------------------------
+# # 安装BBRV3
+# -----------------------------------------
 
 bbrv3() {
 		  root_use
