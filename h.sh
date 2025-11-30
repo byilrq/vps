@@ -737,7 +737,13 @@ linux_ps() {
 	local isp_info=$(echo "$ipinfo" | grep 'org' | awk -F': ' '{print $2}' | tr -d '",')
 
 	local load=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}')
-	local dns_addresses=$(awk '/^nameserver/{printf "%s ", $2} END {print ""}' /etc/resolv.conf)
+	# local dns_addresses=$(awk '/^nameserver/{printf "%s ", $2} END {print ""}' /etc/resolv.conf)
+	# 显示真实的dns
+local dns_addresses=$(resolvectl status 2>/dev/null | awk '
+/DNS Servers:/ {
+    for (i=3;i<=NF;i++) printf "%s ", $i
+}
+END {print ""}')
 
 
 	local cpu_arch=$(uname -m)
