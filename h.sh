@@ -711,23 +711,24 @@ swap_cache() {
 }
 
 # 上海三网路由节点
-besttrace() {
-    url="https://raw.githubusercontent.com/chiakge/Linux-Optimize/master/besttrace.sh"
-
-    curl -s $url -o /tmp/besttrace.sh
-    chmod +x /tmp/besttrace.sh
+trace_sh() {
+    # 下载最新版 besttrace
+    wget -qO /tmp/besttrace.zip https://cdn.ipip.net/17mon/besttrace4linux.zip
+    unzip -o /tmp/besttrace.zip -d /tmp >/dev/null 2>&1
+    chmod +x /tmp/besttrace
 
     echo -e "\n🔵 上海电信"
-    /tmp/besttrace.sh 101.227.14.1
+    /tmp/besttrace 101.227.14.1
 
     echo -e "\n🔴 上海联通"
-    /tmp/besttrace.sh 139.226.226.1
+    /tmp/besttrace 139.226.226.1
 
     echo -e "\n🟢 上海移动"
-    /tmp/besttrace.sh 211.136.112.200
+    /tmp/besttrace 211.136.112.200
 
-    rm -f /tmp/besttrace.sh
+    rm -f /tmp/besttrace /tmp/besttrace.zip
 }
+
 
 
 
