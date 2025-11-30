@@ -711,11 +711,9 @@ swap_cache() {
 }
 
 # 上海三网路由节点 wget -qO- git.io/besttrace | bash   
-trace_sh() {
+besttrace() {
   wget -qO- git.io/besttrace | bash   
 }
-
-
 
 
 linux_ps() {
