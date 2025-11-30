@@ -710,23 +710,9 @@ swap_cache() {
     echo "操作完成！新的 Swap 缓存大小为 ${size_mb} MB。"
 }
 
-# 上海三网路由节点
+# 上海三网路由节点 wget -qO- git.io/besttrace | bash   
 trace_sh() {
-    # 下载最新版 besttrace
-    wget -qO /tmp/besttrace.zip https://cdn.ipip.net/17mon/besttrace4linux.zip
-    unzip -o /tmp/besttrace.zip -d /tmp >/dev/null 2>&1
-    chmod +x /tmp/besttrace
-
-    echo -e "\n🔵 上海电信"
-    /tmp/besttrace 101.227.14.1
-
-    echo -e "\n🔴 上海联通"
-    /tmp/besttrace 139.226.226.1
-
-    echo -e "\n🟢 上海移动"
-    /tmp/besttrace 211.136.112.200
-
-    rm -f /tmp/besttrace /tmp/besttrace.zip
+  wget -qO- git.io/besttrace | bash   
 }
 
 
