@@ -743,8 +743,10 @@ local dns_addresses=$(resolvectl status 2>/dev/null | awk '
 /DNS Servers:/ {
     for (i=3;i<=NF;i++) printf "%s ", $i
 }
+/Fallback DNS Servers:/ {
+    for (i=4;i<=NF;i++) printf "%s ", $i
+}
 END {print ""}')
-
 
 	local cpu_arch=$(uname -m)
 
