@@ -1547,7 +1547,7 @@ menu() {
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
-    read -rp "请输入选项 [0-9]: " menuInput
+    read -rp "请输入选项 [0-12]: " menuInput
     case $menuInput in
         1 ) insthysteria ;;
         2 ) unsthysteria ;;
