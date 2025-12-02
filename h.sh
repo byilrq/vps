@@ -352,7 +352,8 @@ EOF
     yellow "Hysteria 2 分享二维码如下："
     qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur2.txt)"
  }
-/etc/hysteria/config.yaml
+ 
+# /etc/hysteria/config.yaml
 
 unsthysteria(){
     systemctl stop hysteria-server.service >/dev/null 2>&1
