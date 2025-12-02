@@ -1486,6 +1486,33 @@ cnipban() {
 
 }
 
+# 选择BBR类型和tcp调优
+bbrx() {
+  local url="https://raw.githubusercontent.com/byilrq/vps/main/tcpx.sh"
+  local tmp_file="/tmp/tcpx.sh"
+
+  echo -e "${CYAN}>>> 正在下载 BBR / TCP 优化脚本：${YELLOW}$url${RESET}"
+
+  # 优先用 curl，其次 wget
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$tmp_file"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$tmp_file" "$url"
+  else
+    echo -e "${RED}错误：未找到 curl 或 wget，无法下载脚本${RESET}"
+    return 1
+  fi
+
+  if [ ! -s "$tmp_file" ]; then
+    echo -e "${RED}错误：下载失败或文件为空${RESET}"
+    return 1
+  fi
+
+  chmod +x "$tmp_file"
+  echo -e "${GREEN}>>> 下载完成，开始执行 tcpx.sh ...${RESET}"
+  bash "$tmp_file"
+}
+
 
 
 #修改配置
@@ -1500,13 +1527,14 @@ changeconf(){
     echo -e " ${GREEN}7.${tianlan} 设置缓存" 
     echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级" 
     echo -e " ${GREEN}9.${tianlan} 安装BBR3"
-    echo -e " ${GREEN}10.${tianlan} 设置定时重启"  
-    echo -e " ${GREEN}11.${tianlan} 修改SSH端口2222"  
-	echo -e " ${GREEN}12.${tianlan} 禁止国内IP"  
+	echo -e " ${GREEN}10.${tianlan} BBR/TCP 优化"
+    echo -e " ${GREEN}11.${tianlan} 设置定时重启"  
+    echo -e " ${GREEN}12.${tianlan} 修改SSH端口2222"  
+	echo -e " ${GREEN}13.${tianlan} 禁止国内IP"  
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
-    read -p " 请选择操作 [1-5]：" confAnswer
+    read -p " 请选择操作 [1-13]：" confAnswer
     case $confAnswer in
         1 ) changeport ;;
         2 ) changepasswd ;;
@@ -1517,9 +1545,10 @@ changeconf(){
         7 ) swap_cache ;;
         8 ) set_ip_priority ;;
         9 ) bbrv3 ;;
-	    10 ) cron ;;
-        11 ) ssh_port 2222 ;;  # 修改SSH端口为2222
-		12 ) cnipban ;;  # 
+		10 ) bbrx ;;
+	    11 ) cron ;;
+        12 ) ssh_port 2222 ;;  # 修改SSH端口为2222
+		13 ) cnipban ;;  # 
         * ) echo "无效选项，退出脚本"; exit 1 ;;
     esac
 }
