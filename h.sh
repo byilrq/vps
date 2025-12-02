@@ -1481,11 +1481,6 @@ ipquality() {
     curl -sL https://Check.Place | bash -s - -I
 }
 
-#封锁境内IP访问
-cnipban() {
-
-}
-
 # 选择BBR类型和tcp调优
 bbrx() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/tcpx.sh"
