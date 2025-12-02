@@ -1641,27 +1641,53 @@ key_ed25519() {
                 echo "$pubkey" >> "$auth_keys"
                 echo "已将公钥写入：$auth_keys"
             fi
+            # 生成主机密钥如果不存在
+            if [[ ! -f /etc/ssh/ssh_host_ed25519_key ]]; then
+                echo "ED25519 主机密钥不存在，正在生成..."
+                ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key -N "" || {
+                    echo "生成主机密钥失败，请手动执行 ssh-keygen -A。"
+                    return 1
+                }
+            fi
+            # 确保 HostKey 配置
+            if ! grep -q '^HostKey /etc/ssh/ssh_host_ed25519_key' "$cfg"; then
+                echo 'HostKey /etc/ssh/ssh_host_ed25519_key' >> "$cfg"
+            fi
             # 开启 PubkeyAuthentication
             if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
                 sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
             else
                 echo "PubkeyAuthentication yes" >> "$cfg"
             fi
-            echo "当前配置文件中 PubkeyAuthentication 行："
-            grep -i 'PubkeyAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
-            # 确保 ED25519 HostKey 配置
-            if ! grep -q '^HostKey /etc/ssh/ssh_host_ed25519_key' "$cfg"; then
-                echo 'HostKey /etc/ssh/ssh_host_ed25519_key' >> "$cfg"
+            # 确保 PubkeyAcceptedKeyTypes 支持 ED25519
+            if grep -qE '^[#[:space:]]*PubkeyAcceptedKeyTypes' "$cfg"; then
+                sed -i 's/^[#[:space:]]*PubkeyAcceptedKeyTypes.*/PubkeyAcceptedKeyTypes +ssh-ed25519/' "$cfg"
+            else
+                echo "PubkeyAcceptedKeyTypes +ssh-ed25519" >> "$cfg"
+            fi
+            # 确保 AuthorizedKeysFile 配置
+            if ! grep -qE '^[#[:space:]]*AuthorizedKeysFile' "$cfg"; then
+                echo "AuthorizedKeysFile .ssh/authorized_keys" >> "$cfg"
+            fi
+            echo "当前配置文件中相关行："
+            grep -E 'PubkeyAuthentication|PubkeyAcceptedKeyTypes|AuthorizedKeysFile|HostKey' "$cfg" || echo "未找到相关行（已追加）。"
+            # 检查覆盖配置目录
+            if [[ -d /etc/ssh/sshd_config.d/ ]]; then
+                echo "警告：检测到 /etc/ssh/sshd_config.d/ 目录，可能有覆盖配置。请检查其内容。"
+                ls -l /etc/ssh/sshd_config.d/
             fi
             echo "重载 SSH 服务..."
             if ! { systemctl reload sshd || systemctl reload ssh || service ssh reload; }; then
-                echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh（注意：restart 可能断开当前会话）。"
+                echo "重载失败，尝试重启服务（注意：这可能断开当前 SSH 会话！）..."
+                if ! { systemctl restart sshd || systemctl restart ssh || service ssh restart; }; then
+                    echo "重启失败，请手动调查 SSH 服务状态。"
+                fi
             fi
             echo
             echo "✅ 已配置 ED25519 公钥登录（密码登录仍然保留）。"
             echo "👉 建议现在立刻在【新终端】测试：ssh -i id_ed25519 user@server"
             echo "验证配置："
-            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication' || echo "验证失败，请检查 sshd 配置。"
+            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyacceptedkeytypes|authorizedkeysfile' || echo "验证失败，请检查 sshd 配置和系统日志。"
             ;;
         2)
             # 关闭密钥登录
@@ -1672,13 +1698,21 @@ key_ed25519() {
             fi
             echo "当前配置文件中 PubkeyAuthentication 行："
             grep -i 'PubkeyAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
+            # 检查覆盖配置目录
+            if [[ -d /etc/ssh/sshd_config.d/ ]]; then
+                echo "警告：检测到 /etc/ssh/sshd_config.d/ 目录，可能有覆盖配置。请检查其内容。"
+                ls -l /etc/ssh/sshd_config.d/
+            fi
             echo "已在 $cfg 中禁用 PubkeyAuthentication（不会删除 authorized_keys）。"
             echo "重载 SSH 服务..."
             if ! { systemctl reload sshd || systemctl reload ssh || service ssh reload; }; then
-                echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh（注意：restart 可能断开当前会话）。"
+                echo "重载失败，尝试重启服务（注意：这可能断开当前 SSH 会话！）..."
+                if ! { systemctl restart sshd || systemctl restart ssh || service ssh restart; }; then
+                    echo "重启失败，请手动调查 SSH 服务状态。"
+                fi
             fi
             echo "验证配置："
-            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication' || echo "验证失败，请检查 sshd 配置。"
+            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyacceptedkeytypes|authorizedkeysfile' || echo "验证失败，请检查 sshd 配置和系统日志。"
             ;;
         3)
             echo "⚠️ 警告：这会关闭密码登录，只允许密钥登录。"
@@ -1707,13 +1741,21 @@ key_ed25519() {
             fi
             echo "当前配置文件中 ChallengeResponseAuthentication 行："
             grep -i 'ChallengeResponseAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
+            # 检查覆盖配置目录
+            if [[ -d /etc/ssh/sshd_config.d/ ]]; then
+                echo "警告：检测到 /etc/ssh/sshd_config.d/ 目录，可能有覆盖配置。请检查其内容。"
+                ls -l /etc/ssh/sshd_config.d/
+            fi
             echo "重载 SSH 服务..."
             if ! { systemctl reload sshd || systemctl reload ssh || service ssh reload; }; then
-                echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh（注意：restart 可能断开当前会话）。"
+                echo "重载失败，尝试重启服务（注意：这可能断开当前 SSH 会话！）..."
+                if ! { systemctl restart sshd || systemctl restart ssh || service ssh restart; }; then
+                    echo "重启失败，请手动调查 SSH 服务状态。"
+                fi
             fi
             echo "✅ 已尝试禁用密码登录，现在只允许密钥登录。"
             echo "验证配置："
-            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication' || echo "验证失败，请检查 sshd 配置。"
+            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication|pubkeyacceptedkeytypes|authorizedkeysfile' || echo "验证失败，请检查 sshd 配置和系统日志。"
             ;;
         0)
             return 0
@@ -1723,7 +1765,6 @@ key_ed25519() {
             ;;
     esac
 }
-
 
 #修改配置
 changeconf(){
