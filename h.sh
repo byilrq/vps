@@ -1523,7 +1523,6 @@ firewall() {
     echo " 0) 返回上级菜单"
     echo "-------------------------------------------------"
     read -p " 请选择 [0-2]：" ans
-
     case "$ans" in
         1)
             if ! command -v ufw >/dev/null 2>&1; then
@@ -1533,35 +1532,33 @@ firewall() {
                     return 1
                 }
             fi
-
             local ssh_port
             ssh_port="$(get_ssh_port)"
             echo "当前 SSH 端口：$ssh_port，将自动放行以防止被锁在外面。"
             echo
             read -rp " 请输入需要额外放行的端口（例如：2222 52000-53000，可留空）： " ports
-
             echo "开启 ufw 防火墙..."
             ufw --force enable
-
-            echo "放行 SSH 端口 ${ssh_port}/tcp"
+            echo "放行 SSH 端口 ${ssh_port}/tcp 和 ${ssh_port}/udp"
             ufw allow "${ssh_port}/tcp"
-
+            ufw allow "${ssh_port}/udp"
             for p in $ports; do
                 # 端口范围：如 52000-53000
                 if [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
                     local start end
                     IFS='-' read -r start end <<< "$p"
-                    echo "放行端口区间 ${start}-${end}/tcp"
+                    echo "放行端口区间 ${start}-${end}/tcp 和 ${start}-${end}/udp"
                     ufw allow "${start}:${end}/tcp"
+                    ufw allow "${start}:${end}/udp"
                 # 单个端口：如 2222
                 elif [[ "$p" =~ ^[0-9]+$ ]]; then
-                    echo "放行端口 ${p}/tcp"
+                    echo "放行端口 ${p}/tcp 和 ${p}/udp"
                     ufw allow "${p}/tcp"
+                    ufw allow "${p}/udp"
                 else
                     echo "忽略非法端口格式：$p"
                 fi
             done
-
             echo
             echo "当前 ufw 状态："
             ufw status numbered
@@ -1593,37 +1590,30 @@ key_ed25519() {
     echo " 0) 返回上级菜单"
     echo "-----------------------------------------------------"
     read -p " 请选择 [0-3]：" ans
-
     local cfg="/etc/ssh/sshd_config"
-
     case "$ans" in
         1)
             local user
             read -rp " 请输入要配置的 SSH 用户(默认 root)： " user
             [[ -z "$user" ]] && user="root"
-
             local home_dir
             home_dir=$(getent passwd "$user" | cut -d: -f6)
             if [[ -z "$home_dir" ]]; then
                 echo "找不到用户：$user"
                 return 1
             fi
-
             local ssh_dir="$home_dir/.ssh"
             local auth_keys="$ssh_dir/authorized_keys"
-
             echo "准备目录和权限：$ssh_dir"
             install -d -m 700 "$ssh_dir"
             touch "$auth_keys"
             chmod 600 "$auth_keys"
             chown -R "$user":"$user" "$ssh_dir"
-
             echo
             echo "请选择公钥来源："
             echo " 1) 从公钥文件读取 (例如：/root/.ssh/id_ed25519.pub)"
             echo " 2) 手动粘贴 ssh-ed25519 公钥字符串"
             read -p " 请选择 [1-2]：" src
-
             local pubkey=""
             if [[ "$src" == "1" ]]; then
                 read -rp " 请输入公钥文件路径：" path
@@ -1636,99 +1626,65 @@ key_ed25519() {
                 echo " 请粘贴以 ssh-ed25519 开头的公钥（不要粘贴私钥！），回车结束："
                 read -r pubkey
             fi
-
             # 安全检查：拒绝私钥
             if [[ "$pubkey" =~ ^-----BEGIN ]]; then
                 echo "检测到是私钥格式（-----BEGIN...），出于安全原因脚本拒绝保存私钥！"
                 return 1
             fi
-
             if [[ "$pubkey" != ssh-ed25519* ]]; then
                 echo "这看起来不是 ssh-ed25519 公钥（应以 ssh-ed25519 开头），已取消。"
                 return 1
             fi
-
             if grep -qF "$pubkey" "$auth_keys"; then
                 echo "该公钥已存在于 $auth_keys 中。"
             else
                 echo "$pubkey" >> "$auth_keys"
                 echo "已将公钥写入：$auth_keys"
             fi
-
             # 开启 PubkeyAuthentication
-            if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
-                sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
-            else
-                echo "PubkeyAuthentication yes" >> "$cfg"
-            fi
-
+            sed -i '/^[#]*[[:space:]]*PubkeyAuthentication[[:space:]]*/c\PubkeyAuthentication yes' "$cfg"
             # 确保 ED25519 HostKey 配置（大部分系统默认就有）
             if ! grep -q '^HostKey /etc/ssh/ssh_host_ed25519_key' "$cfg"; then
                 echo 'HostKey /etc/ssh/ssh_host_ed25519_key' >> "$cfg"
             fi
-
             echo "重载 SSH 服务..."
             systemctl reload sshd 2>/dev/null || \
-            systemctl reload ssh 2>/dev/null  || \
-            service ssh reload 2>/dev/null    || \
+            systemctl reload ssh 2>/dev/null || \
+            service ssh reload 2>/dev/null || \
             echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
-
             echo
             echo "✅ 已配置 ED25519 公钥登录（密码登录仍然保留）。"
             echo "👉 建议现在立刻在【新终端】测试：ssh -i id_ed25519 user@server"
             ;;
-
         2)
             # 关闭密钥登录
-            if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
-                sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication no/' "$cfg"
-            else
-                echo "PubkeyAuthentication no" >> "$cfg"
-            fi
-
+            sed -i '/^[#]*[[:space:]]*PubkeyAuthentication[[:space:]]*/c\PubkeyAuthentication no' "$cfg"
             echo "已在 $cfg 中禁用 PubkeyAuthentication（不会删除 authorized_keys）。"
-
             echo "重载 SSH 服务..."
             systemctl reload sshd 2>/dev/null || \
-            systemctl reload ssh 2>/dev/null  || \
-            service ssh reload 2>/dev/null    || \
+            systemctl reload ssh 2>/dev/null || \
+            service ssh reload 2>/dev/null || \
             echo "重载失败，请手动执行：systemctl restart sshd 或系统重启 SSH 服务。"
             ;;
-
         3)
             echo "⚠️ 警告：这会关闭密码登录，只允许密钥登录。"
             echo "⚠️ 请确认你已经用密钥成功登录过一次，否则可能把自己锁在外面。"
             read -p "确认继续？输入 yes 才会生效：" confirm
             [[ "$confirm" != "yes" ]] && { echo "已取消。"; return 0; }
-
-            if grep -qE '^[#[:space:]]*PasswordAuthentication' "$cfg"; then
-                sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' "$cfg"
-            else
-                echo "PasswordAuthentication no" >> "$cfg"
-            fi
-
+            sed -i '/^[#]*[[:space:]]*PasswordAuthentication[[:space:]]*/c\PasswordAuthentication no' "$cfg"
             # 建议同时关掉键盘交互认证
-            if grep -qE '^[#[:space:]]*KbdInteractiveAuthentication' "$cfg"; then
-                sed -i 's/^[#[:space:]]*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' "$cfg"
-            else
-                echo "KbdInteractiveAuthentication no" >> "$cfg"
-            fi
-
-            if grep -qE '^[#[:space:]]*ChallengeResponseAuthentication' "$cfg"; then
-                sed -i 's/^[#[:space:]]*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$cfg"
-            else
-                echo "ChallengeResponseAuthentication no" >> "$cfg"
-            fi
-
+            sed -i '/^[#]*[[:space:]]*KbdInteractiveAuthentication[[:space:]]*/c\KbdInteractiveAuthentication no' "$cfg"
+            sed -i '/^[#]*[[:space:]]*ChallengeResponseAuthentication[[:space:]]*/c\ChallengeResponseAuthentication no' "$cfg"
             echo "重载 SSH 服务..."
             systemctl reload sshd 2>/dev/null || \
-            systemctl reload ssh 2>/dev/null  || \
-            service ssh reload 2>/dev/null    || \
+            systemctl reload ssh 2>/dev/null || \
+            service ssh reload 2>/dev/null || \
             echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
-
             echo "✅ 已尝试禁用密码登录，现在只允许密钥登录。"
+            # 额外验证
+            echo "验证配置："
+            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication'
             ;;
-
         0)
             return 0
             ;;
@@ -1737,7 +1693,6 @@ key_ed25519() {
             ;;
     esac
 }
-
 
 
 #修改配置
