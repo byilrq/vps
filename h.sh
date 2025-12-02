@@ -1587,11 +1587,14 @@ firewall() {
 #设置开启密钥登录
 key_ed25519() {
     echo "---------------- ED25519 密钥登录设置 ----------------"
-    echo " 1) 开启 / 配置 ED25519 公钥登录"
+    echo " 1) 开启 / 配置 ED25519 公钥登录（保留密码登录）"
     echo " 2) 关闭密钥登录（禁用 PubkeyAuthentication）"
+    echo " 3) 禁用密码登录（仅允许密钥登录，危险操作！）"
     echo " 0) 返回上级菜单"
     echo "-----------------------------------------------------"
-    read -p " 请选择 [0-2]：" ans
+    read -p " 请选择 [0-3]：" ans
+
+    local cfg="/etc/ssh/sshd_config"
 
     case "$ans" in
         1)
@@ -1652,8 +1655,6 @@ key_ed25519() {
                 echo "已将公钥写入：$auth_keys"
             fi
 
-            local cfg="/etc/ssh/sshd_config"
-
             # 开启 PubkeyAuthentication
             if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
                 sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
@@ -1666,11 +1667,6 @@ key_ed25519() {
                 echo 'HostKey /etc/ssh/ssh_host_ed25519_key' >> "$cfg"
             fi
 
-            # 如果你想强制只接受 ed25519 类型，可以再加这一行（按需开启）：
-            # if ! grep -q '^PubkeyAcceptedKeyTypes' "$cfg"; then
-            #     echo 'PubkeyAcceptedKeyTypes ssh-ed25519' >> "$cfg"
-            # fi
-
             echo "重载 SSH 服务..."
             systemctl reload sshd 2>/dev/null || \
             systemctl reload ssh 2>/dev/null  || \
@@ -1678,12 +1674,12 @@ key_ed25519() {
             echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
 
             echo
-            echo "已配置 ED25519 公钥登录。"
-            echo "建议：在【新开一个终端】测试无密码登录成功后，再考虑关闭密码登录。"
+            echo "✅ 已配置 ED25519 公钥登录（密码登录仍然保留）。"
+            echo "👉 建议现在立刻在【新终端】测试：ssh -i id_ed25519 user@server"
             ;;
-        2)
-            local cfg="/etc/ssh/sshd_config"
 
+        2)
+            # 关闭密钥登录
             if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
                 sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication no/' "$cfg"
             else
@@ -1696,8 +1692,43 @@ key_ed25519() {
             systemctl reload sshd 2>/dev/null || \
             systemctl reload ssh 2>/dev/null  || \
             service ssh reload 2>/dev/null    || \
-            echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
+            echo "重载失败，请手动执行：systemctl restart sshd 或系统重启 SSH 服务。"
             ;;
+
+        3)
+            echo "⚠️ 警告：这会关闭密码登录，只允许密钥登录。"
+            echo "⚠️ 请确认你已经用密钥成功登录过一次，否则可能把自己锁在外面。"
+            read -p "确认继续？输入 yes 才会生效：" confirm
+            [[ "$confirm" != "yes" ]] && { echo "已取消。"; return 0; }
+
+            if grep -qE '^[#[:space:]]*PasswordAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' "$cfg"
+            else
+                echo "PasswordAuthentication no" >> "$cfg"
+            fi
+
+            # 建议同时关掉键盘交互认证
+            if grep -qE '^[#[:space:]]*KbdInteractiveAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' "$cfg"
+            else
+                echo "KbdInteractiveAuthentication no" >> "$cfg"
+            fi
+
+            if grep -qE '^[#[:space:]]*ChallengeResponseAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$cfg"
+            else
+                echo "ChallengeResponseAuthentication no" >> "$cfg"
+            fi
+
+            echo "重载 SSH 服务..."
+            systemctl reload sshd 2>/dev/null || \
+            systemctl reload ssh 2>/dev/null  || \
+            service ssh reload 2>/dev/null    || \
+            echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
+
+            echo "✅ 已尝试禁用密码登录，现在只允许密钥登录。"
+            ;;
+
         0)
             return 0
             ;;
@@ -1706,6 +1737,7 @@ key_ed25519() {
             ;;
     esac
 }
+
 
 
 #修改配置
