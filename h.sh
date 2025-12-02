@@ -15,7 +15,13 @@ skyblue() {
     echo -e "\033[1;36m$1\033[0m"
 }
 
-
+# 获取当前 SSH 端口，缺省为 22
+get_ssh_port() {
+    local port
+    port=$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | tail -n1 | awk '{print $2}')
+    [[ -z "$port" ]] && port=22
+    echo "$port"
+}
 
 red(){
     echo -e "\033[31m\033[01m$1\033[0m"
@@ -1509,6 +1515,197 @@ bbrx() {
   bash "$tmp_file"
 }
 
+#开启防火墙
+firewall() {
+    echo "---------------- 防火墙设置 (ufw) ----------------"
+    echo " 1) 开启防火墙并设置放行端口"
+    echo " 2) 关闭防火墙"
+    echo " 0) 返回上级菜单"
+    echo "-------------------------------------------------"
+    read -p " 请选择 [0-2]：" ans
+
+    case "$ans" in
+        1)
+            if ! command -v ufw >/dev/null 2>&1; then
+                echo "未检测到 ufw，准备安装 (Ubuntu)："
+                apt update && apt install -y ufw || {
+                    echo "安装 ufw 失败，请手动检查。"
+                    return 1
+                }
+            fi
+
+            local ssh_port
+            ssh_port="$(get_ssh_port)"
+            echo "当前 SSH 端口：$ssh_port，将自动放行以防止被锁在外面。"
+            echo
+            read -rp " 请输入需要额外放行的端口（例如：2222 52000-53000，可留空）： " ports
+
+            echo "开启 ufw 防火墙..."
+            ufw --force enable
+
+            echo "放行 SSH 端口 ${ssh_port}/tcp"
+            ufw allow "${ssh_port}/tcp"
+
+            for p in $ports; do
+                # 端口范围：如 52000-53000
+                if [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
+                    local start end
+                    IFS='-' read -r start end <<< "$p"
+                    echo "放行端口区间 ${start}-${end}/tcp"
+                    ufw allow "${start}:${end}/tcp"
+                # 单个端口：如 2222
+                elif [[ "$p" =~ ^[0-9]+$ ]]; then
+                    echo "放行端口 ${p}/tcp"
+                    ufw allow "${p}/tcp"
+                else
+                    echo "忽略非法端口格式：$p"
+                fi
+            done
+
+            echo
+            echo "当前 ufw 状态："
+            ufw status numbered
+            ;;
+        2)
+            if ! command -v ufw >/dev/null 2>&1; then
+                echo "未检测到 ufw，无需关闭。"
+                return 0
+            fi
+            echo "关闭 ufw 防火墙..."
+            ufw disable
+            ufw status
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            echo "无效选项。"
+            ;;
+    esac
+}
+
+#设置开启密钥登录
+key_ed25519() {
+    echo "---------------- ED25519 密钥登录设置 ----------------"
+    echo " 1) 开启 / 配置 ED25519 公钥登录"
+    echo " 2) 关闭密钥登录（禁用 PubkeyAuthentication）"
+    echo " 0) 返回上级菜单"
+    echo "-----------------------------------------------------"
+    read -p " 请选择 [0-2]：" ans
+
+    case "$ans" in
+        1)
+            local user
+            read -rp " 请输入要配置的 SSH 用户(默认 root)： " user
+            [[ -z "$user" ]] && user="root"
+
+            local home_dir
+            home_dir=$(getent passwd "$user" | cut -d: -f6)
+            if [[ -z "$home_dir" ]]; then
+                echo "找不到用户：$user"
+                return 1
+            fi
+
+            local ssh_dir="$home_dir/.ssh"
+            local auth_keys="$ssh_dir/authorized_keys"
+
+            echo "准备目录和权限：$ssh_dir"
+            install -d -m 700 "$ssh_dir"
+            touch "$auth_keys"
+            chmod 600 "$auth_keys"
+            chown -R "$user":"$user" "$ssh_dir"
+
+            echo
+            echo "请选择公钥来源："
+            echo " 1) 从公钥文件读取 (例如：/root/.ssh/id_ed25519.pub)"
+            echo " 2) 手动粘贴 ssh-ed25519 公钥字符串"
+            read -p " 请选择 [1-2]：" src
+
+            local pubkey=""
+            if [[ "$src" == "1" ]]; then
+                read -rp " 请输入公钥文件路径：" path
+                if [[ ! -f "$path" ]]; then
+                    echo "文件不存在：$path"
+                    return 1
+                fi
+                pubkey=$(<"$path")
+            else
+                echo " 请粘贴以 ssh-ed25519 开头的公钥（不要粘贴私钥！），回车结束："
+                read -r pubkey
+            fi
+
+            # 安全检查：拒绝私钥
+            if [[ "$pubkey" =~ ^-----BEGIN ]]; then
+                echo "检测到是私钥格式（-----BEGIN...），出于安全原因脚本拒绝保存私钥！"
+                return 1
+            fi
+
+            if [[ "$pubkey" != ssh-ed25519* ]]; then
+                echo "这看起来不是 ssh-ed25519 公钥（应以 ssh-ed25519 开头），已取消。"
+                return 1
+            fi
+
+            if grep -qF "$pubkey" "$auth_keys"; then
+                echo "该公钥已存在于 $auth_keys 中。"
+            else
+                echo "$pubkey" >> "$auth_keys"
+                echo "已将公钥写入：$auth_keys"
+            fi
+
+            local cfg="/etc/ssh/sshd_config"
+
+            # 开启 PubkeyAuthentication
+            if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
+            else
+                echo "PubkeyAuthentication yes" >> "$cfg"
+            fi
+
+            # 确保 ED25519 HostKey 配置（大部分系统默认就有）
+            if ! grep -q '^HostKey /etc/ssh/ssh_host_ed25519_key' "$cfg"; then
+                echo 'HostKey /etc/ssh/ssh_host_ed25519_key' >> "$cfg"
+            fi
+
+            # 如果你想强制只接受 ed25519 类型，可以再加这一行（按需开启）：
+            # if ! grep -q '^PubkeyAcceptedKeyTypes' "$cfg"; then
+            #     echo 'PubkeyAcceptedKeyTypes ssh-ed25519' >> "$cfg"
+            # fi
+
+            echo "重载 SSH 服务..."
+            systemctl reload sshd 2>/dev/null || \
+            systemctl reload ssh 2>/dev/null  || \
+            service ssh reload 2>/dev/null    || \
+            echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
+
+            echo
+            echo "已配置 ED25519 公钥登录。"
+            echo "建议：在【新开一个终端】测试无密码登录成功后，再考虑关闭密码登录。"
+            ;;
+        2)
+            local cfg="/etc/ssh/sshd_config"
+
+            if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication no/' "$cfg"
+            else
+                echo "PubkeyAuthentication no" >> "$cfg"
+            fi
+
+            echo "已在 $cfg 中禁用 PubkeyAuthentication（不会删除 authorized_keys）。"
+
+            echo "重载 SSH 服务..."
+            systemctl reload sshd 2>/dev/null || \
+            systemctl reload ssh 2>/dev/null  || \
+            service ssh reload 2>/dev/null    || \
+            echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
+            ;;
+        0)
+            return 0
+            ;;
+        *)
+            echo "无效选项。"
+            ;;
+    esac
+}
 
 
 #修改配置
@@ -1526,7 +1723,8 @@ changeconf(){
 	echo -e " ${GREEN}10.${tianlan} BBR/TCP 优化"
     echo -e " ${GREEN}11.${tianlan} 设置定时重启"  
     echo -e " ${GREEN}12.${tianlan} 修改SSH端口2222"  
-	echo -e " ${GREEN}13.${tianlan} 禁止国内IP"  
+	echo -e " ${GREEN}13.${tianlan} 设置防火墙"  
+	echo -e " ${GREEN}14.${tianlan} 设置密钥登录" 
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -1544,7 +1742,9 @@ changeconf(){
 		10 ) bbrx ;;
 	    11 ) cron ;;
         12 ) ssh_port 2222 ;;  # 修改SSH端口为2222
-		13 ) cnipban ;;  # 
+        13 ) firewall ;;        # 调用上面的防火墙函数
+        14 ) key_ed25519 ;;     # 调用上面的密钥登录函数
+
         * ) echo "无效选项，退出脚本"; exit 1 ;;
     esac
 }
