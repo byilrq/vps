@@ -1642,48 +1642,78 @@ key_ed25519() {
                 echo "已将公钥写入：$auth_keys"
             fi
             # 开启 PubkeyAuthentication
-            sed -i '/^[#]*[[:space:]]*PubkeyAuthentication[[:space:]]*/c\PubkeyAuthentication yes' "$cfg"
-            # 确保 ED25519 HostKey 配置（大部分系统默认就有）
+            if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication yes/' "$cfg"
+            else
+                echo "PubkeyAuthentication yes" >> "$cfg"
+            fi
+            echo "当前配置文件中 PubkeyAuthentication 行："
+            grep -i 'PubkeyAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
+            # 确保 ED25519 HostKey 配置
             if ! grep -q '^HostKey /etc/ssh/ssh_host_ed25519_key' "$cfg"; then
                 echo 'HostKey /etc/ssh/ssh_host_ed25519_key' >> "$cfg"
             fi
             echo "重载 SSH 服务..."
-            systemctl reload sshd 2>/dev/null || \
-            systemctl reload ssh 2>/dev/null || \
-            service ssh reload 2>/dev/null || \
-            echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
+            if ! { systemctl reload sshd || systemctl reload ssh || service ssh reload; }; then
+                echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh（注意：restart 可能断开当前会话）。"
+            fi
             echo
             echo "✅ 已配置 ED25519 公钥登录（密码登录仍然保留）。"
             echo "👉 建议现在立刻在【新终端】测试：ssh -i id_ed25519 user@server"
+            echo "验证配置："
+            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication' || echo "验证失败，请检查 sshd 配置。"
             ;;
         2)
             # 关闭密钥登录
-            sed -i '/^[#]*[[:space:]]*PubkeyAuthentication[[:space:]]*/c\PubkeyAuthentication no' "$cfg"
+            if grep -qE '^[#[:space:]]*PubkeyAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*PubkeyAuthentication.*/PubkeyAuthentication no/' "$cfg"
+            else
+                echo "PubkeyAuthentication no" >> "$cfg"
+            fi
+            echo "当前配置文件中 PubkeyAuthentication 行："
+            grep -i 'PubkeyAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
             echo "已在 $cfg 中禁用 PubkeyAuthentication（不会删除 authorized_keys）。"
             echo "重载 SSH 服务..."
-            systemctl reload sshd 2>/dev/null || \
-            systemctl reload ssh 2>/dev/null || \
-            service ssh reload 2>/dev/null || \
-            echo "重载失败，请手动执行：systemctl restart sshd 或系统重启 SSH 服务。"
+            if ! { systemctl reload sshd || systemctl reload ssh || service ssh reload; }; then
+                echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh（注意：restart 可能断开当前会话）。"
+            fi
+            echo "验证配置："
+            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication' || echo "验证失败，请检查 sshd 配置。"
             ;;
         3)
             echo "⚠️ 警告：这会关闭密码登录，只允许密钥登录。"
             echo "⚠️ 请确认你已经用密钥成功登录过一次，否则可能把自己锁在外面。"
             read -p "确认继续？输入 yes 才会生效：" confirm
             [[ "$confirm" != "yes" ]] && { echo "已取消。"; return 0; }
-            sed -i '/^[#]*[[:space:]]*PasswordAuthentication[[:space:]]*/c\PasswordAuthentication no' "$cfg"
-            # 建议同时关掉键盘交互认证
-            sed -i '/^[#]*[[:space:]]*KbdInteractiveAuthentication[[:space:]]*/c\KbdInteractiveAuthentication no' "$cfg"
-            sed -i '/^[#]*[[:space:]]*ChallengeResponseAuthentication[[:space:]]*/c\ChallengeResponseAuthentication no' "$cfg"
+            if grep -qE '^[#[:space:]]*PasswordAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*PasswordAuthentication.*/PasswordAuthentication no/' "$cfg"
+            else
+                echo "PasswordAuthentication no" >> "$cfg"
+            fi
+            echo "当前配置文件中 PasswordAuthentication 行："
+            grep -i 'PasswordAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
+            # 同时关掉键盘交互认证
+            if grep -qE '^[#[:space:]]*KbdInteractiveAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*KbdInteractiveAuthentication.*/KbdInteractiveAuthentication no/' "$cfg"
+            else
+                echo "KbdInteractiveAuthentication no" >> "$cfg"
+            fi
+            echo "当前配置文件中 KbdInteractiveAuthentication 行："
+            grep -i 'KbdInteractiveAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
+            if grep -qE '^[#[:space:]]*ChallengeResponseAuthentication' "$cfg"; then
+                sed -i 's/^[#[:space:]]*ChallengeResponseAuthentication.*/ChallengeResponseAuthentication no/' "$cfg"
+            else
+                echo "ChallengeResponseAuthentication no" >> "$cfg"
+            fi
+            echo "当前配置文件中 ChallengeResponseAuthentication 行："
+            grep -i 'ChallengeResponseAuthentication' "$cfg" || echo "未找到相关行（已追加）。"
             echo "重载 SSH 服务..."
-            systemctl reload sshd 2>/dev/null || \
-            systemctl reload ssh 2>/dev/null || \
-            service ssh reload 2>/dev/null || \
-            echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh"
+            if ! { systemctl reload sshd || systemctl reload ssh || service ssh reload; }; then
+                echo "重载失败，请手动执行：systemctl restart sshd 或 systemctl restart ssh（注意：restart 可能断开当前会话）。"
+            fi
             echo "✅ 已尝试禁用密码登录，现在只允许密钥登录。"
-            # 额外验证
             echo "验证配置："
-            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication'
+            sshd -T | grep -E 'pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|challengeresponseauthentication' || echo "验证失败，请检查 sshd 配置。"
             ;;
         0)
             return 0
