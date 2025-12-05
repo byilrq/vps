@@ -717,11 +717,150 @@ swap_cache() {
     echo "操作完成！新的 Swap 缓存大小为 ${size_mb} MB。"
 }
 
-# 上海三网路由节点 wget -qO- git.io/besttrace | bash   
-besttrace() {
-  wget -qO- git.io/besttrace | bash   
-}
+# ============================================
+# 上海三网回程路由测试函数 - trace()
+# 集成到您的管理脚本中使用
+# ============================================
 
+besttrace() {
+    # 颜色定义
+    local RED='\033[0;31m'
+    local GREEN='\033[0;32m'
+    local YELLOW='\033[1;33m'
+    local BLUE='\033[0;34m'
+    local PURPLE='\033[0;35m'
+    local CYAN='\033[0;36m'
+    local NC='\033[0m' # No Color
+    local BOLD='\033[1m'
+    
+    # 测试目标IP（上海三网）
+    local TELECOM_IP="202.96.209.133"
+    local UNICOM_IP="210.22.97.1"
+    local MOBILE_IP="211.136.112.200"
+    
+    # 测试参数
+    local MAX_HOPS=30
+    local TIMEOUT=15
+    
+    # 内部函数
+    print_separator() {
+        echo -e "${CYAN}==============================================${NC}"
+    }
+    
+    # 检查NextTrace
+    local NEXTTRACE_INSTALLED=false
+    if command -v nexttrace &> /dev/null; then
+        NEXTTRACE_INSTALLED=true
+    fi
+    
+    # 检查traceroute
+    if ! command -v traceroute &> /dev/null; then
+        echo -e "${RED}[✗] 错误: traceroute未安装${NC}"
+        echo "请运行: sudo apt-get install traceroute"
+        return 1
+    fi
+    
+    # 使用NextTrace测试
+    nexttrace_test() {
+        local target_ip=$1
+        local isp_name=$2
+        
+        echo -e "\n${PURPLE}[NextTrace] ${isp_name}回程测试 ($target_ip)${NC}"
+        echo -e "命令: nexttrace -m $MAX_HOPS $target_ip\n"
+        
+        if timeout $TIMEOUT nexttrace -m $MAX_HOPS "$target_ip"; then
+            echo -e "${GREEN}✓ ${isp_name}测试完成${NC}"
+            return 0
+        else
+            echo -e "${RED}✗ ${isp_name}测试超时或失败${NC}"
+            return 1
+        fi
+    }
+    
+    # 使用traceroute测试
+    traceroute_test() {
+        local target_ip=$1
+        local isp_name=$2
+        
+        echo -e "\n${PURPLE}[traceroute] ${isp_name}回程测试 ($target_ip)${NC}"
+        echo -e "命令: traceroute -m $MAX_HOPS -n $target_ip\n"
+        
+        if timeout $TIMEOUT traceroute -m $MAX_HOPS -n "$target_ip"; then
+            echo -e "${GREEN}✓ ${isp_name}测试完成${NC}"
+            return 0
+        else
+            echo -e "${RED}✗ ${isp_name}测试超时或失败${NC}"
+            return 1
+        fi
+    }
+    
+    # 开始测试
+    echo -e "${BOLD}${CYAN}"
+    echo "上海三网回程路由测试"
+    print_separator
+    echo -e "${NC}"
+    
+    # 记录开始时间
+    local start_time=$(date +%s)
+    local success_count=0
+    local total_count=3
+    
+    # 测试上海电信
+    if [ "$NEXTTRACE_INSTALLED" = true ]; then
+        nexttrace_test "$TELECOM_IP" "上海电信"
+    else
+        traceroute_test "$TELECOM_IP" "上海电信"
+    fi
+    [ $? -eq 0 ] && ((success_count++))
+    
+    echo -e "${CYAN}----------------------------------------------${NC}"
+    sleep 1
+    
+    # 测试上海联通
+    if [ "$NEXTTRACE_INSTALLED" = true ]; then
+        nexttrace_test "$UNICOM_IP" "上海联通"
+    else
+        traceroute_test "$UNICOM_IP" "上海联通"
+    fi
+    [ $? -eq 0 ] && ((success_count++))
+    
+    echo -e "${CYAN}----------------------------------------------${NC}"
+    sleep 1
+    
+    # 测试上海移动
+    if [ "$NEXTTRACE_INSTALLED" = true ]; then
+        nexttrace_test "$MOBILE_IP" "上海移动"
+    else
+        traceroute_test "$MOBILE_IP" "上海移动"
+    fi
+    [ $? -eq 0 ] && ((success_count++))
+    
+    # 计算总耗时
+    local end_time=$(date +%s)
+    local duration=$((end_time - start_time))
+    
+    # 输出测试结果摘要
+    echo ""
+    print_separator
+    echo -e "${BOLD}测试结果摘要:${NC}"
+    echo -e "  测试目标: 上海电信、上海联通、上海移动"
+    echo -e "  测试工具: $([ "$NEXTTRACE_INSTALLED" = true ] && echo "NextTrace" || echo "traceroute")"
+    echo -e "  成功数: $success_count/$total_count"
+    echo -e "  总耗时: ${duration}秒"
+    
+    if [ $success_count -eq $total_count ]; then
+        echo -e "${GREEN}✅ 所有测试均成功完成${NC}"
+    elif [ $success_count -eq 0 ]; then
+        echo -e "${RED}❌ 所有测试均失败${NC}"
+    else
+        echo -e "${YELLOW}⚠️  部分测试失败 ($success_count/$total_count)${NC}"
+    fi
+    
+    print_separator
+    echo ""
+    
+    return $((total_count - success_count))
+}
 
 linux_ps() {
 
