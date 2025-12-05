@@ -1768,84 +1768,90 @@ key_ed25519() {
 
 #修改配置
 changeconf(){
-    green "Hysteria 2 配置变更选择如下:"
-    echo -e " ${GREEN}1.${tianlan} 修改端口"
-    echo -e " ${GREEN}2.${tianlan} 修改密码"
-    echo -e " ${GREEN}3.${tianlan} 修改证书类型"
-    echo -e " ${GREEN}4.${tianlan} 修改伪装网站"
-    echo -e " ${GREEN}5.${tianlan} 修改时区"
-    echo -e " ${GREEN}6.${tianlan} 修改DNS"
-    echo -e " ${GREEN}7.${tianlan} 设置缓存" 
-    echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级" 
-    echo -e " ${GREEN}9.${tianlan} 安装BBR3"
-	echo -e " ${GREEN}10.${tianlan} BBR/TCP 优化"
-    echo -e " ${GREEN}11.${tianlan} 设置定时重启"  
-    echo -e " ${GREEN}12.${tianlan} 修改SSH端口2222"  
-	echo -e " ${GREEN}13.${tianlan} 设置防火墙"  
-	echo -e " ${GREEN}14.${tianlan} 设置密钥登录" 
-    echo " ---------------------------------------------------"
-    echo -e " ${GREEN}0.${PLAIN} 退出脚本"
-    echo ""
-    read -p " 请选择操作 [1-13]：" confAnswer
-    case $confAnswer in
-        1 ) changeport ;;
-        2 ) changepasswd ;;
-        3 ) change_cert ;;
-        4 ) changeproxysite ;;
-        5 ) change_tz ;;
-        6 ) set_dns_ui ;;
-        7 ) swap_cache ;;
-        8 ) set_ip_priority ;;
-        9 ) bbrv3 ;;
-		10 ) bbrx ;;
-	    11 ) cron ;;
-        12 ) ssh_port 2222 ;;  # 修改SSH端口为2222
-        13 ) firewall ;;        # 调用上面的防火墙函数
-        14 ) key_ed25519 ;;     # 调用上面的密钥登录函数
-
-        * ) echo "无效选项，退出脚本"; exit 1 ;;
-    esac
+    while true; do
+        green "Hysteria 2 配置变更选择如下:"
+        echo -e " ${GREEN}1.${tianlan} 修改端口"
+        echo -e " ${GREEN}2.${tianlan} 修改密码"
+        echo -e " ${GREEN}3.${tianlan} 修改证书类型"
+        echo -e " ${GREEN}4.${tianlan} 修改伪装网站"
+        echo -e " ${GREEN}5.${tianlan} 修改时区"
+        echo -e " ${GREEN}6.${tianlan} 修改DNS"
+        echo -e " ${GREEN}7.${tianlan} 设置缓存"
+        echo -e " ${GREEN}8.${tianlan} 设置IPV4/6优先级"
+        echo -e " ${GREEN}9.${tianlan} 安装BBR3"
+        echo -e " ${GREEN}10.${tianlan} BBR/TCP 优化"
+        echo -e " ${GREEN}11.${tianlan} 设置定时重启"
+        echo -e " ${GREEN}12.${tianlan} 修改SSH端口2222"
+        echo -e " ${GREEN}13.${tianlan} 设置防火墙"
+        echo -e " ${GREEN}14.${tianlan} 设置密钥登录"
+        echo " ---------------------------------------------------"
+        echo -e " ${GREEN}0.${PLAIN} 退出脚本"
+        echo ""
+        read -p " 请选择操作 [1-13]：" confAnswer
+        case $confAnswer in
+            1 ) changeport ;;
+            2 ) changepasswd ;;
+            3 ) change_cert ;;
+            4 ) changeproxysite ;;
+            5 ) change_tz ;;
+            6 ) set_dns_ui ;;
+            7 ) swap_cache ;;
+            8 ) set_ip_priority ;;
+            9 ) bbrv3 ;;
+            10 ) bbrx ;;
+            11 ) cron ;;
+            12 ) ssh_port 2222 ;; # 修改SSH端口为2222
+            13 ) firewall ;; # 调用上面的防火墙函数
+            14 ) key_ed25519 ;; # 调用上面的密钥登录函数
+            0 ) break ;;  # Exit the loop on 0
+            * ) echo "无效选项，请重新选择";;
+        esac
+        clear  # Clear screen before redisplaying the menu
+    done
 }
 
-
 menu() {
-    clear
-    echo "#############################################################"
-    echo -e "#         ${tianlan}Hysteria 2 一键安装脚本      #"
-    echo "#############################################################"
-    echo ""
-    echo -e " ${GREEN}1.${GREEN}安装 Hysteria 2"
-    echo -e " ${GREEN}2.${zi}卸载 Hysteria 2"
-    echo " ---------------------------------------------------"
-    echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hysteria 2"
-    echo -e " ${GREEN}4.${tianlan} 修改 系统配置"
-    echo -e " ${GREEN}5.${tianlan} 显示 配置文件"
-    echo -e " ${GREEN}6.${tianlan} 查询 运行状态"
-    echo -e " ${GREEN}7.${tianlan} 更新内核方式1（官方）"
-    echo -e " ${GREEN}8.${tianlan} 更新内核方式2（脚本）"
-    echo -e " ${GREEN}9.${tianlan} 回程测试"  
-    echo -e " ${GREEN}10.${tianlan} IP质量检测"  
-    echo -e " ${GREEN}11.${tianlan} 系统查询"  
-    echo -e " ${GREEN}12.${tianlan} 系统更新" 
-    echo " ---------------------------------------------------"
-    echo -e " ${GREEN}0.${PLAIN} 退出脚本"
-    echo ""
-    read -rp "请输入选项 [0-12]: " menuInput
-    case $menuInput in
-        1 ) insthysteria ;;
-        2 ) unsthysteria ;;
-        3 ) hysteriaswitch ;;
-        4 ) changeconf ;;
-        5 ) showconf ;;
-        6 ) showstatus ;;
-        7 ) update_core1 ;;
-        8 ) update_core2 ;;
-        9 ) besttrace ;;
-        10 ) ipquality ;;
-        11)  linux_ps;;
-        12)  linux_update;;
-        * ) exit 1 ;;
-    esac
+    while true; do
+        clear
+        echo "#############################################################"
+        echo -e "# ${tianlan}Hysteria 2 一键安装脚本 #"
+        echo "#############################################################"
+        echo ""
+        echo -e " ${GREEN}1.${GREEN}安装 Hysteria 2"
+        echo -e " ${GREEN}2.${zi}卸载 Hysteria 2"
+        echo " ---------------------------------------------------"
+        echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hysteria 2"
+        echo -e " ${GREEN}4.${tianlan} 修改 系统配置"
+        echo -e " ${GREEN}5.${tianlan} 显示 配置文件"
+        echo -e " ${GREEN}6.${tianlan} 查询 运行状态"
+        echo -e " ${GREEN}7.${tianlan} 更新内核方式1（官方）"
+        echo -e " ${GREEN}8.${tianlan} 更新内核方式2（脚本）"
+        echo -e " ${GREEN}9.${tianlan} 回程测试"
+        echo -e " ${GREEN}10.${tianlan} IP质量检测"
+        echo -e " ${GREEN}11.${tianlan} 系统查询"
+        echo -e " ${GREEN}12.${tianlan} 系统更新"
+        echo " ---------------------------------------------------"
+        echo -e " ${GREEN}0.${PLAIN} 退出脚本"
+        echo ""
+        read -rp "请输入选项 [0-12]: " menuInput
+        case $menuInput in
+            1 ) insthysteria ;;
+            2 ) unsthysteria ;;
+            3 ) hysteriaswitch ;;
+            4 ) changeconf ;;
+            5 ) showconf ;;
+            6 ) showstatus ;;
+            7 ) update_core1 ;;
+            8 ) update_core2 ;;
+            9 ) besttrace ;;
+            10 ) ipquality ;;
+            11) linux_ps;;
+            12) linux_update;;
+            0 ) break ;;  # Exit the loop on 0
+            * ) echo "无效选项，请重新选择";;
+        esac
+        clear  # Clear screen before redisplaying the menu
+    done
 }
 
 menu
