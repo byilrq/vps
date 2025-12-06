@@ -215,8 +215,8 @@ inst_pwd(){
 }
 
 inst_site(){
-    read -rp "请输入 Hysteria 2 的伪装网站地址 （去除https://） [回车:maimai.sega.jp]：" proxysite
-    [[ -z $proxysite ]] && proxysite="maimai.sega.jp"
+    read -rp "请输入 Hysteria 2 的伪装网站地址 （去除https://） [回车:video.unext.jp]：" proxysite
+    [[ -z $proxysite ]] && proxysite="video.unext.jp"
     yellow "使用在 Hysteria 2 节点的伪装网站为：$proxysite"
 }
 
@@ -270,6 +270,10 @@ quic:
   maxIdleTimeout: 90s 
   maxIncomingStreams: 1024 
   disablePathMTUDiscovery: false 
+
+  bandwidth:
+  up: 500 mbps
+  down: 100 mbps
 
 auth:
   type: password
