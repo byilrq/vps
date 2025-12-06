@@ -738,18 +738,20 @@ besttrace() {
     declare -A pcode=( [1]="Beijing" [2]="Shanghai" [3]="Guangzhou" [4]="Chengdu" )  # Example provinces; expand as needed.
     declare -A pshort=( [1]="BJ" [2]="SH" [3]="GZ" [4]="CD" )
     declare -A pdm  # ISP endpoints (example IPs; replace with actual if needed for accuracy).
-    pdm[11$ipv]="210.22.84.3"   # Beijing Telecom
-    pdm[12$ipv]="219.158.3.243" # Beijing Unicom
-    pdm[13$ipv]="221.183.55.36" # Beijing Mobile (adjusted for example)
-    pdm[21$ipv]="58.32.0.1"     # Shanghai Telecom
-    pdm[22$ipv]="113.17.174.6"  # Shanghai Unicom
-    pdm[23$ipv]="120.80.255.255"# Shanghai Mobile
-    # Add more provinces/ISPs as per original script's full array if required.
+    pdm[114]="210.22.84.3"   # Beijing Telecom IPv4
+    pdm[124]="219.158.3.243" # Beijing Unicom IPv4
+    pdm[134]="221.183.55.36" # Beijing Mobile IPv4
+    pdm[214]="58.32.0.1"     # Shanghai Telecom IPv4
+    pdm[224]="113.17.174.6"  # Shanghai Unicom IPv4
+    pdm[234]="120.80.255.255"# Shanghai Mobile IPv4
+    # For IPv6, add pdm[116]="etc." if needed; currently using IPv4 examples.
+    # Example IPv6 endpoints (add more as required):
+    # pdm[116]="2400:dd00:1::1"  # Placeholder for Beijing Telecom IPv6
 
-    local ping_test_count=4  # Number of probes per endpoint (original uses up to 44 for detailed mode).
+    local ping_test_count=4  # Number of probes per endpoint.
     local max_threads=10     # Limit concurrency to avoid overload.
     local current_threads=0
-    local tmpresult=""
+    local tmpfile=$(mktemp)  # Temporary file to capture parallel outputs.
 
     # Helper function for single ping test (adapted from original ping_test).
     ping_test_helper() {
@@ -763,18 +765,21 @@ besttrace() {
         if [[ -z "$rtt" || ! "$rtt" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
             rtt=0.00
         fi
-        echo "$province $isp $ipv $count $rtt"
+        echo "$province $isp $ipv $count $rtt" >> "$tmpfile"
     }
 
     # Run tests in parallel.
     for count in $(seq 1 "$ping_test_count"); do
         for province in "${!pcode[@]}"; do
             for isp in 1 2 3; do
-                ping_test_helper "${pdm[$province$isp$ipv]}" "$count" "$province" "$isp" &
-                ((current_threads++))
-                if ((current_threads >= max_threads)); then
-                    wait -n
-                    ((current_threads--))
+                local domain="${pdm[$province$isp$ipv]}"
+                if [[ -n "$domain" ]]; then
+                    ping_test_helper "$domain" "$count" "$province" "$isp" &
+                    ((current_threads++))
+                    if ((current_threads >= max_threads)); then
+                        wait -n
+                        ((current_threads--))
+                    fi
                 fi
             done
         done
@@ -782,12 +787,29 @@ besttrace() {
     wait  # Wait for all background jobs.
 
     # Process results (adapted from process_pingtestresult).
-    declare -A pout pavg presu
+    declare -A presu pcount pavg
     while IFS= read -r line; do
-        # Assuming tmpresult populated from background echoes; in practice, capture via temp file or pipe if needed.
-        # For brevity, simulate aggregation here (expand with actual capture in full implementation).
-        # ...
-    done <<< "$tmpresult"  # Placeholder; implement full capture.
+        if [[ -n "$line" ]]; then
+            read -r province isp ipv count rtt <<< "$line"
+            if (($(echo "$rtt > 0" | bc -l))); then
+                presu["$province$isp$ipv"]=$(bc <<< "${presu["$province$isp$ipv"]:-0} + $rtt")
+                pcount["$province$isp$ipv"]=$(( ${pcount["$province$isp$ipv"]:-0} + 1 ))
+            fi
+        fi
+    done < "$tmpfile"
+    rm "$tmpfile"
+
+    # Calculate averages.
+    for province in "${!pcode[@]}"; do
+        for isp in 1 2 3; do
+            local key="$province$isp$ipv"
+            if [[ ${pcount[$key]:-0} -gt 0 ]]; then
+                pavg[$key]=$(bc <<< "scale=2; ${presu[$key]} / ${pcount[$key]}")
+            else
+                pavg[$key]="N/A"
+            fi
+        done
+    done
 
     # Output structured results.
     echo "Three-Network Latency Test Results (IPv$ipv):"
@@ -796,9 +818,37 @@ besttrace() {
         local telecom_avg="${pavg[$province1$ipv]:-N/A}"
         local unicom_avg="${pavg[$province2$ipv]:-N/A}"
         local mobile_avg="${pavg[$province3$ipv]:-N/A}"
-        local color_telecom=$([[ "$telecom_avg" =~ ^[0-9]+$ && "$telecom_avg" -le 150 ]] && echo "\033[32m" || ([[ "$telecom_avg" -le 240 ]] && echo "\033[33m" || echo "\033[31m"))
-        local color_unicom=$([[ "$unicom_avg" =~ ^[0-9]+$ && "$unicom_avg" -le 150 ]] && echo "\033[32m" || ([[ "$unicom_avg" -le 240 ]] && echo "\033[33m" || echo "\033[31m"))
-        local color_mobile=$([[ "$mobile_avg" =~ ^[0-9]+$ && "$mobile_avg" -le 150 ]] && echo "\033[32m" || ([[ "$mobile_avg" -le 240 ]] && echo "\033[33m" || echo "\033[31m"))
+
+        # Color for Telecom
+        local color_telecom="\033[31m"  # Default red for N/A or high
+        if [[ "$telecom_avg" != "N/A" ]]; then
+            if (($(echo "$telecom_avg <= 150" | bc -l))); then
+                color_telecom="\033[32m"
+            elif (($(echo "$telecom_avg <= 240" | bc -l))); then
+                color_telecom="\033[33m"
+            fi
+        fi
+
+        # Color for Unicom
+        local color_unicom="\033[31m"
+        if [[ "$unicom_avg" != "N/A" ]]; then
+            if (($(echo "$unicom_avg <= 150" | bc -l))); then
+                color_unicom="\033[32m"
+            elif (($(echo "$unicom_avg <= 240" | bc -l))); then
+                color_unicom="\033[33m"
+            fi
+        fi
+
+        # Color for Mobile
+        local color_mobile="\033[31m"
+        if [[ "$mobile_avg" != "N/A" ]]; then
+            if (($(echo "$mobile_avg <= 150" | bc -l))); then
+                color_mobile="\033[32m"
+            elif (($(echo "$mobile_avg <= 240" | bc -l))); then
+                color_mobile="\033[33m"
+            fi
+        fi
+
         printf "%-8s | %s%-6s ms\033[0m | %s%-6s ms\033[0m | %s%-6s ms\033[0m\n" "${pshort[$province]}" "$color_telecom" "$telecom_avg" "$color_unicom" "$unicom_avg" "$color_mobile" "$mobile_avg"
     done
 }
