@@ -727,144 +727,170 @@ swap_cache() {
 # ============================================
 
 besttrace() {
+    local output_format="${1:-standard}"
+    local result_file="/tmp/speedtest_result_$$.txt"
+    
     # 颜色定义
-    local RED='\033[0;31m'
-    local GREEN='\033[0;32m'
-    local YELLOW='\033[1;33m'
-    local BLUE='\033[0;34m'
-    local PURPLE='\033[0;35m'
-    local CYAN='\033[0;36m'
-    local NC='\033[0m' # No Color
-    local BOLD='\033[1m'
+    RED="\033[31m"
+    GREEN="\033[32m"
+    YELLOW="\033[33m"
+    BLUE="\033[34m"
+    PURPLE="\033[35m"
+    CYAN="\033[36m"
+    WHITE="\033[37m"
+    BOLD="\033[1m"
+    RESET="\033[0m"
     
-    # 测试目标IP（上海三网）
-    local TELECOM_IP="202.96.209.133"
-    local UNICOM_IP="210.22.97.1"
-    local MOBILE_IP="211.136.112.200"
-    
-    # 测试参数
-    local MAX_HOPS=30
-    local TIMEOUT=15
-    
-    # 内部函数
-    print_separator() {
-        echo -e "${CYAN}==============================================${NC}"
-    }
-    
-    # 检查NextTrace
-    local NEXTTRACE_INSTALLED=false
-    if command -v nexttrace &> /dev/null; then
-        NEXTTRACE_INSTALLED=true
-    fi
-    
-    # 检查traceroute
-    if ! command -v traceroute &> /dev/null; then
-        echo -e "${RED}[✗] 错误: traceroute未安装${NC}"
-        echo "请运行: sudo apt-get install traceroute"
-        return 1
-    fi
-    
-    # 使用NextTrace测试
-    nexttrace_test() {
-        local target_ip=$1
-        local isp_name=$2
-        
-        echo -e "\n${PURPLE}[NextTrace] ${isp_name}回程测试 ($target_ip)${NC}"
-        echo -e "命令: nexttrace -m $MAX_HOPS $target_ip\n"
-        
-        if timeout $TIMEOUT nexttrace -m $MAX_HOPS "$target_ip"; then
-            echo -e "${GREEN}✓ ${isp_name}测试完成${NC}"
-            return 0
-        else
-            echo -e "${RED}✗ ${isp_name}测试超时或失败${NC}"
-            return 1
+    # 检测 speedtest-cli
+    check_speedtest() {
+        if ! command -v speedtest-cli &> /dev/null; then
+            echo "正在安装 speedtest-cli..."
+            if command -v apt-get &> /dev/null; then
+                apt-get update && apt-get install -y speedtest-cli
+            elif command -v yum &> /dev/null; then
+                yum install -y speedtest-cli
+            elif command -v brew &> /dev/null; then
+                brew install speedtest-cli
+            else
+                echo "请手动安装 speedtest-cli: pip install speedtest-cli"
+                exit 1
+            fi
         fi
     }
     
-    # 使用traceroute测试
-    traceroute_test() {
-        local target_ip=$1
-        local isp_name=$2
+    # 格式化输出
+    format_output() {
+        case $output_format in
+            "json")
+                echo "{"
+                echo "  \"location\": \"上海\","
+                echo "  \"tests\": ["
+                local first=true
+                for test in "${tests[@]}"; do
+                    if [ "$first" = true ]; then
+                        first=false
+                    else
+                        echo ","
+                    fi
+                    echo "$test"
+                done
+                echo "  ]"
+                echo "}"
+                ;;
+            "simple")
+                echo "上海三网测速结果："
+                echo "=================="
+                for test in "${tests[@]}"; do
+                    echo "$test" | grep -o '"name":"[^"]*","speed":"[^"]*"'
+                done
+                ;;
+            *)
+                echo -e "${BOLD}${CYAN}=== 上海三网测速结果 ===${RESET}"
+                echo ""
+                for test in "${tests[@]}"; do
+                    local name=$(echo "$test" | grep -o '"name":"[^"]*"' | cut -d'"' -f4)
+                    local speed=$(echo "$test" | grep -o '"speed":"[^"]*"' | cut -d'"' -f4)
+                    echo -e "${YELLOW}$name${RESET}: $speed"
+                done
+                ;;
+        esac
+    }
+    
+    # 测试单个服务器
+    test_single_server() {
+        local server_id="$1"
+        local isp="$2"
+        local server_name="$3"
         
-        echo -e "\n${PURPLE}[traceroute] ${isp_name}回程测试 ($target_ip)${NC}"
-        echo -e "命令: traceroute -m $MAX_HOPS -n $target_ip\n"
+        echo -e "${BLUE}正在测试 $server_name...${RESET}"
         
-        if timeout $TIMEOUT traceroute -m $MAX_HOPS -n "$target_ip"; then
-            echo -e "${GREEN}✓ ${isp_name}测试完成${NC}"
-            return 0
+        # 运行 speedtest
+        speedtest-cli --server "$server_id" --simple --timeout 30 > "$result_file" 2>&1
+        
+        if [ $? -eq 0 ]; then
+            local ping=$(grep -i ping "$result_file" | grep -oE '[0-9]+\.[0-9]+')
+            local download=$(grep -i download "$result_file" | grep -oE '[0-9]+\.[0-9]+')
+            local upload=$(grep -i upload "$result_file" | grep -oE '[0-9]+\.[0-9]+')
+            
+            local result="{\"name\":\"$server_name\",\"isp\":\"$isp\",\"ping\":\"${ping}ms\",\"download\":\"${download}Mbps\",\"upload\":\"${upload}Mbps\",\"speed\":\"↓${download} ↑${upload}\"}"
+            tests+=("$result")
         else
-            echo -e "${RED}✗ ${isp_name}测试超时或失败${NC}"
-            return 1
+            echo -e "${RED}测试 $server_name 失败${RESET}"
+            local result="{\"name\":\"$server_name\",\"isp\":\"$isp\",\"error\":\"测试失败\"}"
+            tests+=("$result")
         fi
     }
     
-    # 开始测试
-    echo -e "${BOLD}${CYAN}"
-    echo "上海三网回程路由测试"
-    print_separator
-    echo -e "${NC}"
+    # 主函数
+    main() {
+        check_speedtest
+        
+        # 上海地区的测试服务器（基于原脚本）
+        # 电信服务器
+        local telecom_servers=(
+            "5083 上海电信"
+            "3633 上海电信5G"
+        )
+        
+        # 联通服务器
+        local unicom_servers=(
+            "13704 上海联通"
+            "24447 上海联通5G"
+        )
+        
+        # 移动服务器
+        local mobile_servers=(
+            "4665 上海移动"
+            "16398 上海移动5G"
+        )
+        
+        # 存储测试结果
+        declare -a tests
+        
+        echo -e "${BOLD}开始上海三网测速...${RESET}"
+        echo ""
+        
+        # 测试电信
+        echo -e "${GREEN}=== 电信网络测试 ===${RESET}"
+        for server in "${telecom_servers[@]}"; do
+            local id=$(echo "$server" | awk '{print $1}')
+            local name=$(echo "$server" | awk '{print $2}')
+            test_single_server "$id" "电信" "$name"
+        done
+        
+        # 测试联通
+        echo -e "${GREEN}=== 联通网络测试 ===${RESET}"
+        for server in "${unicom_servers[@]}"; do
+            local id=$(echo "$server" | awk '{print $1}')
+            local name=$(echo "$server" | awk '{print $2}')
+            test_single_server "$id" "联通" "$name"
+        done
+        
+        # 测试移动
+        echo -e "${GREEN}=== 移动网络测试 ===${RESET}"
+        for server in "${mobile_servers[@]}"; do
+            local id=$(echo "$server" | awk '{print $1}')
+            local name=$(echo "$server" | awk '{print $2}')
+            test_single_server "$id" "移动" "$name"
+        done
+        
+        # 清理临时文件
+        rm -f "$result_file"
+        
+        # 输出结果
+        format_output
+        
+        return 0
+    }
     
-    # 记录开始时间
-    local start_time=$(date +%s)
-    local success_count=0
-    local total_count=3
-    
-    # 测试上海电信
-    if [ "$NEXTTRACE_INSTALLED" = true ]; then
-        nexttrace_test "$TELECOM_IP" "上海电信"
-    else
-        traceroute_test "$TELECOM_IP" "上海电信"
-    fi
-    [ $? -eq 0 ] && ((success_count++))
-    
-    echo -e "${CYAN}----------------------------------------------${NC}"
-    sleep 1
-    
-    # 测试上海联通
-    if [ "$NEXTTRACE_INSTALLED" = true ]; then
-        nexttrace_test "$UNICOM_IP" "上海联通"
-    else
-        traceroute_test "$UNICOM_IP" "上海联通"
-    fi
-    [ $? -eq 0 ] && ((success_count++))
-    
-    echo -e "${CYAN}----------------------------------------------${NC}"
-    sleep 1
-    
-    # 测试上海移动
-    if [ "$NEXTTRACE_INSTALLED" = true ]; then
-        nexttrace_test "$MOBILE_IP" "上海移动"
-    else
-        traceroute_test "$MOBILE_IP" "上海移动"
-    fi
-    [ $? -eq 0 ] && ((success_count++))
-    
-    # 计算总耗时
-    local end_time=$(date +%s)
-    local duration=$((end_time - start_time))
-    
-    # 输出测试结果摘要
-    echo ""
-    print_separator
-    echo -e "${BOLD}测试结果摘要:${NC}"
-    echo -e "  测试目标: 上海电信、上海联通、上海移动"
-    echo -e "  测试工具: $([ "$NEXTTRACE_INSTALLED" = true ] && echo "NextTrace" || echo "traceroute")"
-    echo -e "  成功数: $success_count/$total_count"
-    echo -e "  总耗时: ${duration}秒"
-    
-    if [ $success_count -eq $total_count ]; then
-        echo -e "${GREEN}✅ 所有测试均成功完成${NC}"
-    elif [ $success_count -eq 0 ]; then
-        echo -e "${RED}❌ 所有测试均失败${NC}"
-    else
-        echo -e "${YELLOW}⚠️  部分测试失败 ($success_count/$total_count)${NC}"
-    fi
-    
-    print_separator
-    echo ""
-    
-    return $((total_count - success_count))
+    # 执行主函数
+    main
 }
+
+# 如果直接运行此脚本，则执行测试
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    shanghai_three_net_speedtest "$@"
+fi
 
 linux_ps() {
 
