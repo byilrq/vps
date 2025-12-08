@@ -1533,13 +1533,31 @@ firewall() {
     read -p " 请选择 [0-2]：" ans
     case "$ans" in
         1)
-            if ! command -v ufw >/dev/null 2>&1; then
-                echo "未检测到 ufw，准备安装 (Ubuntu)："
-                apt update && apt install -y ufw || {
+            # 确保用 root 运行
+            if [[ $EUID -ne 0 ]]; then
+                echo "请使用 root 权限运行此脚本（例如：sudo bash h.sh）。"
+                return 1
+            fi
+
+            # 清掉可能的旧 hash
+            hash -r
+
+            # 如果没有 ufw 或文件不存在，就安装
+            if ! command -v ufw >/dev/null 2>&1 || [ ! -x "$(command -v ufw 2>/dev/null)" ]; then
+                echo "未检测到可用的 ufw，准备安装 (Ubuntu)："
+                if ! apt update || ! apt install -y ufw; then
                     echo "安装 ufw 失败，请手动检查。"
                     return 1
-                }
+                fi
+                hash -r
             fi
+
+            # 再次严格确认
+            if ! command -v ufw >/dev/null 2>&1 || [ ! -x "$(command -v ufw)" ]; then
+                echo "系统中仍然找不到可执行的 ufw（可能文件损坏或路径不正确），请手动排查。"
+                return 1
+            fi
+
             local ssh_port
             ssh_port="$(get_ssh_port)"
             echo "当前 SSH 端口：$ssh_port，将自动放行以防止被锁在外面。"
@@ -1550,15 +1568,14 @@ firewall() {
             echo "放行 SSH 端口 ${ssh_port}/tcp 和 ${ssh_port}/udp"
             ufw allow "${ssh_port}/tcp"
             ufw allow "${ssh_port}/udp"
+
             for p in $ports; do
-                # 端口范围：如 52000-53000
                 if [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
                     local start end
                     IFS='-' read -r start end <<< "$p"
                     echo "放行端口区间 ${start}-${end}/tcp 和 ${start}-${end}/udp"
                     ufw allow "${start}:${end}/tcp"
                     ufw allow "${start}:${end}/udp"
-                # 单个端口：如 2222
                 elif [[ "$p" =~ ^[0-9]+$ ]]; then
                     echo "放行端口 ${p}/tcp 和 ${p}/udp"
                     ufw allow "${p}/tcp"
@@ -1588,6 +1605,7 @@ firewall() {
             ;;
     esac
 }
+
 
 #设置开启密钥登录
 key_ed25519() {
