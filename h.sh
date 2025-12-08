@@ -271,10 +271,6 @@ quic:
   maxIncomingStreams: 1024 
   disablePathMTUDiscovery: false 
 
-  bandwidth:
-  up: 500 mbps
-  down: 100 mbps
-
 auth:
   type: password
   password: $auth_pwd
