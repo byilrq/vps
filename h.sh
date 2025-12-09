@@ -233,10 +233,29 @@ insthysteria(){
         realip
     fi
 
-    if [[ ! ${SYSTEM} == "CentOS" ]]; then
-        ${PACKAGE_UPDATE}
-    fi
-    ${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
+   # 函数：等待 apt 锁释放
+wait_for_apt_lock() {
+    local max_attempts=60  # 最大等待时间约1分钟（每秒检查一次）
+    local attempt=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        if [ $attempt -ge $max_attempts ]; then
+            red "apt 锁等待超时，请手动检查进程并释放锁（例如 kill <PID>），然后重试。"
+            exit 1
+        fi
+        yellow "apt 锁被占用（可能有其他更新进程），等待中... ($attempt/$max_attempts)"
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    green "apt 锁已释放，继续安装。"
+}
+
+# 在更新和安装前调用等待函数
+if [[ ! ${SYSTEM} == "CentOS" ]]; then
+    wait_for_apt_lock
+    ${PACKAGE_UPDATE}
+fi
+wait_for_apt_lock
+${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
 
     wget -N https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh
     bash install_server.sh
