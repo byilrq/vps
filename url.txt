@@ -10,14 +10,14 @@ V2N使用方法：
 3.core类型选hy2
 4.Socks端口填  yaml文件中的端口；
 
-小火箭：
+🚀：
 地址：IP
 端口填一个  UDP范围内的端口；
 TLS：填www.bing.com
 快速打开：选上
 带宽
-心跳：10
-
+心跳：105
 sni: 如果你用的是ca证书，这里填入你的域名,如果你是自签证书，这里填入www.bing.com;(有的协议填伪装域名)
 insecure: 如果你用的是ca证书,insecure为false;如果你是自签证书，insecure要改成true
+
 
