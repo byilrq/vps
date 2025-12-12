@@ -1,3 +1,4 @@
+
 #!/bin/bash
 
 export LANG=en_US.UTF-8
@@ -604,7 +605,7 @@ showconf(){
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下，并保存到 /root/hy/hy-client.yaml"
     green "$(cat /root/hy/hy-client.yaml)"
     yellow "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur1.txt"
-    green "$(cat /root/hy/ur2.txt)"
+    green "$(cat /root/hy/ur1.txt)"
     yellow "Hysteria 2 二维码如下"
     qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)"
     systemctl restart hysteria-server.service
