@@ -639,6 +639,26 @@ showstatus(){
     systemctl status hysteria-server.service
 }
 
+wait_for_apt_lock() {
+    local timeout=60  # Maximum wait time in seconds (5 minutes)
+    local count=0
+    while sudo fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 ||
+          sudo fuser /var/lib/dpkg/lock >/dev/null 2>&1 ||
+          sudo fuser /var/lib/apt/lists/lock >/dev/null 2>&1 ||
+          sudo fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
+        if [ $count -ge $timeout ]; then
+            echo "Timed out waiting for apt lock after $timeout seconds."
+            return 1
+        fi
+        echo "Waiting for apt lock to be released..."
+        sleep 1
+        count=$((count + 1))
+    done
+    return 0
+}
+
+
+
 linux_update() {
     echo -e "${green}正在系统更新...${green}"
     if command -v dnf &>/dev/null; then
