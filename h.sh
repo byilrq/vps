@@ -353,10 +353,8 @@ transport:
     hopInterval: 15s 
 EOF
   
-    ur1="hysteria2://$auth_pwd@$last_ip:$last_port/?insecure=1&sni=$hy_domain#Misaka-Hysteria2"
-    ur2="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
+    ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
     echo $ur1 > /root/hy/ur1.txt
-    echo $ur2 > /root/hy/ur2.txt
 
     systemctl daemon-reload
     systemctl enable hysteria-server
@@ -372,10 +370,10 @@ EOF
     green "$(cat /etc/hysteria/config.yaml)"
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下，并保存到 /root/hy/hy-client.yaml"
     green "$(cat /root/hy/hy-client.yaml)"
-    yellow "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur2.txt"
-    green "$(cat /root/hy/ur2.txt)"
+    yellow "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur1.txt"
+    green "$(cat /root/hy/ur1.txt)"
     yellow "Hysteria 2 分享二维码如下："
-    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur2.txt)"
+    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)"
  }
  
 # /etc/hysteria/config.yaml
@@ -453,7 +451,7 @@ changepasswd() {
     # 路径
     local config_file="/etc/hysteria/config.yaml"
     local client_file="/root/hy/hy-client.yaml"
-    local link_file="/root/hy/ur2.txt"
+    local link_file="/root/hy/ur1.txt"
 
     # 基础检查
     if [[ ! -f $config_file ]]; then
@@ -524,7 +522,7 @@ changepasswd() {
 update_hysteria_link() {
     local oldpasswd="$1"
     local newpasswd="$2"
-    local link_file="${3:-/root/hy/ur2.txt}"
+    local link_file="${3:-/root/hy/ur1.txt}"
     local link
     local new_link
 
@@ -605,10 +603,10 @@ showconf(){
     green "$(cat /etc/hysteria/config.yaml)"
     yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下，并保存到 /root/hy/hy-client.yaml"
     green "$(cat /root/hy/hy-client.yaml)"
-    yellow "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur2.txt"
+    yellow "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur1.txt"
     green "$(cat /root/hy/ur2.txt)"
     yellow "Hysteria 2 二维码如下"
-    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur2.txt)"
+    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)"
     systemctl restart hysteria-server.service
 }
 
