@@ -640,30 +640,34 @@ showstatus(){
 }
 
 linux_update() {
-	echo -e "${green}正在系统更新...${green}"
-	if command -v dnf &>/dev/null; then
-		dnf -y update
-	elif command -v yum &>/dev/null; then
-		yum -y update
-	elif command -v apt &>/dev/null; then
-		fix_dpkg
-		DEBIAN_FRONTEND=noninteractive apt update -y
-		DEBIAN_FRONTEND=noninteractive apt full-upgrade -y
-	elif command -v apk &>/dev/null; then
-		apk update && apk upgrade
-	elif command -v pacman &>/dev/null; then
-		pacman -Syu --noconfirm
-	elif command -v zypper &>/dev/null; then
-		zypper refresh
-		zypper update
-	elif command -v opkg &>/dev/null; then
-		opkg update
-	else
-		echo "未知的包管理器!"
-		return
-	fi
+    echo -e "${green}正在系统更新...${green}"
+    if command -v dnf &>/dev/null; then
+        dnf -y update
+    elif command -v yum &>/dev/null; then
+        yum -y update
+    elif command -v apt &>/dev/null; then
+        if ! wait_for_apt_lock; then
+            return 1
+        fi
+        DEBIAN_FRONTEND=noninteractive apt update -y
+        if ! wait_for_apt_lock; then
+            return 1
+        fi
+        DEBIAN_FRONTEND=noninteractive apt full-upgrade -y
+    elif command -v apk &>/dev/null; then
+        apk update && apk upgrade
+    elif command -v pacman &>/dev/null; then
+        pacman -Syu --noconfirm
+    elif command -v zypper &>/dev/null; then
+        zypper refresh
+        zypper update
+    elif command -v opkg &>/dev/null; then
+        opkg update
+    else
+        echo "未知的包管理器!"
+        return 1
+    fi
 }
-
 swap_cache() {
     echo "=== 硬盘缓存设置工具 ==="
 
