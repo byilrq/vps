@@ -11,11 +11,17 @@ lan='\033[34m'
 zi='\033[35m'
 tianlan='\033[96m'
 chen="\033[38;5;214m\033[01m$1\033[0m"
+
+# -----------------------------------------
+#  输出天蓝色文本（skyblue）
+# -----------------------------------------
 skyblue() {
     echo -e "\033[1;36m$1\033[0m"
 }
 
-# 获取当前 SSH 端口，缺省为 22
+# -----------------------------------------
+#  获取当前 SSH 端口，缺省为 22
+# -----------------------------------------
 get_ssh_port() {
     local port
     port=$(grep -E '^[[:space:]]*Port[[:space:]]+[0-9]+' /etc/ssh/sshd_config 2>/dev/null | tail -n1 | awk '{print $2}')
@@ -23,14 +29,23 @@ get_ssh_port() {
     echo "$port"
 }
 
+# -----------------------------------------
+#  红色输出（red）
+# -----------------------------------------
 red(){
     echo -e "\033[31m\033[01m$1\033[0m"
 }
 
+# -----------------------------------------
+#  绿色输出（green）
+# -----------------------------------------
 green(){
     echo -e "\033[32m\033[01m$1\033[0m"
 }
 
+# -----------------------------------------
+#  黄色输出（yellow）
+# -----------------------------------------
 yellow(){
     echo -e "\033[33m\033[01m$1\033[0m"
 }
@@ -64,10 +79,16 @@ if [[ -z $(type -P curl) ]]; then
     ${PACKAGE_INSTALL[int]} curl
 fi
 
+# -----------------------------------------
+#  获取真实IP（realip）
+# -----------------------------------------
 realip(){
     ip=$(curl -s4m8 ip.sb -k) || ip=$(curl -s6m8 ip.sb -k)
 }
 
+# -----------------------------------------
+#  证书安装/申请逻辑（inst_cert）
+# -----------------------------------------
 inst_cert(){
     green "Hysteria 2 协议证书申请方式如下："
     echo ""
@@ -164,6 +185,9 @@ inst_cert(){
     fi
 }
 
+# -----------------------------------------
+#  设置Hysteria 2端口（inst_port）
+# -----------------------------------------
 inst_port(){
     iptables -t nat -F PREROUTING >/dev/null 2>&1
 
@@ -181,6 +205,9 @@ inst_port(){
     inst_jump
 }
 
+# -----------------------------------------
+#  端口跳跃配置（inst_jump）
+# -----------------------------------------
 inst_jump(){
     green "Hysteria 2 端口使用模式如下："
     echo ""
@@ -208,18 +235,27 @@ inst_jump(){
     fi
 }
 
+# -----------------------------------------
+#  设置Hysteria 2密码（inst_pwd）
+# -----------------------------------------
 inst_pwd(){
     read -p "设置 Hysteria 2 密码（回车跳过为随机字符）：" auth_pwd
     [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
     yellow "使用在 Hysteria 2 节点的密码为：$auth_pwd"
 }
 
+# -----------------------------------------
+#  设置伪装站点（inst_site）
+# -----------------------------------------
 inst_site(){
     read -rp "请输入 Hysteria 2 的伪装网站地址 （去除https://） [回车:video.unext.jp]：" proxysite
     [[ -z $proxysite ]] && proxysite="video.unext.jp"
     yellow "使用在 Hysteria 2 节点的伪装网站为：$proxysite"
 }
 
+# -----------------------------------------
+#  安装并配置 Hysteria 2（insthysteria）
+# -----------------------------------------
 insthysteria(){
     warpv6=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
     warpv4=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
@@ -233,7 +269,9 @@ insthysteria(){
         realip
     fi
 
-   # 函数：等待 apt 锁释放
+   # -----------------------------------------
+   #  等待 apt 锁释放（wait_for_apt_lock）
+   # -----------------------------------------
 wait_for_apt_lock() {
     local max_attempts=60  # 最大等待时间约1分钟（每秒检查一次）
     local attempt=0
@@ -375,9 +413,12 @@ EOF
     yellow "Hysteria 2 分享二维码如下："
     qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)"
  }
- 
+
 # /etc/hysteria/config.yaml
 
+# -----------------------------------------
+#  卸载 Hysteria 2（unsthysteria）
+# -----------------------------------------
 unsthysteria(){
     systemctl stop hysteria-server.service >/dev/null 2>&1
     systemctl disable hysteria-server.service >/dev/null 2>&1
@@ -389,16 +430,25 @@ unsthysteria(){
     green "Hysteria 2 已彻底卸载完成！"
 }
 
+# -----------------------------------------
+#  启动 Hysteria 2（starthysteria）
+# -----------------------------------------
 starthysteria(){
     systemctl start hysteria-server
     systemctl enable hysteria-server >/dev/null 2>&1
 }
 
+# -----------------------------------------
+#  停止 Hysteria 2（stophysteria）
+# -----------------------------------------
 stophysteria(){
     systemctl stop hysteria-server
     systemctl disable hysteria-server >/dev/null 2>&1
 }
 
+# -----------------------------------------
+#  Hysteria 2 开关/重启菜单（hysteriaswitch）
+# -----------------------------------------
 hysteriaswitch(){
     yellow "请选择你需要的操作："
     echo ""
@@ -415,6 +465,9 @@ hysteriaswitch(){
     esac
 }
 
+# -----------------------------------------
+#  修改端口（changeport）
+# -----------------------------------------
 changeport(){
     oldport=$(cat /etc/hysteria/config.yaml 2>/dev/null | sed -n 1p | awk '{print $2}' | awk -F ":" '{print $2}')
     
@@ -440,8 +493,9 @@ changeport(){
     showconf
 }
 
-#修改配置密码
-
+# -----------------------------------------
+#  修改配置密码（changepasswd）
+# -----------------------------------------
 changepasswd() {
 
     # 颜色
@@ -516,9 +570,9 @@ changepasswd() {
     yellow "showconf 显示的客户端配置和二维码已同步为新密码"
 }
 
-
-
-##更新密码后重新打印链接和二维码###
+# -----------------------------------------
+#  更新分享链接并输出二维码（update_hysteria_link）
+# -----------------------------------------
 update_hysteria_link() {
     local oldpasswd="$1"
     local newpasswd="$2"
@@ -555,9 +609,11 @@ update_hysteria_link() {
     qrencode -o - -t ANSIUTF8 "$new_link"
 }
 
-
-
 ############################
+
+# -----------------------------------------
+#  修改证书类型/路径（change_cert）
+# -----------------------------------------
 change_cert(){
     old_cert=$(cat /etc/hysteria/config.yaml | grep cert | awk -F " " '{print $2}')
     old_key=$(cat /etc/hysteria/config.yaml | grep key | awk -F " " '{print $2}')
@@ -577,6 +633,9 @@ change_cert(){
     showconf
 }
 
+# -----------------------------------------
+#  修改伪装网站（changeproxysite）
+# -----------------------------------------
 changeproxysite(){
     oldproxysite=$(cat /etc/hysteria/config.yaml | grep url | awk -F " " '{print $2}' | awk -F "https://" '{print $2}')
     
@@ -589,15 +648,18 @@ changeproxysite(){
     green "Hysteria 2 节点伪装网站已成功修改为：$proxysite"
 }
 
+# -----------------------------------------
+#  修改系统时区为 Asia/Shanghai（change_tz）
+# -----------------------------------------
 change_tz(){
     sudo timedatectl set-timezone Asia/Shanghai
     green "系统时区已经改为Asia/Shanghai"
     timedatectl
 }
 
-
-
-
+# -----------------------------------------
+#  显示配置并重启服务（showconf）
+# -----------------------------------------
 showconf(){
     yellow "Hysteria 2 服务端 YAML 配置文件 config.yaml 内容如下，并保存到 /etc/hysteria/config.yaml"
     green "$(cat /etc/hysteria/config.yaml)"
@@ -610,6 +672,9 @@ showconf(){
     systemctl restart hysteria-server.service
 }
 
+# -----------------------------------------
+#  更新内核方式1（官方）（update_core1）
+# -----------------------------------------
 update_core1(){
         green "官方更新方式必须先脚本安装后使用，否则会失败。"        
         systemctl stop hysteria-server.service
@@ -622,6 +687,9 @@ update_core1(){
         green "Hysteria 内核已重新启动！"  
 }
 
+# -----------------------------------------
+#  更新内核方式2（脚本）（update_core2）
+# -----------------------------------------
 update_core2(){
     systemctl stop hysteria-server.service
     rm -f /usr/local/bin/hysteria
@@ -633,10 +701,16 @@ update_core2(){
     green "Hysteria 内核已经重新启动"
 }
 
+# -----------------------------------------
+#  查询服务状态（showstatus）
+# -----------------------------------------
 showstatus(){
     systemctl status hysteria-server.service
 }
 
+# -----------------------------------------
+#  系统更新（linux_update）
+# -----------------------------------------
 linux_update() {
     echo -e "${green}正在系统更新...${green}"
     if command -v dnf &>/dev/null; then
@@ -666,6 +740,10 @@ linux_update() {
         return 1
     fi
 }
+
+# -----------------------------------------
+#  设置/重建 Swap 缓存（swap_cache）
+# -----------------------------------------
 swap_cache() {
     echo "=== 硬盘缓存设置工具 ==="
 
@@ -738,16 +816,119 @@ swap_cache() {
     echo "操作完成！新的 Swap 缓存大小为 ${size_mb} MB。"
 }
 
-# ============================================
-# 上海三网回程路由测试函数 - trace()
-# ============================================
+# -----------------------------------------
+#  回程测试（besttrace）
+# -----------------------------------------
 besttrace() {
  wget -qO- git.io/besttrace | bash   
 }
 
-# ============================================
-# 系统参数修改
-# ============================================
+# -----------------------------------------
+#  设置DNS并锁死 resolv.conf（set_dns_ui）
+#  简化实现：固定为 8.8.8.8 / 1.1.1.1，并禁用 systemd-resolved
+# -----------------------------------------
+set_dns_ui() {
+  set -e
+
+  # ===== 🎨 颜色定义 =====
+  local GREEN='\033[0;32m'    # 成功
+  local RED='\033[0;31m'      # 错误
+  local YELLOW='\033[1;33m'   # 警告
+  local BLUE='\033[0;34m'     # 信息
+  local NC='\033[0m'          # 重置颜色
+
+  # 必须 root 执行
+  if [[ $EUID -ne 0 ]]; then
+    echo -e "${RED}❌ 此功能需要 root 权限执行${NC}"
+    return 1
+  fi
+
+  # ===== 🔍 自动安装 curl =====
+  echo -e "${BLUE}📦 检查 curl...${NC}"
+  if ! command -v curl &>/dev/null; then
+    echo -e "${YELLOW}⚠️ 未检测到 curl，尝试自动安装...${NC}"
+    if command -v apt &>/dev/null; then
+      apt update && apt install -y curl
+    elif command -v yum &>/dev/null; then
+      yum install -y curl
+    elif command -v dnf &>/dev/null; then
+      dnf install -y curl
+    elif command -v pacman &>/dev/null; then
+      pacman -Sy --noconfirm curl
+    else
+      echo -e "${RED}❌ 不支持的包管理器，无法安装 curl${NC}"
+      return 1
+    fi
+    echo -e "${GREEN}✅ curl 安装成功${NC}"
+  fi
+
+  # ===== 🔍 自动安装 sudo =====
+  echo -e "${BLUE}📦 检查 sudo...${NC}"
+  if ! command -v sudo &>/dev/null; then
+    echo -e "${YELLOW}⚠️ 未检测到 sudo，尝试自动安装...${NC}"
+    if command -v apt &>/dev/null; then
+      apt update && apt install -y sudo
+    elif command -v yum &>/dev/null; then
+      yum install -y sudo
+    elif command -v dnf &>/dev/null; then
+      dnf install -y sudo
+    elif command -v pacman &>/dev/null; then
+      pacman -Sy --noconfirm sudo
+    else
+      echo -e "${RED}❌ 不支持的包管理器，无法安装 sudo${NC}"
+      return 1
+    fi
+    echo -e "${GREEN}✅ sudo 安装成功${NC}"
+  fi
+
+  # ===== 🔧 开始修复 DNS =====
+  echo -e "${BLUE}🔧 正在配置 DNS（8.8.8.8 / 1.1.1.1）...${NC}"
+
+  # 取消 resolv.conf 的符号链接（如有）
+  if [ -L /etc/resolv.conf ]; then
+    sudo rm -f /etc/resolv.conf
+    sudo touch /etc/resolv.conf
+  fi
+
+  # 解除不可变锁（避免之前已锁导致写入失败）
+  sudo chattr -i /etc/resolv.conf 2>/dev/null || true
+
+  # 写入固定 DNS
+  sudo bash -c 'cat > /etc/resolv.conf <<EOF
+nameserver 8.8.8.8
+nameserver 1.1.1.1
+EOF'
+
+  # 添加不可变锁
+  sudo chattr +i /etc/resolv.conf
+  echo -e "${GREEN}✅ resolv.conf 设置成功并已锁定${NC}"
+
+  # 禁用 systemd-resolved（如存在）
+  if systemctl is-enabled systemd-resolved &>/dev/null; then
+    echo -e "${YELLOW}⚠️ 正在禁用 systemd-resolved...${NC}"
+    sudo systemctl disable --now systemd-resolved
+    echo -e "${GREEN}✅ 已禁用 systemd-resolved${NC}"
+  fi
+
+  # 添加到 /etc/rc.local 防止重启失效
+  if [ ! -f /etc/rc.local ]; then
+    echo -e "#!/bin/bash\nexit 0" | sudo tee /etc/rc.local >/dev/null
+    sudo chmod +x /etc/rc.local
+  fi
+
+  # 避免重复添加
+  if ! grep -q "resolv.conf" /etc/rc.local; then
+    sudo sed -i '1i\chattr -i /etc/resolv.conf; echo -e "nameserver 8.8.8.8\\nnameserver 1.1.1.1" > /etc/resolv.conf; chattr +i /etc/resolv.conf' /etc/rc.local
+    echo -e "${GREEN}✅ 已写入 /etc/rc.local 保持重启持久${NC}"
+  fi
+
+  echo -e "${GREEN}🎉 DNS 配置成功并锁定为 8.8.8.8 / 1.1.1.1，重启后仍将生效。${NC}"
+}
+
+# -----------------------------------------
+#  系统信息查询展示（linux_ps）
+#  修复：优先从 /etc/resolv.conf 读取 DNS，确保禁用 resolved 后也能正确显示
+# -----------------------------------------
 linux_ps() {
 
 	clear
@@ -771,13 +952,20 @@ linux_ps() {
 	local isp_info=$(echo "$ipinfo" | grep 'org' | awk -F': ' '{print $2}' | tr -d '",')
 
 	local load=$(uptime | awk '{print $(NF-2), $(NF-1), $NF}')
-	# local dns_addresses=$(awk '/^nameserver/{printf "%s ", $2} END {print ""}' /etc/resolv.conf)
-	# 显示真实的dns
-local dns_addresses=$(resolvectl status 2>/dev/null | awk '
+
+	# 显示 DNS：优先读取 /etc/resolv.conf（兼容 set_dns_ui 禁用 resolved 的场景）
+	local dns_addresses=""
+	if [ -f /etc/resolv.conf ]; then
+		dns_addresses=$(awk '/^nameserver[ \t]+/{printf "%s ", $2} END {print ""}' /etc/resolv.conf)
+	fi
+	# 兜底：如果 resolv.conf 没有 nameserver，再尝试 resolvectl
+	if [[ -z "${dns_addresses// /}" ]]; then
+		dns_addresses=$(resolvectl status 2>/dev/null | awk '
 /^ *DNS Servers:/ {
     for (i=3;i<=NF;i++) printf "%s ", $i
 }
 END {print ""}')
+	fi
 
 	local cpu_arch=$(uname -m)
 
@@ -791,7 +979,6 @@ END {print ""}')
 	local os_info=$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')
 
 	local current_time=$(date "+%Y-%m-%d %I:%M %p")
-
 
 	local swap_info=$(free -m | awk 'NR==3{used=$3; total=$2; if (total == 0) {percentage=0} else {percentage=used*100/total}; printf "%dMB/%dMB (%d%%)", used, total, percentage}')
 
@@ -834,457 +1021,11 @@ END {print ""}')
 	echo -e "${tianlan}-------------"
 	echo -e "${tianlan}运行时长:     ${hui}$runtime"
 	echo
-
-
-
 }
-# -----------------------------------------
-#  设置DNS并锁死 resolv.conf	
-# -----------------------------------------
-set_dns_ui() {
-  echo -e "${CYAN}>>> 修改系统DNS地址（A 模式：127.0.0.53 + systemd-resolved）...${RESET}"
-
-  # 检查权限
-  if [ $EUID -ne 0 ]; then
-    echo -e "${RED}错误: 此功能需要root权限执行${RESET}"
-    return 1
-  fi
-
-  # 常用DNS服务器列表
-  common_dns=(
-    # IPv4
-    "8.8.8.8|Google Public DNS (IPv4)"
-    "8.8.4.4|Google Public DNS 备用 (IPv4)"
-    "1.1.1.1|Cloudflare DNS (IPv4)"
-    "1.0.0.1|Cloudflare DNS 备用 (IPv4)"
-    "208.67.222.222|OpenDNS (IPv4)"
-    "208.67.220.220|OpenDNS 备用 (IPv4)"
-    "9.9.9.9|Quad9 DNS (IPv4)"
-    "149.112.112.112|Quad9 DNS 备用 (IPv4)"
-    "94.140.14.14|AdGuard DNS (IPv4)"
-    "94.140.15.15|AdGuard DNS 备用 (IPv4)"
-    "223.5.5.5|阿里 AliDNS (IPv4)"
-    "223.6.6.6|阿里 AliDNS 备用 (IPv4)"
-    "119.29.29.29|腾讯 DNSPod (IPv4)"
-    "180.76.76.76|百度 BaiduDNS (IPv4)"
-    # IPv6
-    "2001:4860:4860::8888|Google Public DNS (IPv6)"
-    "2001:4860:4860::8844|Google Public DNS 备用 (IPv6)"
-    "2606:4700:4700::1111|Cloudflare DNS (IPv6)"
-    "2606:4700:4700::1001|Cloudflare DNS 备用 (IPv6)"
-    "2620:119:35::35|OpenDNS (IPv6)"
-    "2620:119:53::53|OpenDNS 备用 (IPv6)"
-    "2620:fe::fe|Quad9 DNS (IPv6)"
-    "2a10:50c0::ad1:ff|AdGuard DNS (IPv6)"
-    "2400:3200::1|阿里 AliDNS (IPv6)"
-    "2400:da00::6666|百度 BaiduDNS (IPv6)"
-  )
-
-  # 全局变量，用于接收子函数返回的 IP 列表
-  SELECTED_IPS=()
-
-  # 显示当前DNS配置
-  echo -e "${YELLOW}当前 /etc/resolv.conf 配置:${RESET}"
-  if [ -f /etc/resolv.conf ]; then
-    grep -E '^nameserver' /etc/resolv.conf | while read line; do
-      echo -e "  ${GREEN}✓${RESET} $line"
-    done
-  fi
-
-  # 使用循环包裹菜单，实现子菜单返回上一级
-  while true; do
-    # 每次循环清空选择
-    SELECTED_IPS=()
-
-    echo -e "\n${CYAN}请选择操作方式:${RESET}"
-    echo -e "  ${GREEN}1${RESET}) 自动测试并手动选择 (支持多选，含IPv6)"
-    echo -e "  ${GREEN}2${RESET}) 手动输入DNS地址 (支持连续输入，含IPv6)"
-    echo -e "  ${GREEN}3${RESET}) 从常用DNS列表选择 (支持多选，含IPv6)"
-    echo -e "  ${YELLOW}0.${RESET} 取消操作/返回"
-
-    read -p "请输入选择 [0-3]: " choice
-
-    case $choice in
-    1)
-      auto_test_dns
-      ;;
-    2)
-      manual_input_dns
-      ;;
-    3)
-      select_from_list
-      ;;
-    0)
-      echo -e "${YELLOW}已取消DNS修改操作${RESET}"
-      SKIP_PAUSE=true
-      return 0
-      ;;
-    *)
-      echo -e "${RED}无效选择，请重新输入${RESET}"
-      continue
-      ;;
-    esac
-
-    # 检查是否有选中的 IP
-    if [ ${#SELECTED_IPS[@]} -eq 0 ]; then
-      echo -e "${YELLOW}未选择任何 DNS，返回上一级菜单...${RESET}"
-      continue # 继续循环
-    fi
-
-    # 如果选择了IP，则跳出循环，继续执行应用逻辑
-    break
-  done
-
-  # === 数组去重 ===
-  SELECTED_IPS=($(printf "%s\n" "${SELECTED_IPS[@]}" | awk '!a[$0]++'))
-
-  echo -e "\n${CYAN}准备应用新的 DNS 配置(上游): ${SELECTED_IPS[*]}${RESET}"
-
-  # --- 1. 备份配置 ---
-  local backup_file="/etc/resolv.conf.backup.$(date +%Y%m%d_%H%M%S)"
-  local backup_systemd=""
-
-  # 尝试备份 resolv.conf
-  if cp -P /etc/resolv.conf "$backup_file" 2>/dev/null; then
-    echo -e "${GREEN}[√] 已备份原配置到: $backup_file${RESET}"
-  else
-    touch "$backup_file"
-    echo -e "${YELLOW}[!] 原配置不存在或无法备份，将创建新配置...${RESET}"
-  fi
-
-  # 如果存在 systemd-resolved，也备份它的配置
-  if [ -f /etc/systemd/resolved.conf ]; then
-    backup_systemd="/etc/systemd/resolved.conf.backup.$(date +%Y%m%d_%H%M%S)"
-    cp /etc/systemd/resolved.conf "$backup_systemd" 2>/dev/null
-  fi
-
-  # --- 2. 写入新配置 (A 模式) ---
-  write_dns_config "${SELECTED_IPS[@]}"
-
-  # --- 3. 验证与回滚 ---
-  if verify_dns_config; then
-    echo -e "${GREEN}[√] DNS修改成功且验证通过${RESET}"
-    echo -e "${YELLOW}当前 /etc/resolv.conf 内容:${RESET}"
-    grep -E '^nameserver' /etc/resolv.conf | while read line; do
-      echo -e "  ${GREEN}✓${RESET} $line"
-    done
-
-    echo -e "${CYAN}当前 systemd-resolved 上游 DNS:${RESET}"
-    resolvectl status 2>/dev/null | grep -A2 "DNS Servers" || systemd-resolve --status 2>/dev/null | grep -A2 "DNS Servers"
-
-    # 验证成功，删除备份文件
-    echo -e "${CYAN}>>> 正在清理备份文件...${RESET}"
-    [ -f "$backup_file" ] && rm -f "$backup_file"
-    [ -n "$backup_systemd" ] && [ -f "$backup_systemd" ] && rm -f "$backup_systemd"
-    echo -e "${GREEN}[√] 备份文件已删除${RESET}"
-
-  else
-    echo -e "${RED}[×] DNS配置验证失败，正在还原配置...${RESET}"
-
-    # 还原 resolv.conf
-    if [ -f "$backup_file" ]; then
-      chattr -i /etc/resolv.conf 2>/dev/null
-      rm -f /etc/resolv.conf
-      cp -P "$backup_file" /etc/resolv.conf 2>/dev/null || cp "$backup_file" /etc/resolv.conf
-      echo -e "${YELLOW}[!] 已还原 /etc/resolv.conf${RESET}"
-    fi
-
-    # 还原 systemd-resolved
-    if [ -n "$backup_systemd" ] && [ -f "$backup_systemd" ]; then
-      cp "$backup_systemd" /etc/systemd/resolved.conf
-      systemctl restart systemd-resolved 2>/dev/null
-      echo -e "${YELLOW}[!] 已还原 /etc/systemd/resolved.conf${RESET}"
-    fi
-
-    return 1
-  fi
-}
-
-auto_test_dns() {
-  echo -e "${CYAN}>>> 正在测试常用DNS速度 (含IPv6)...${RESET}"
-
-  # 测试的DNS服务器 (混合v4和v6)
-  local test_dns=(
-    "8.8.8.8|Google IPv4"
-    "1.1.1.1|Cloudflare IPv4"
-    "208.67.222.222|OpenDNS IPv4"
-    "9.9.9.9|Quad9 IPv4"
-    "223.5.5.5|AliDNS IPv4"
-    "119.29.29.29|DNSPod IPv4"
-    "2001:4860:4860::8888|Google IPv6"
-    "2606:4700:4700::1111|Cloudflare IPv6"
-    "2400:3200::1|AliDNS IPv6"
-  )
-
-  declare -a dns_results
-  local count=0
-
-  for dns_info in "${test_dns[@]}"; do
-    IFS='|' read -r dns_ip dns_name <<<"$dns_info"
-    echo -ne "  测试 ${YELLOW}$dns_name${RESET} ($dns_ip)... "
-
-    # 判断IPv4还是IPv6选择ping命令
-    local ping_cmd="ping"
-    if [[ "$dns_ip" == *":"* ]]; then
-      # IPv6
-      if command -v ping6 &>/dev/null; then
-        ping_cmd="ping6"
-      else
-        ping_cmd="ping -6"
-      fi
-    fi
-
-    # 使用ping测试延迟
-    if ping_result=$(LC_ALL=C $ping_cmd -c 2 -W 2 "$dns_ip" 2>/dev/null | grep -i 'avg'); then
-      avg_latency=$(echo "$ping_result" | awk -F'/' '{print $5}')
-      echo -e "${GREEN}${avg_latency}ms${RESET}"
-      dns_results[$count]="$avg_latency|$dns_ip|$dns_name"
-    else
-      echo -e "${RED}超时/不可达${RESET}"
-      dns_results[$count]="9999|$dns_ip|$dns_name"
-    fi
-
-    count=$((count + 1))
-  done
-
-  # Separate results
-  local v4_list=()
-  local v6_list=()
-  for res in "${dns_results[@]}"; do
-    IFS='|' read -r lat ip nm <<<"$res"
-    if [[ "$ip" == *":"* ]]; then
-      v6_list+=("$res")
-    else
-      v4_list+=("$res")
-    fi
-  done
-
-  # Sort
-  local sorted_v4=()
-  local sorted_v6=()
-  if [ ${#v4_list[@]} -gt 0 ]; then
-    IFS=$'\n' sorted_v4=($(printf "%s\n" "${v4_list[@]}" | sort -n -t'|' -k1))
-    unset IFS
-  fi
-  if [ ${#v6_list[@]} -gt 0 ]; then
-    IFS=$'\n' sorted_v6=($(printf "%s\n" "${v6_list[@]}" | sort -n -t'|' -k1))
-    unset IFS
-  fi
-
-  local valid_options=()
-  local display_index=1
-
-  # Display IPv4
-  echo -e "\n${CYAN}IPv4 DNS 延迟排名:${RESET}"
-  local v4_count=0
-  for item in "${sorted_v4[@]}"; do
-    IFS='|' read -r latency ip name <<<"$item"
-    if [ "$latency" != "9999" ]; then
-      echo -e "  ${GREEN}${display_index}${RESET}. ${BOLD}$name${RESET} ($ip) - ${YELLOW}${latency}ms${RESET}"
-      valid_options[$display_index]="$ip"
-      display_index=$((display_index + 1))
-      v4_count=$((v4_count + 1))
-    fi
-  done
-  [ $v4_count -eq 0 ] && echo -e "  ${GRAY}无可用 IPv4 结果${RESET}"
-
-  # Display IPv6
-  echo -e "\n${CYAN}IPv6 DNS 延迟排名:${RESET}"
-  local v6_count=0
-  for item in "${sorted_v6[@]}"; do
-    IFS='|' read -r latency ip name <<<"$item"
-    if [ "$latency" != "9999" ]; then
-      echo -e "  ${GREEN}${display_index}${RESET}. ${BOLD}$name${RESET} ($ip) - ${YELLOW}${latency}ms${RESET}"
-      valid_options[$display_index]="$ip"
-      display_index=$((display_index + 1))
-      v6_count=$((v6_count + 1))
-    fi
-  done
-  [ $v6_count -eq 0 ] && echo -e "  ${GRAY}无可用 IPv6 结果${RESET}"
-
-  # Check if any valid
-  if [ ${#valid_options[@]} -eq 0 ]; then
-    echo -e "${RED}所有DNS测试均超时，请检查网络连接${RESET}"
-    return 1
-  fi
-
-  echo -e "\n${YELLOW}提示：可以输入多个编号进行组合（例如：1 3）(输入 0 退出)${RESET}"
-  read -p "请输入要使用的DNS编号 (用空格分隔): " user_choices
-
-  # 处理用户输入
-  for choice in $user_choices; do
-    if [ "$choice" == "0" ]; then return 0; fi
-    if [ -n "${valid_options[$choice]}" ]; then
-      SELECTED_IPS+=("${valid_options[$choice]}")
-    fi
-  done
-}
-
-manual_input_dns() {
-  echo -e "${CYAN}>>> 手动输入DNS地址${RESET}"
-  echo -e "${YELLOW}提示：支持输入多个IP地址(IPv4/IPv6)，用空格分隔 (输入 0 返回)${RESET}"
-
-  read -p "请输入DNS服务器地址: " input_dns
-  if [ "$input_dns" == "0" ]; then return 0; fi
-
-  for ip in $input_dns; do
-    if validate_ip "$ip"; then
-      SELECTED_IPS+=("$ip")
-    else
-      echo -e "${RED}忽略无效的IP地址格式: $ip${RESET}"
-    fi
-  done
-}
-
-select_from_list() {
-  echo -e "${CYAN}>>> 从常用DNS列表选择${RESET}"
-
-  echo -e "${YELLOW}常用DNS服务器列表:${RESET}"
-  for i in "${!common_dns[@]}"; do
-    IFS='|' read -r ip name <<<"${common_dns[$i]}"
-    echo -e "  ${GREEN}$((i + 1))${RESET}) $name - ${YELLOW}$ip${RESET}"
-  done
-
-  echo -e "\n${YELLOW}提示：可以输入多个编号进行组合（例如：1 2）(输入 0 退出)${RESET}"
-  read -p "请选择DNS服务器编号 [用空格分隔]: " user_choices
-
-  for choice in $user_choices; do
-    if [ "$choice" == "0" ]; then return 0; fi
-
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "${#common_dns[@]}" ]; then
-      index=$((choice - 1))
-      IFS='|' read -r selected_ip selected_name <<<"${common_dns[$index]}"
-      SELECTED_IPS+=("$selected_ip")
-    else
-      echo -e "${RED}忽略无效选择: $choice${RESET}"
-    fi
-  done
-}
-
-# 辅助函数 (支持IPv4和IPv6)
-validate_ip() {
-  local ip=$1
-  # IPv4 check
-  if [[ $ip =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    return 0
-  # IPv6 check (简化正则)
-  elif [[ $ip =~ ^([0-9a-fA-F]{0,4}:){1,7}[0-9a-fA-F]{0,4}$ ]]; then
-    return 0
-  else
-    return 1
-  fi
-}
-
-# A 模式写入：resolv.conf -> 127.0.0.53，上游 DNS 写入 systemd-resolved
-write_dns_config() {
-  local dns_list=("$@")
-
-  echo -e "${CYAN}>>> A 模式：127.0.0.53 + systemd-resolved 上游 DNS 应用中...${RESET}"
-
-  # 确保 systemd-resolved 在运行
-  if ! systemctl is-active systemd-resolved >/dev/null 2>&1; then
-    echo -e "${YELLOW}systemd-resolved 未运行，正在尝试启动...${RESET}"
-    systemctl enable --now systemd-resolved >/dev/null 2>&1 || {
-      echo -e "${RED}无法启动 systemd-resolved，放弃本次修改${RESET}"
-      return 1
-    }
-  fi
-
-  # 1) resolv.conf 指向 127.0.0.53
-  chattr -i /etc/resolv.conf 2>/dev/null
-  cat >/etc/resolv.conf <<EOF
-# Generated by set_dns_ui (A mode)
-# 使用 systemd-resolved 本地缓存，所有程序将通过 127.0.0.53 解析DNS
-nameserver 127.0.0.53
-EOF
-
-  echo -e "${GREEN}[√] /etc/resolv.conf 已切换为 127.0.0.53${RESET}"
-
-  # 2) 生成上游 DNS 配置
-  local count=${#dns_list[@]}
-  local dns_primary=""
-  local dns_fallback=""
-
-  if [ "$count" -eq 1 ]; then
-    dns_primary="${dns_list[0]}"
-    dns_fallback="8.8.8.8 1.1.1.1"
-  elif [ "$count" -eq 2 ]; then
-    dns_primary="${dns_list[0]} ${dns_list[1]}"
-    dns_fallback="8.8.8.8 1.1.1.1"
-  elif [ "$count" -ge 3 ]; then
-    dns_primary="${dns_list[0]} ${dns_list[1]}"
-    # 第3、4个作为 fallback，不足则重复第3个
-    if [ "$count" -ge 4 ]; then
-      dns_fallback="${dns_list[2]} ${dns_list[3]}"
-    else
-      dns_fallback="${dns_list[2]} ${dns_list[2]}"
-    fi
-  fi
-
-  echo -e "${CYAN}设置上游 DNS=${RESET} ${YELLOW}$dns_primary${RESET}"
-  [ -n "$dns_fallback" ] && echo -e "${CYAN}设置 FallbackDNS=${RESET} ${YELLOW}$dns_fallback${RESET}"
-
-  # 3) 重写 /etc/systemd/resolved.conf
-  cat >/etc/systemd/resolved.conf <<EOF
-[Resolve]
-DNS=$dns_primary
-FallbackDNS=$dns_fallback
-DNSSEC=no
-DNSOverTLS=no
-MulticastDNS=no
-LLMNR=no
-Cache=yes
-EOF
-
-  echo -e "${GREEN}[√] /etc/systemd/resolved.conf 已更新${RESET}"
-
-  # 4) 重启 systemd-resolved
-  systemctl restart systemd-resolved
-  echo -e "${GREEN}[√] systemd-resolved 已重启${RESET}"
-
-  # 5) 是否锁定 resolv.conf
-  echo -e "${YELLOW}是否锁定 /etc/resolv.conf 防止被系统/云厂商修改？ [y/N]${RESET}"
-  read -r lock_choice
-  if [[ "$lock_choice" =~ ^[Yy]$ ]]; then
-    if command -v chattr >/dev/null 2>&1; then
-      chattr +i /etc/resolv.conf
-      echo -e "${GREEN}[√] resolv.conf 已锁定 (+i)${RESET}"
-    else
-      echo -e "${RED}[!] 未找到 chattr，无法锁定文件${RESET}"
-    fi
-  fi
-}
-
-verify_dns_config() {
-  echo -e "\n${CYAN}>>> 验证DNS配置 (通过 127.0.0.53)...${RESET}"
-
-  if ! command -v dig >/dev/null 2>&1; then
-    echo -e "${YELLOW}未找到 dig，尝试使用 nslookup/ping 进行简易验证...${RESET}"
-    echo -ne "  测试解析 google.com ... "
-    if nslookup -timeout=5 google.com >/dev/null 2>&1 || ping -c 1 -W 2 google.com >/dev/null 2>&1; then
-      echo -e "${GREEN}成功${RESET}"
-      return 0
-    else
-      echo -e "${RED}失败${RESET}"
-      return 1
-    fi
-  fi
-
-  echo -ne "  使用 dig @127.0.0.53 解析 google.com ... "
-  if dig +short google.com @127.0.0.53 >/dev/null 2>&1; then
-    echo -e "${GREEN}成功${RESET}"
-    return 0
-  else
-    echo -e "${RED}失败${RESET}"
-    return 1
-  fi
-}
-
 
 # -----------------------------------------
-# # 安装BBRV3
+#  安装BBRv3（bbrv3）
 # -----------------------------------------
-
 bbrv3() {
 		  root_use
 		  send_stats "bbrv3管理"
@@ -1411,8 +1152,9 @@ bbrv3() {
 
 }
 
-
-# 设置IPv4/IPv6 优先级
+# -----------------------------------------
+#  设置IPv4/IPv6 优先级（set_ip_priority）
+# -----------------------------------------
 set_ip_priority() {
     while true; do
         clear
@@ -1463,6 +1205,9 @@ set_ip_priority() {
     done
 }
 
+# -----------------------------------------
+#  设置定时重启（cron）
+# -----------------------------------------
 cron() {
     wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/mdadm -O /etc/cron.d/mdadm
     if [ $? -eq 0 ]; then
@@ -1474,6 +1219,9 @@ cron() {
     reboot
 }
 
+# -----------------------------------------
+#  修改 SSH 端口（ssh_port）
+# -----------------------------------------
 ssh_port() {
   local new_port=$1
 
@@ -1507,13 +1255,17 @@ ssh_port() {
   fi
 }
 
-#IP质量检测
+# -----------------------------------------
+#  IP质量检测（ipquality）
+# -----------------------------------------
 ipquality() {
     echo "检查 IP 质量中..."
     curl -sL https://Check.Place | bash -s - -I
 }
 
-# 选择BBR类型和tcp调优
+# -----------------------------------------
+#  选择BBR类型和tcp调优（bbrx）
+# -----------------------------------------
 bbrx() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/tcpx.sh"
   local tmp_file="/tmp/tcpx.sh"
@@ -1540,7 +1292,9 @@ bbrx() {
   bash "$tmp_file"
 }
 
-#开启防火墙
+# -----------------------------------------
+#  防火墙设置（ufw）（firewall）
+# -----------------------------------------
 firewall() {
     echo "---------------- 防火墙设置 (ufw) ----------------"
     echo " 1) 开启防火墙并设置放行端口"
@@ -1623,7 +1377,9 @@ firewall() {
     esac
 }
 
-#修改配置
+# -----------------------------------------
+#  修改系统配置菜单（changeconf）
+# -----------------------------------------
 changeconf(){
     while true; do
         green "Hysteria 2 配置变更选择如下:"
@@ -1665,6 +1421,9 @@ changeconf(){
     done
 }
 
+# -----------------------------------------
+#  主菜单（menu）
+# -----------------------------------------
 menu() {
     while true; do
         clear
