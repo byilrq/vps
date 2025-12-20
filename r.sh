@@ -812,6 +812,26 @@ linux_ps() {
   load="$(uptime | awk -F'load average:' '{print $2}' | xargs)"
   os_info="$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')"
   kernel_version="$(uname -r)"
+    # --- 补充：拥塞控制/队列算法/内核headers匹配 ---
+  local cc_algo qdisc_algo headers_status
+
+  cc_algo="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
+  # 优先用 root(/) 网卡的 qdisc；取不到就回退到 any dev 的第一条
+  qdisc_algo="$(
+    ip -o route get 1.1.1.1 2>/dev/null \
+      | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' \
+      | xargs -I{} tc qdisc show dev {} 2>/dev/null \
+      | awk 'NR==1{print $2; exit}'
+  )"
+  [[ -z "$qdisc_algo" ]] && qdisc_algo="$(tc qdisc show 2>/dev/null | awk 'NR==1{print $2; exit}')"
+
+  # 内核 headers 是否匹配当前内核版本
+  if [[ -d "/lib/modules/${kernel_version}/build" || -e "/usr/src/linux-headers-${kernel_version}" ]]; then
+    headers_status="已匹配"
+  else
+    headers_status="未匹配"
+  fi
+
   cpu_arch="$(uname -m)"
   hostname="$(uname -n)"
   now="$(date '+%Y-%m-%d %H:%M:%S')"
@@ -853,6 +873,7 @@ linux_ps() {
   [[ -n "$ipv6" ]] && echo -e "IPv6地址:     ${ipv6}"
   echo -e "DNS地址:      ${dns_addresses}"
   [[ -n "$country$city" ]] && echo -e "地理位置:     ${country} ${city}"
+  echo -e "拥塞控制算法:: ${cc_algo:-未知} 队列算法: ${qdisc_algo:-未知} 内核headers：${headers_status}"
   echo -e "系统时间:     ${now}"
   echo -e "运行时长:     ${runtime}"
   echo ""
