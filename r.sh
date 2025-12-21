@@ -19,11 +19,6 @@ SERVICE="xray"
 INFO_FILE="$HOME/_vless_reality_url_"
 SOURCES_LIST="/etc/apt/sources.list"
 SOURCES_BAK="/etc/apt/sources.list.bak.xray_reality"
-local _red="${red:-}"
-local _yellow="${yellow:-}"
-local _green="${green:-}"
-local _reset="${reset:-${none:-}}"
-
 # 与你原来打印保持一致（可自行改）
 FLOW="xtls-rprx-vision"
 ENCRYPTION="none"
