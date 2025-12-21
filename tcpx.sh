@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #=================================================
 # System Required: CentOS 7/8, Debian/Ubuntu, oraclelinux (部分功能按发行版实现)
-# Description: BBR + BBRplus + BBRplusNew 管理精简版
-# Version: 100.0.4.15 (menu slim)
+# Description: BBR + BBRplus + BBRplusNew 管理精简版（已补全 2/3 安装逻辑）
+# Version: 100.0.4.15 (menu slim patched)
 #=================================================
 
 set -euo pipefail
@@ -143,18 +143,17 @@ opsy=""
 virtual=""
 arch=""
 kern=""
+kernel_version_full=""
+kernel_version=""
 
 check_status() {
-  local kernel_version_full
-  local kernel_version
-
   kernel_version_full="$(uname -r)"
   kernel_version="$(uname -r | awk -F "-" '{print $1}')"
 
   net_congestion_control="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || echo "unknown")"
   net_qdisc="$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || echo "unknown")"
 
-  # 内核类型识别（保留原逻辑的关键部分）
+  # 内核类型识别
   if [[ "$kernel_version_full" == *bbrplus* ]]; then
     kernel_status="BBRplus"
   elif read -r major minor <<<"$(echo "$kernel_version" | awk -F'.' '{print $1, $2}')" && \
@@ -205,7 +204,6 @@ check_status() {
     if dpkg -l 2>/dev/null | grep -q "linux-headers-${kernel_version_full}"; then
       headers_status="已匹配"
     else
-      # 没装/不匹配都归为未匹配（你要细分可自行改成：先查是否存在任意headers）
       if dpkg -l 2>/dev/null | grep -q "linux-headers"; then
         headers_status="未匹配"
       else
@@ -223,6 +221,236 @@ check_status() {
 }
 
 # -----------------------------
+# GitHub/下载辅助（补全 2/3 安装逻辑）
+# -----------------------------
+check_cn() {
+  if ! _exists curl; then
+    echo "$1"
+    return 0
+  fi
+
+  local country="unknown"
+  country="$(curl -fsS --max-time 3 https://ip.im/info -4 2>/dev/null | sed -n '/CountryCode/s/.*://p' | tr -d ' ,"')"
+  [[ -z "$country" ]] && country="unknown"
+
+  if [[ "$country" != "CN" ]]; then
+    echo "$1"
+    return 0
+  fi
+
+  local raw="$1"
+  local prefixes=(
+    "https://gh-proxy.com/"
+    "https://hub.gitmirror.com/"
+    "https://gh.ddlc.top/"
+  )
+
+  local p url code
+  for p in "${prefixes[@]}"; do
+    url="${p}${raw}"
+    code="$(curl -fsSIL --max-time 2 -o /dev/null -w "%{http_code}" "$url" 2>/dev/null || true)"
+    if [[ "$code" =~ ^2|^3 ]]; then
+      echo "$url"
+      return 0
+    fi
+  done
+
+  echo "$raw"
+  return 0
+}
+
+download_file() {
+  local url="$1"
+  local filename="$2"
+  if _exists curl; then
+    curl -fL --retry 3 --connect-timeout 10 --max-time 300 "$url" -o "$filename"
+  else
+    wget -t 3 -T 10 -O "$filename" "$url"
+  fi
+}
+
+detele_kernel_head() {
+  local kv="${kernel_version:-}"
+  [[ -z "$kv" ]] && return 0
+
+  if [[ "${OS_type}" == "CentOS" ]]; then
+    local del
+    del="$(rpm -qa | grep -E 'kernel-(headers|devel)' | grep -v "${kv}" || true)"
+    [[ -n "$del" ]] && rpm --nodeps -e $del || true
+  elif [[ "${OS_type}" == "Debian" ]]; then
+    local del
+    del="$(dpkg -l 2>/dev/null | awk '/linux-headers/{print $2}' | grep -v "${kv}" || true)"
+    if [[ -n "$del" ]]; then
+      apt-get purge -y $del || true
+      apt-get autoremove -y || true
+    fi
+  fi
+}
+
+BBR_grub() {
+  if [[ "${OS_type}" == "CentOS" ]]; then
+    if _exists grub2-mkconfig; then
+      grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1 || true
+      grub2-set-default 0 >/dev/null 2>&1 || true
+    elif _exists grub-mkconfig; then
+      grub-mkconfig -o /boot/grub/grub.cfg >/dev/null 2>&1 || true
+      grub-set-default 0 >/dev/null 2>&1 || true
+    fi
+  elif [[ "${OS_type}" == "Debian" ]]; then
+    if _exists update-grub; then
+      update-grub >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+install_bbrplus_real() {
+  echo -e "${Info} 安装 BBRplus 内核（4.14.129-bbrplus）..."
+
+  local bit
+  bit="$(uname -m)"
+  if [[ "$bit" != "x86_64" ]]; then
+    echo -e "${Error} BBRplus 仅支持 x86_64"
+    return 1
+  fi
+
+  rm -rf /tmp/bbrplus && mkdir -p /tmp/bbrplus && cd /tmp/bbrplus
+
+  if [[ "${OS_type}" == "CentOS" ]]; then
+    [[ "${version}" != "7" ]] && { echo -e "${Error} CentOS 仅支持 7"; return 1; }
+
+    kernel_version="4.14.129-bbrplus"
+    detele_kernel_head
+
+    local headurl imgurl
+    headurl="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/centos/7/kernel-headers-4.14.129-bbrplus.rpm"
+    imgurl="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/centos/7/kernel-4.14.129-bbrplus.rpm"
+
+    headurl="$(check_cn "$headurl")"
+    imgurl="$(check_cn "$imgurl")"
+
+    download_file "$imgurl" kernel.rpm
+    download_file "$headurl" kernel-headers.rpm
+
+    yum install -y kernel.rpm
+    yum install -y kernel-headers.rpm
+
+  elif [[ "${OS_type}" == "Debian" ]]; then
+    kernel_version="4.14.129-bbrplus"
+    detele_kernel_head
+
+    local headurl imgurl
+    headurl="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/debian-ubuntu/x64/linux-headers-4.14.129-bbrplus.deb"
+    imgurl="https://github.com/cx9208/Linux-NetSpeed/raw/master/bbrplus/debian-ubuntu/x64/linux-image-4.14.129-bbrplus.deb"
+
+    headurl="$(check_cn "$headurl")"
+    imgurl="$(check_cn "$imgurl")"
+
+    download_file "$imgurl" linux-image.deb
+    download_file "$headurl" linux-headers.deb
+
+    dpkg -i linux-image.deb || apt-get -f install -y
+    dpkg -i linux-headers.deb || apt-get -f install -y
+  else
+    echo -e "${Error} 不支持的系统"
+    return 1
+  fi
+
+  cd / && rm -rf /tmp/bbrplus
+  BBR_grub
+  echo -e "${Tip} 安装完成：请重启后生效。"
+  return 0
+}
+
+install_bbrplusnew_real() {
+  echo -e "${Info} 安装 BBRplusNew 内核（UJX6N/bbrplus-6.x_stable 最新 release）..."
+
+  if ! _exists curl; then
+    echo -e "${Error} 需要 curl 才能从 GitHub API 获取最新版本"
+    return 1
+  fi
+
+  local github_ver_plus github_ver_plus_num
+  github_ver_plus="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep /tag/ | head -1 | awk -F'[/"]' '{print $8}')"
+  github_ver_plus_num="$(echo "$github_ver_plus" | awk -F'-' '{print $1}')"
+
+  if [[ -z "$github_ver_plus" || -z "$github_ver_plus_num" ]]; then
+    echo -e "${Error} 获取 release 版本失败（可能 GitHub API 受限）"
+    return 1
+  fi
+
+  echo -e "${Info} 最新版本: ${github_ver_plus}"
+
+  rm -rf /tmp/bbrplusnew && mkdir -p /tmp/bbrplusnew && cd /tmp/bbrplusnew
+
+  local bit
+  bit="$(uname -m)"
+
+  if [[ "${OS_type}" == "CentOS" ]]; then
+    [[ "$bit" != "x86_64" ]] && { echo -e "${Error} CentOS 仅支持 x86_64"; return 1; }
+    [[ "${version}" != "7" && "${version}" != "8" ]] && { echo -e "${Error} CentOS 仅支持 7/8"; return 1; }
+
+    kernel_version="${github_ver_plus_num}-bbrplus"
+    detele_kernel_head
+
+    local headurl imgurl
+    if [[ "${version}" == "7" ]]; then
+      headurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'rpm' | grep -E 'headers' | grep -E 'el7' | awk -F'"' '{print $4}' | head -1)"
+      imgurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'rpm' | grep -vE 'devel|headers|Source' | grep -E 'el7' | awk -F'"' '{print $4}' | head -1)"
+    else
+      headurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'rpm' | grep -E 'headers' | grep -E 'el8' | awk -F'"' '{print $4}' | head -1)"
+      imgurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'rpm' | grep -vE 'devel|headers|Source' | grep -E 'el8' | awk -F'"' '{print $4}' | head -1)"
+    fi
+
+    [[ -z "$headurl" || -z "$imgurl" ]] && { echo -e "${Error} 未找到 rpm 资源链接"; return 1; }
+
+    headurl="$(check_cn "$headurl")"
+    imgurl="$(check_cn "$imgurl")"
+
+    # 修正：image -> kernel.rpm, headers -> kernel-headers.rpm
+    download_file "$imgurl" kernel.rpm
+    download_file "$headurl" kernel-headers.rpm
+
+    yum install -y kernel.rpm
+    yum install -y kernel-headers.rpm
+
+  elif [[ "${OS_type}" == "Debian" ]]; then
+    kernel_version="${github_ver_plus_num}-bbrplus"
+    detele_kernel_head
+
+    local headurl imgurl
+    if [[ "$bit" == "x86_64" ]]; then
+      headurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'amd64\.deb' | grep -E 'headers' | awk -F'"' '{print $4}' | head -1)"
+      imgurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'amd64\.deb' | grep -E 'image' | awk -F'"' '{print $4}' | head -1)"
+    elif [[ "$bit" == "aarch64" || "$bit" == "arm64" ]]; then
+      headurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'arm64\.deb' | grep -E 'headers' | awk -F'"' '{print $4}' | head -1)"
+      imgurl="$(curl -fsSL https://api.github.com/repos/UJX6N/bbrplus-6.x_stable/releases | grep "${github_ver_plus}" | grep -E 'arm64\.deb' | grep -E 'image' | awk -F'"' '{print $4}' | head -1)"
+    else
+      echo -e "${Error} Debian 仅支持 x86_64 / arm64"
+      return 1
+    fi
+
+    [[ -z "$headurl" || -z "$imgurl" ]] && { echo -e "${Error} 未找到 deb 资源链接"; return 1; }
+
+    headurl="$(check_cn "$headurl")"
+    imgurl="$(check_cn "$imgurl")"
+
+    download_file "$imgurl" linux-image.deb
+    download_file "$headurl" linux-headers.deb
+
+    dpkg -i linux-image.deb || apt-get -f install -y
+    dpkg -i linux-headers.deb || apt-get -f install -y
+  else
+    echo -e "${Error} 不支持的系统"
+    return 1
+  fi
+
+  cd / && rm -rf /tmp/bbrplusnew
+  BBR_grub
+  echo -e "${Tip} 安装完成：请重启后生效。"
+  return 0
+}
+
+# -----------------------------
 # 系统优化（保留你脚本里的“优化新”）
 # -----------------------------
 optimizing_system_johnrosen1() {
@@ -230,7 +458,6 @@ optimizing_system_johnrosen1() {
     touch /etc/sysctl.d/99-sysctl.conf
   fi
 
-  # 直接覆盖写入（和你原脚本一致的方式）
   cat >'/etc/sysctl.d/99-sysctl.conf' <<'EOF'
 net.ipv4.tcp_fack = 1
 net.ipv4.tcp_early_retrans = 3
@@ -344,17 +571,17 @@ edit_sysctl_interactive() {
 }
 
 # -----------------------------
-# 卸载全部加速（清理 sysctl.d + sysctl.conf 相关项）
+# 卸载全部加速（更安全：只删 99-sysctl.conf）
 # -----------------------------
 remove_all() {
-  rm -rf /etc/sysctl.d/*.conf || true
+  rm -f /etc/sysctl.d/99-sysctl.conf || true
   if [[ ! -f "/etc/sysctl.conf" ]]; then
     touch /etc/sysctl.conf
   else
     : > /etc/sysctl.conf
   fi
   sysctl --system >/dev/null 2>&1 || true
-  echo -e "${Info} 已清理全部加速配置（sysctl），如有自定义内核不在此处卸载。"
+  echo -e "${Info} 已清理加速配置（sysctl）。如有自定义内核不在此处卸载。"
 }
 
 # -----------------------------
@@ -430,20 +657,15 @@ startbbrplus() {
 }
 
 # -----------------------------
-# 内核安装（菜单 1-3）：
-# 这里保留“原版/plus/plus新版”的入口。
-# 说明：你原脚本的下载/匹配逻辑很长且依赖多源，
-# 精简版这里提供“官方源安装”的通用实现（更稳）。
+# 内核安装（菜单 1-3）
 # -----------------------------
 install_bbr_official() {
   echo -e "${Info} 安装 BBR 原版内核（官方源/仓库）..."
   if [[ "${OS_type}" == "Debian" ]]; then
     apt-get update -y
-    # Ubuntu/Debian：安装通用内核与headers（尽量匹配）
     if [[ "${release}" == "ubuntu" ]]; then
       apt-get install -y linux-image-generic linux-headers-generic
     else
-      # Debian：优先 amd64/arm64 元包
       if [[ "$(uname -m)" == "x86_64" ]]; then
         apt-get install -y linux-image-amd64 linux-headers-amd64
       else
@@ -461,20 +683,6 @@ install_bbr_official() {
     return 1
   fi
   echo -e "${Tip} 内核安装完成，请重启后生效。"
-}
-
-install_bbrplus_stub() {
-  echo -e "${Info} 安装 BBRplus 版内核..."
-  echo -e "${Tip} 精简版脚本未内置第三方 BBRplus 内核下载逻辑。"
-  echo -e "${Tip} 如需保留你原脚本的 BBRplus 下载/安装，请把 installbbrplus() 及其依赖函数粘回本脚本，并在此处调用。"
-  return 0
-}
-
-install_bbrplusnew_stub() {
-  echo -e "${Info} 安装 BBRplus 新版内核..."
-  echo -e "${Tip} 精简版脚本未内置第三方 BBRplusNew 内核下载逻辑。"
-  echo -e "${Tip} 如需保留你原脚本的 installbbrplusnew() 及依赖，请粘回本脚本，并在此处调用。"
-  return 0
 }
 
 # -----------------------------
@@ -513,9 +721,9 @@ start_menu() {
 
     read -r -p " 请输入数字: " num
     case "${num}" in
-      1) install_bbr_official ;;
-      2) install_bbrplus_stub ;;
-      3) install_bbrplusnew_stub ;;
+      1) install_bbr_official || true ;;
+      2) install_bbrplus_real || true ;;
+      3) install_bbrplusnew_real || true ;;
       4) startbbrfq ;;
       5) startbbrfqpie ;;
       6) startbbrcake ;;
