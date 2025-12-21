@@ -940,12 +940,27 @@ linux_ps() {
 
 	local cpu_cores=$(nproc)
 
-	local cpu_freq=$(cat /proc/cpuinfo | grep "MHz" | head -n 1 | awk '{printf "%.1f GHz\n", $4/1000}')
+	local cpu_freq=$(grep "MHz" /proc/cpuinfo | head -n 1 | awk '{printf "%.1f GHz\n", $4/1000}')
 
-	local mem_info=$(free -b | awk 'NR==2{printf "%.2f/%.2f MB (%.2f%%)", $3/1024/1024, $2/1024/1024, $3*100/$2}')
+	# 面板口径（nocache used）
+	local mem_info=$(awk '/MemTotal/{t=$2}/MemFree/{f=$2}/^Buffers:/{b=$2}/^Cached:/{c=$2}/SReclaimable/{r=$2}/Shmem:/{s=$2}END{used=t-f-b-c-r+s;if(used<0)used=0;printf "%.2f/%.2f MB (%.2f%%)",used/1024,t/1024,used*100/t}' /proc/meminfo)
 
+	# OOM 风险参考（MemAvailable）
+	local mem_pressure=$(
+  awk -v red="${red}" -v yellow="${yellow}" -v green="${green}" -v reset="${reset}" '
+    /MemTotal/     {t=$2}
+    /MemAvailable/ {a=$2}
+    END{
+      p = (t>0)? (a*100/t) : 0
+      mb = a/1024
+      if (p < 5)      {color=red;    status="高危"}
+      else if (p < 10){color=yellow; status="警告"}
+      else            {color=green;  status="安全"}
+      printf "%s%.0fMB available (%.0f%%) %s%s", color, mb, p, status, reset
+    }
+  ' /proc/meminfo
+)
 	local disk_info=$(df -h | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}')
-
 	local ipinfo=$(curl -s ipinfo.io)
 	local country=$(echo "$ipinfo" | grep 'country' | awk -F': ' '{print $2}' | tr -d '",')
 	local city=$(echo "$ipinfo" | grep 'city' | awk -F': ' '{print $2}' | tr -d '",')
@@ -968,9 +983,7 @@ END {print ""}')
 	fi
 
 	local cpu_arch=$(uname -m)
-
 	local hostname=$(uname -n)
-
 	local kernel_version=$(uname -r)
 
 	local congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control)
@@ -982,8 +995,7 @@ END {print ""}')
 
 	local swap_info=$(free -m | awk 'NR==3{used=$3; total=$2; if (total == 0) {percentage=0} else {percentage=used*100/total}; printf "%dMB/%dMB (%d%%)", used, total, percentage}')
 
-	local runtime=$(cat /proc/uptime | awk -F. '{run_days=int($1 / 86400);run_hours=int(($1 % 86400) / 3600);run_minutes=int(($1 % 3600) / 60); if (run_days > 0) printf("%d天 ", run_days); if (run_hours > 0) printf("%d时 ", run_hours); printf("%d分\n", run_minutes)}')
-
+	local runtime=$(awk -F. '{run_days=int($1 / 86400);run_hours=int(($1 % 86400) / 3600);run_minutes=int(($1 % 3600) / 60); if (run_days > 0) printf("%d天 ", run_days); if (run_hours > 0) printf("%d时 ", run_hours); printf("%d分\n", run_minutes)}' /proc/uptime)
 
 	echo ""
 	echo -e "系统信息查询"
@@ -1000,6 +1012,7 @@ END {print ""}')
 	echo -e "${tianlan}CPU占用:      ${hui}$cpu_usage_percent%"
 	echo -e "${tianlan}系统负载:     ${hui}$load"
 	echo -e "${tianlan}物理内存:     ${hui}$mem_info"
+	echo -e "${tianlan}可用内存:     ${hui}${mem_pressure}"
 	echo -e "${tianlan}虚拟内存:     ${hui}$swap_info"
 	echo -e "${tianlan}硬盘占用:     ${hui}$disk_info"
 	echo -e "${tianlan}-------------"
@@ -1011,7 +1024,6 @@ END {print ""}')
 	if [ -n "$ipv4_address" ]; then
 		echo -e "${tianlan}IPv4地址:     ${hui}$ipv4_address"
 	fi
-
 	if [ -n "$ipv6_address" ]; then
 		echo -e "${tianlan}IPv6地址:     ${hui}$ipv6_address"
 	fi
@@ -1022,6 +1034,7 @@ END {print ""}')
 	echo -e "${tianlan}运行时长:     ${hui}$runtime"
 	echo
 }
+
 
 # -----------------------------------------
 #  安装BBRv3（bbrv3）
