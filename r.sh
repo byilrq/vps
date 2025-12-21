@@ -19,6 +19,10 @@ SERVICE="xray"
 INFO_FILE="$HOME/_vless_reality_url_"
 SOURCES_LIST="/etc/apt/sources.list"
 SOURCES_BAK="/etc/apt/sources.list.bak.xray_reality"
+local _red="${red:-}"
+local _yellow="${yellow:-}"
+local _green="${green:-}"
+local _reset="${reset:-${none:-}}"
 
 # 与你原来打印保持一致（可自行改）
 FLOW="xtls-rprx-vision"
@@ -798,21 +802,51 @@ ipquality() {
   echo "检查 IP 质量中..."
   curl -sL https://Check.Place | bash -s - -I
 }
-
+# ============================================================
+#  系统信息显示
+# ============================================================
 linux_ps() {
   clear || true
   apt_install_safe curl >/dev/null 2>&1 || true
-
-  local cpu_info cpu_cores cpu_freq mem_info disk_info load os_info kernel_version cpu_arch hostname now runtime dns_addresses
+  
+  local cpu_info cpu_cores cpu_freq mem_info mem_pressure disk_info load os_info kernel_version cpu_arch hostname now runtime dns_addresses
   cpu_info="$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')"
   cpu_cores="$(nproc 2>/dev/null || echo 1)"
   cpu_freq="$(awk -F': ' '/cpu MHz/ {printf "%.1f GHz\n",$2/1000; exit}' /proc/cpuinfo 2>/dev/null || true)"
-  mem_info="$(free -b | awk 'NR==2{printf "%.2f/%.2f MB (%.2f%%)", $3/1024/1024, $2/1024/1024, $3*100/$2}')"
+
+  # 物理内存：面板口径（nocache used）= total - free - buffers - cached - sreclaimable + shmem
+  mem_info="$(awk '
+    /MemTotal/     {t=$2}
+    /MemFree/      {f=$2}
+    /^Buffers:/    {b=$2}
+    /^Cached:/     {c=$2}
+    /SReclaimable/ {r=$2}
+    /Shmem:/       {s=$2}
+    END{
+      used = t - f - b - c - r + s
+      if (used < 0) used = 0
+      printf "%.2f/%.2f MB (%.2f%%)", used/1024, t/1024, used*100/t
+    }' /proc/meminfo)"
+
+  # OOM 风险参考：MemAvailable + 阈值（<10% 黄、<5% 红）
+  mem_pressure="$(awk -v red="${_red}" -v yellow="${_yellow}" -v green="${_green}" -v reset="${_reset}" '
+    /MemTotal/     {t=$2}
+    /MemAvailable/ {a=$2}
+    END{
+      p = (t>0)? (a*100/t) : 0
+      mb = a/1024
+      if (p < 5)      {color=red;    status="高危"}
+      else if (p < 10){color=yellow; status="警告"}
+      else            {color=green;  status="安全"}
+      printf "%s%.0fMB available (%.0f%%) %s%s", color, mb, p, status, reset
+    }' /proc/meminfo)"
+
   disk_info="$(df -h | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}')"
   load="$(uptime | awk -F'load average:' '{print $2}' | xargs)"
   os_info="$(grep PRETTY_NAME /etc/os-release | cut -d '=' -f2 | tr -d '"')"
   kernel_version="$(uname -r)"
-    # --- 补充：拥塞控制/队列算法/内核headers匹配 ---
+
+  # --- 补充：拥塞控制/队列算法/内核headers匹配 ---
   local cc_algo qdisc_algo headers_status
 
   cc_algo="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
@@ -866,6 +900,7 @@ linux_ps() {
   echo -e "${cyan}------------------------------${none}"
   echo -e "系统负载:     ${load}"
   echo -e "物理内存:     ${mem_info}"
+  echo -e "可用内存:     ${mem_pressure}"
   echo -e "硬盘占用:     ${disk_info}"
   echo -e "${cyan}------------------------------${none}"
   [[ -n "$isp" ]] && echo -e "运营商:       ${isp}"
@@ -873,11 +908,12 @@ linux_ps() {
   [[ -n "$ipv6" ]] && echo -e "IPv6地址:     ${ipv6}"
   echo -e "DNS地址:      ${dns_addresses}"
   [[ -n "$country$city" ]] && echo -e "地理位置:     ${country} ${city}"
-  echo -e "拥塞控制算法:: ${cc_algo:-未知} 队列算法: ${qdisc_algo:-未知} 内核headers：${headers_status}"
+  echo -e "拥塞控制算法: ${cc_algo:-未知} 队列算法: ${qdisc_algo:-未知} 内核headers：${headers_status}"
   echo -e "系统时间:     ${now}"
   echo -e "运行时长:     ${runtime}"
   echo ""
 }
+
 
 change_tz() {
   local tz=""
