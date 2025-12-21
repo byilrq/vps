@@ -13,7 +13,12 @@ set -Eeuo pipefail
 # -----------------------------
 #  颜色/常量
 # -----------------------------
-red='\e[91m'; green='\e[92m'; yellow='\e[93m'; magenta='\e[95m'; cyan='\e[96m'; none='\e[0m'
+red='\033[31m'
+green='\033[32m'
+yellow='\033[33m'
+magenta='\033[35m'
+cyan='\033[36m'
+none='\033[0m'
 CONFIG="/usr/local/etc/xray/config.json"
 SERVICE="xray"
 INFO_FILE="$HOME/_vless_reality_url_"
@@ -804,13 +809,8 @@ linux_ps() {
   clear || true
   apt_install_safe curl >/dev/null 2>&1 || true
 
-  # 颜色兜底（如果外部没定义这些变量，也不会乱码）
-  local _red="${red:-}"
-  local _yellow="${yellow:-}"
-  local _green="${green:-}"
-  local _reset="${reset:-${none:-}}"
-
   local cpu_info cpu_cores cpu_freq mem_info mem_pressure disk_info load os_info kernel_version cpu_arch hostname now runtime dns_addresses
+
   cpu_info="$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')"
   cpu_cores="$(nproc 2>/dev/null || echo 1)"
   cpu_freq="$(awk -F': ' '/cpu MHz/ {printf "%.1f GHz\n",$2/1000; exit}' /proc/cpuinfo 2>/dev/null || true)"
@@ -829,18 +829,26 @@ linux_ps() {
       printf "%.2f/%.2f MB (%.2f%%)", used/1024, t/1024, used*100/t
     }' /proc/meminfo)"
 
-  # OOM 风险参考：MemAvailable + 阈值（<10% 黄、<5% 红）
-  mem_pressure="$(awk -v red="${_red}" -v yellow="${_yellow}" -v green="${_green}" -v reset="${_reset}" '
-    /MemTotal/     {t=$2}
-    /MemAvailable/ {a=$2}
-    END{
-      p = (t>0)? (a*100/t) : 0
-      mb = a/1024
-      if (p < 5)      {color=red;    status="高危"}
-      else if (p < 10){color=yellow; status="警告"}
-      else            {color=green;  status="安全"}
-      printf "%s%.0fMB available (%.0f%%) %s%s", color, mb, p, status, reset
-    }' /proc/meminfo)"
+  # 可用内存 / OOM 风险参考：MemAvailable（百分比阈值：<10% 黄、<5% 红）
+  local mem_total_kb mem_avail_kb mem_avail_mb mem_avail_pct mem_status mem_color
+  mem_total_kb="$(awk '/MemTotal/ {print $2; exit}' /proc/meminfo)"
+  mem_avail_kb="$(awk '/MemAvailable/ {print $2; exit}' /proc/meminfo)"
+
+  mem_avail_mb=$(( mem_avail_kb / 1024 ))
+  mem_avail_pct=$(( mem_total_kb > 0 ? mem_avail_kb * 100 / mem_total_kb : 0 ))
+
+  if (( mem_avail_pct < 5 )); then
+    mem_status="高危"
+    mem_color="${red}"
+  elif (( mem_avail_pct < 10 )); then
+    mem_status="警告"
+    mem_color="${yellow}"
+  else
+    mem_status="安全"
+    mem_color="${green}"
+  fi
+
+  mem_pressure="${mem_color}${mem_avail_mb}MB available (${mem_avail_pct}%) ${mem_status}${none}"
 
   disk_info="$(df -h | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}')"
   load="$(uptime | awk -F'load average:' '{print $2}' | xargs)"
@@ -851,7 +859,6 @@ linux_ps() {
   local cc_algo qdisc_algo headers_status
 
   cc_algo="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || true)"
-  # 优先用 root(/) 网卡的 qdisc；取不到就回退到 any dev 的第一条
   qdisc_algo="$(
     ip -o route get 1.1.1.1 2>/dev/null \
       | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}' \
@@ -860,7 +867,6 @@ linux_ps() {
   )"
   [[ -z "$qdisc_algo" ]] && qdisc_algo="$(tc qdisc show 2>/dev/null | awk 'NR==1{print $2; exit}')"
 
-  # 内核 headers 是否匹配当前内核版本
   if [[ -d "/lib/modules/${kernel_version}/build" || -e "/usr/src/linux-headers-${kernel_version}" ]]; then
     headers_status="已匹配"
   else
