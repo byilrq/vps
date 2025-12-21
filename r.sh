@@ -19,6 +19,10 @@ yellow='\033[33m'
 magenta='\033[35m'
 cyan='\033[36m'
 none='\033[0m'
+bold='\033[1m'
+dim='\033[2m'
+gray='\033[90m'
+
 CONFIG="/usr/local/etc/xray/config.json"
 SERVICE="xray"
 INFO_FILE="$HOME/_vless_reality_url_"
@@ -1238,24 +1242,39 @@ install_with_params() {
 }
 
 # -----------------------------
-#  主菜单（已按你的要求整合）
+#  主菜单
 # -----------------------------
 menu() {
   while :; do
-    clear || true
-    echo -e "${cyan}====== Xray Reality 管理界面 =======${none}"
-    echo "1) 安装/重装 Xray Reality"
-    echo "2) 卸载 Xray"
-    echo "3) 显示节点信息（URL+二维码）"
-    echo "4) 系统配置/工具（含：改端口/UUID/重置密钥 + DNS/Swap/BBR/防火墙等）"
-    echo "5) 回程测试（besttrace）"
-    echo "6) IP质量检测（ipquality）"
-    echo "7) 系统查询（linux_ps）"
-    echo "8) 查看 Xray 服务状态"
-    echo "0) Exit"
-    echo "--------------------------------------------------"
+    clear >/dev/null 2>&1 || true
+
+    # 仅用于美化：不要求你全局必须有
+    local bold='\033[1m'
+    local dim='\033[2m'
+    local gray='\033[90m'
+
+    echo -e "${cyan}${bold}╔══════════════════════════════════════════════╗${none}"
+    echo -e "${cyan}${bold}║            Xray Reality 管理界面            ║${none}"
+    echo -e "${cyan}${bold}╚══════════════════════════════════════════════╝${none}"
+    echo -e "${gray}--------------------------------------------------${none}"
+
+    echo -e " ${yellow}${bold}1)${none} 安装/重装 Xray Reality"
+    echo -e " ${yellow}${bold}2)${none} 卸载 Xray"
+    echo -e " ${yellow}${bold}3)${none} 显示节点信息（URL+二维码）"
+    echo -e " ${yellow}${bold}4)${none} 系统配置/工具（含：改端口/UUID/重置密钥 + DNS/Swap/BBR/防火墙等）"
+    echo -e " ${yellow}${bold}5)${none} 回程测试（besttrace）"
+    echo -e " ${yellow}${bold}6)${none} IP质量检测（ipquality）"
+    echo -e " ${yellow}${bold}7)${none} 系统查询（linux_ps）"
+    echo -e " ${yellow}${bold}8)${none} 查看 Xray 服务状态"
+    echo -e " ${red}${bold}0)${none} Exit"
+
+    echo -e "${gray}--------------------------------------------------${none}"
+    echo -e "${dim}${gray}提示：输入数字后回车${none}"
+    echo -ne "${green}${bold}请选择 [0-8]${none}${green}: ${none}"
+
     local choice=""
-    read_tty "请选择 [0-8]: " choice
+    read_tty "" choice
+
     case "${choice}" in
       1) install_xray; pause ;;
       2) uninstall_xray; pause ;;
@@ -1270,6 +1289,8 @@ menu() {
     esac
   done
 }
+
+
 
 # -----------------------------
 #  主程序入口
