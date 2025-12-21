@@ -467,14 +467,14 @@ install_bbrplus_stub() {
   echo -e "${Info} 安装 BBRplus 版内核..."
   echo -e "${Tip} 精简版脚本未内置第三方 BBRplus 内核下载逻辑。"
   echo -e "${Tip} 如需保留你原脚本的 BBRplus 下载/安装，请把 installbbrplus() 及其依赖函数粘回本脚本，并在此处调用。"
-  return 1
+  return 0
 }
 
 install_bbrplusnew_stub() {
   echo -e "${Info} 安装 BBRplus 新版内核..."
   echo -e "${Tip} 精简版脚本未内置第三方 BBRplusNew 内核下载逻辑。"
   echo -e "${Tip} 如需保留你原脚本的 installbbrplusnew() 及依赖，请粘回本脚本，并在此处调用。"
-  return 1
+  return 0
 }
 
 # -----------------------------
