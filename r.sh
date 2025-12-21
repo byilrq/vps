@@ -803,7 +803,13 @@ ipquality() {
 linux_ps() {
   clear || true
   apt_install_safe curl >/dev/null 2>&1 || true
-  
+
+  # 颜色兜底（如果外部没定义这些变量，也不会乱码）
+  local _red="${red:-}"
+  local _yellow="${yellow:-}"
+  local _green="${green:-}"
+  local _reset="${reset:-${none:-}}"
+
   local cpu_info cpu_cores cpu_freq mem_info mem_pressure disk_info load os_info kernel_version cpu_arch hostname now runtime dns_addresses
   cpu_info="$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')"
   cpu_cores="$(nproc 2>/dev/null || echo 1)"
@@ -908,6 +914,7 @@ linux_ps() {
   echo -e "运行时长:     ${runtime}"
   echo ""
 }
+
 
 
 change_tz() {
