@@ -1222,15 +1222,34 @@ auth_key() {
   echo "已备份：$bak"
 
   # 设置/追加配置项的 helper
-  _set_sshd_kv() {
-    local k="$1" v="$2"
-    if grep -Eq "^[[:space:]]*#?[[:space:]]*$k[[:space:]]+" "$cfg"; then
-      # 替换第一处匹配
-      sed -i "0,/^[[:space:]]*#\?[[:space:]]*$k[[:space:]].*/s//${k} ${v}/" "$cfg"
-    else
-      printf "\n%s %s\n" "$k" "$v" >> "$cfg"
-    fi
-  }
+ _set_sshd_kv() {
+  local k="$1" v="$2"
+  local tmp
+  tmp="$(mktemp)"
+
+  awk -v K="$k" -v V="$v" '
+    BEGIN { done=0 }
+    {
+      # 匹配：可选空白 + 可选# + 空白 + Key + 至少一个空白
+      # 只替换第一条命中的
+      if (!done && $0 ~ "^[[:space:]]*#?[[:space:]]*" K "[[:space:]]+") {
+        print K " " V
+        done=1
+      } else {
+        print $0
+      }
+    }
+    END {
+      if (!done) {
+        print ""
+        print K " " V
+      }
+    }
+  ' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
+
+  rm -f "$tmp"
+}
+
 
   _set_sshd_kv "PubkeyAuthentication" "yes"
   _set_sshd_kv "AuthorizedKeysFile" ".ssh/authorized_keys"
