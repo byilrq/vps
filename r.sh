@@ -929,15 +929,19 @@ linux_ps() {
   echo ""
 }
 
-
+# -----------------------------
+#  设置时区
+# -----------------------------
 
 change_tz() {
   local tz=""
-  read_tty "请输入时区（回车默认 Asia/Shanghai，例如 Asia/Tokyo）: " tz
+  read_tty "请输入时区（回车默认 Asia/Shanghai，例如 Asia/Shanghai）: " tz
   [[ -z "$tz" ]] && tz="Asia/Shanghai"
   timedatectl set-timezone "$tz" && ok "系统时区已设置为：$tz" || warn "设置失败：请检查 timedatectl / 时区名是否存在"
 }
-
+# -----------------------------
+#  设置DNS
+# -----------------------------
 set_dns_ui() {
   apt_install_safe curl sudo >/dev/null 2>&1 || true
   echo -e "${yellow}正在配置 DNS（8.8.8.8 / 1.1.1.1）并锁定 /etc/resolv.conf ...${none}"
@@ -960,7 +964,9 @@ EOF
     systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
   fi
 }
-
+# -----------------------------
+#  设置SWAP缓存
+# -----------------------------
 swap_cache() {
   local size_mb confirm
   echo "当前 Swap："
@@ -989,6 +995,9 @@ swap_cache() {
   free -h | awk 'NR==1 || /Swap:/ {print}'
 }
 
+# -----------------------------
+#  设置IP优先级
+# -----------------------------
 set_ip_priority() {
   while :; do
     clear || true
@@ -1017,6 +1026,9 @@ set_ip_priority() {
   done
 }
 
+# -----------------------------
+#  定时重启设置
+# -----------------------------
 cron_reboot() {
   apt_install_safe cron >/dev/null 2>&1 || true
   systemctl enable --now cron >/dev/null 2>&1 || true
@@ -1036,6 +1048,9 @@ EOF
   ok "已设置每天 ${hh}:$(printf '%02d' "$mm") 定时重启（/etc/cron.d/xray_reboot）"
 }
 
+# -----------------------------
+# 端口设置
+# -----------------------------
 ssh_port() {
   local new_port="$1"
   [[ -z "$new_port" ]] && { warn "缺少端口参数"; return 1; }
@@ -1053,6 +1068,9 @@ ssh_port() {
   ok "SSH 端口已修改为 ${new_port}（请确保防火墙已放行，否则可能断连）"
 }
 
+# -----------------------------
+#  防火墙设置
+# -----------------------------
 firewall() {
   apt_install_safe ufw >/dev/null 2>&1 || true
 
@@ -1109,6 +1127,9 @@ firewall() {
   done
 }
 
+# -----------------------------
+#  BBR设置
+# -----------------------------
 bbrv3() {
   if [[ ! -r /etc/os-release ]]; then
     warn "无法判断系统类型"
@@ -1155,7 +1176,9 @@ bbrx() {
   bash "$tmp"
 }
 
-
+# -----------------------------
+#  添加秘钥登录
+# -----------------------------
 auth_key() {
   set -e
 
@@ -1375,9 +1398,37 @@ auth_key() {
 
   echo "完成。建议：打开新终端测试密钥登录成功后，再退出当前会话。"
 }
+# -----------------------------
+#  系统清理
+# -----------------------------
+sys_cle() {
+  local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_cle.sh"
+  local script="/root/sys_cle.sh"
+  local cron_line='0 0 * * * /bin/bash /root/sys_cle.sh >> /root/sys_cle.cron.log 2>&1'
 
+  # 确保 curl / wget 至少有一个
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl wget >/dev/null 2>&1 || true
+  fi
 
+  # 下载到 /root/sys_cle.sh（直接覆盖）
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
+  else
+    wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
+  fi
+  chmod +x "$script" || true
 
+  # 写入 cron（去重：先删掉旧的同类行，再加新的）
+  ( crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" ; echo "$cron_line" ) | crontab -
+
+  echo "OK: 已下载 $script，并设置每日 00:00 定时执行"
+}
+
+# -----------------------------
+#  参数修改
+# -----------------------------
 changeconf() {
   while :; do
     clear || true
@@ -1397,6 +1448,7 @@ changeconf() {
     echo "12) 修改SSH端口2222"
     echo "13) 设置ufw"
     echo "14) 设置SSH秘钥"
+    echo "15) 设置系统清理"
     echo "0) 返回"
     echo "--------------------------------------------------"
     local c=""
@@ -1415,6 +1467,7 @@ changeconf() {
       12) ssh_port 2222; pause ;;
       13) firewall; pause ;;
       14) auth_key ;;
+      14) sys_cle ;;
       0) return 0 ;;
       *) error; pause ;;
     esac
