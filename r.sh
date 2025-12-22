@@ -1155,6 +1155,111 @@ bbrx() {
   bash "$tmp"
 }
 
+
+auth_key() {
+  set -e
+
+  # ===== 可改参数 =====
+  local target_user="${1:-root}"     # auth_key root / auth_key ubuntu
+  local ssh_port="${2:-22}"          # 预留：如果你要改端口可用
+  # ===================
+
+  if [ "$(id -u)" -ne 0 ]; then
+    echo "ERROR: 请用 root 执行（需要写 /etc/ssh/sshd_config 并重启 ssh）。"
+    return 1
+  fi
+
+  read -r -p "是否设置密钥登录方式？[y/N] " yn
+  case "$yn" in
+    y|Y|yes|YES) ;;
+    *) echo "已取消。"; return 0 ;;
+  esac
+
+  # 获取用户家目录
+  local user_home
+  user_home="$(getent passwd "$target_user" | cut -d: -f6)"
+  if [ -z "$user_home" ] || [ ! -d "$user_home" ]; then
+    echo "ERROR: 找不到用户或家目录：$target_user"
+    return 1
+  fi
+
+  echo "请输入公钥字符串（一整行，以 ssh-ed25519/ssh-rsa/ecdsa... 开头），回车结束："
+  read -r pubkey
+
+  if ! echo "$pubkey" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+(\s.*)?$'; then
+    echo "ERROR: 公钥格式不正确。示例：ssh-ed25519 AAAAC3... comment"
+    return 1
+  fi
+
+  # 创建 .ssh 和 authorized_keys
+  local ssh_dir="$user_home/.ssh"
+  local ak="$ssh_dir/authorized_keys"
+  mkdir -p "$ssh_dir"
+  chmod 700 "$ssh_dir"
+
+  touch "$ak"
+  chmod 600 "$ak"
+  chown -R "$target_user:$target_user" "$ssh_dir"
+
+  # 去重写入（只比较前两段：type + base64）
+  local key_two
+  key_two="$(echo "$pubkey" | awk '{print $1" "$2}')"
+  if awk '{print $1" "$2}' "$ak" | grep -Fxq "$key_two"; then
+    echo "公钥已存在：未重复写入 $ak"
+  else
+    echo "$pubkey" >> "$ak"
+    echo "公钥已写入：$ak"
+  fi
+
+  # 备份 sshd_config
+  local cfg="/etc/ssh/sshd_config"
+  if [ ! -f "$cfg" ]; then
+    echo "ERROR: 找不到 $cfg"
+    return 1
+  fi
+  local bak="${cfg}.bak.$(date +%Y%m%d-%H%M%S)"
+  cp -a "$cfg" "$bak"
+  echo "已备份：$bak"
+
+  # 设置/追加配置项的 helper
+  _set_sshd_kv() {
+    local k="$1" v="$2"
+    if grep -Eq "^[[:space:]]*#?[[:space:]]*$k[[:space:]]+" "$cfg"; then
+      # 替换第一处匹配
+      sed -i "0,/^[[:space:]]*#\?[[:space:]]*$k[[:space:]].*/s//${k} ${v}/" "$cfg"
+    else
+      printf "\n%s %s\n" "$k" "$v" >> "$cfg"
+    fi
+  }
+
+  _set_sshd_kv "PubkeyAuthentication" "yes"
+  _set_sshd_kv "AuthorizedKeysFile" ".ssh/authorized_keys"
+
+  # “关闭端口访问功能”——这里实现为关闭密码登录
+  read -r -p "是否关闭密码登录（仅允许密钥登录）？[y/N] " dis_pw
+  case "$dis_pw" in
+    y|Y|yes|YES)
+      _set_sshd_kv "PasswordAuthentication" "no"
+      _set_sshd_kv "KbdInteractiveAuthentication" "no"
+      echo "已关闭密码登录。"
+      ;;
+    *)
+      echo "保留密码登录。"
+      ;;
+  esac
+
+  # 重启 SSH 服务
+  if command -v systemctl >/dev/null 2>&1; then
+    systemctl restart ssh 2>/dev/null || systemctl restart sshd
+  else
+    service ssh restart 2>/dev/null || service sshd restart
+  fi
+  echo "SSH 服务已重启。"
+
+  echo "完成。建议：打开新终端测试密钥登录成功后，再退出当前会话。"
+}
+
+
 changeconf() {
   while :; do
     clear || true
@@ -1162,7 +1267,7 @@ changeconf() {
     echo "---------------- Xray 相关 ----------------"
     echo "1) 重置端口"
     echo "2) 重置UUID和ShortID"
-    echo "3) 重置私钥和公钥）"
+    echo "3) 重置私钥和公钥"
     echo "---------------- 系统相关 ----------------"
     echo "5) 修改时区"
     echo "6) 修改DNS"
@@ -1173,6 +1278,7 @@ changeconf() {
     echo "11) 设置定时重启"
     echo "12) 修改SSH端口2222"
     echo "13) 设置ufw"
+    echo "14) 设置SSH秘钥"
     echo "0) 返回"
     echo "--------------------------------------------------"
     local c=""
@@ -1190,6 +1296,7 @@ changeconf() {
       11) cron_reboot; pause ;;
       12) ssh_port 2222; pause ;;
       13) firewall; pause ;;
+      14) auth_key ;;
       0) return 0 ;;
       *) error; pause ;;
     esac
