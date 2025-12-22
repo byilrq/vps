@@ -1405,25 +1405,60 @@ sys_cle() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_cle.sh"
   local script="/root/sys_cle.sh"
   local cron_line='0 0 * * * /bin/bash /root/sys_cle.sh >> /root/sys_cle.cron.log 2>&1'
+  local action="${1:-add}"
 
-  # 确保 curl / wget 至少有一个
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y curl wget >/dev/null 2>&1 || true
-  fi
+  # 下载/更新脚本
+  _sys_cle_update() {
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+      apt-get update -y >/dev/null 2>&1 || true
+      apt-get install -y curl wget >/dev/null 2>&1 || true
+    fi
 
-  # 下载到 /root/sys_cle.sh（直接覆盖）
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
-  else
-    wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
-  fi
-  chmod +x "$script" || true
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
+    else
+      wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
+    fi
+    chmod +x "$script" || true
+  }
 
-  # 写入 cron（去重：先删掉旧的同类行，再加新的）
-  ( crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" ; echo "$cron_line" ) | crontab -
+  # 添加 cron（去重）
+  _sys_cle_add_cron() {
+    ( crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" ; echo "$cron_line" ) | crontab -
+  }
 
-  echo "OK: 已下载 $script，并设置每日 00:00 定时执行"
+  # 删除 cron（删掉包含 /root/sys_cle.sh 的行）
+  _sys_cle_del_cron() {
+    crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" | crontab - 2>/dev/null || true
+  }
+
+  case "$action" in
+    add)
+      _sys_cle_update && _sys_cle_add_cron
+      echo "OK: 已下载 $script 并添加每日 00:00 cron"
+      ;;
+    del|delete|rm)
+      _sys_cle_del_cron
+      echo "OK: 已删除 sys_cle 的 cron"
+      ;;
+    run)
+      _sys_cle_update || return 1
+      /bin/bash "$script"
+      ;;
+    update)
+      _sys_cle_update
+      echo "OK: 已更新 $script"
+      ;;
+    status)
+      echo "脚本: $script"
+      echo "Cron:"
+      crontab -l 2>/dev/null | grep -F "/root/sys_cle.sh" || echo "（未设置）"
+      ;;
+    *)
+      echo "用法: sys_cle {add|del|run|update|status}"
+      return 1
+      ;;
+  esac
 }
 
 # -----------------------------
