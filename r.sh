@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 # ============================================================
 # Xray VLESS Reality 管理脚本（整合版）
-# - 私钥/公钥：真随机 32 bytes 私钥 + 正确 X25519 推导公钥（OpenSSL）
-# - 支持 b64url/b64/hex 输入，输出纯净 b64url 公钥
-# - 安装时可选版本：回车默认 v25.10.15 / 输入 latest 安装最新 / 或输入 vX.Y.Z
-# - 主菜单精简：节点信息与 showconf 合并为一个入口
-# - “系统配置/工具”二级菜单：包含 修改端口 / 修改UUID+ShortID / 重置密钥 + DNS/Swap/BBR/防火墙等
 # ============================================================
 
 set -Eeuo pipefail
@@ -133,7 +128,11 @@ choose_xray_version() {
 # -----------------------------
 #  随机与校验
 # -----------------------------
-rand_hex() { local n="${1:?}"; hexdump -vn "$n" -e '1/1 "%02x"' /dev/urandom; }
+rand_hex() {
+  local n="${1:?}"   # n = bytes
+  openssl rand -hex "$n" 2>/dev/null
+}
+
 rand_uuid() { cat /proc/sys/kernel/random/uuid; }
 rand_shortid() { rand_hex 8; } # 16 hex
 
@@ -239,17 +238,16 @@ apt_install_safe() { wait_apt_lock; DEBIAN_FRONTEND=noninteractive apt-get -y in
 #  获取公网 IP
 # -----------------------------
 get_public_ips() {
-  local ifaces
-  mapfile -t ifaces < <(ls /sys/class/net/ | grep -E '^(eth|ens|eno|esp|enp|venet|vif)' || true)
-  IPv4=""; IPv6=""
-  for i in "${ifaces[@]}"; do
-    local v4 v6
-    v4=$(curl -4s --interface "$i" -m 2 https://www.cloudflare.com/cdn-cgi/trace | grep -oP "ip=\K.*$" || true)
-    v6=$(curl -6s --interface "$i" -m 2 https://www.cloudflare.com/cdn-cgi/trace | grep -oP "ip=\K.*$" || true)
-    [[ -n "${v4:-}" ]] && IPv4="$v4"
-    [[ -n "${v6:-}" ]] && IPv6="$v6"
-  done
+  IPv4=""
+  IPv6=""
+
+  IPv4="$(curl -4s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | awk -F= '/^ip=/{print $2; exit}' || true)"
+
+  IPv6="$(curl -6s --max-time 5 https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null \
+        | awk -F= '/^ip=/{print $2; exit}' || true)"
 }
+
 
 # -----------------------------
 #  读取配置（只读 inbounds）
@@ -629,6 +627,8 @@ showconf() { print_full_info_and_qr; }
 #  安装/重装
 # -----------------------------
 install_xray() {
+
+
   echo -e "${yellow}开始安装/重装 Xray Reality...${none}"
   if ! apt_update_safe; then
     warn "APT update 失败：请先修复 sources.list 再运行脚本。"
