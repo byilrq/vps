@@ -1467,7 +1467,7 @@ changeconf() {
       12) ssh_port 2222; pause ;;
       13) firewall; pause ;;
       14) auth_key ;;
-      14) sys_cle ;;
+      15) sys_cle ;;
       0) return 0 ;;
       *) error; pause ;;
     esac
