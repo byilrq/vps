@@ -804,7 +804,11 @@ besttrace() {
 ipquality() {
   apt_install_safe curl >/dev/null 2>&1 || true
   echo "检查 IP 质量中..."
-  curl -sL https://Check.Place | bash -s - -I
+
+  if ! curl -fsSL --max-time 15 https://Check.Place | bash -s -- -I; then
+    warn "ipquality 执行失败：可能无法访问 Check.Place，或脚本返回非 0。你可以手动测试：curl -vL https://Check.Place"
+    return 0
+  fi
 }
 # ============================================================
 #  系统信息显示
