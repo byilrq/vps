@@ -1161,7 +1161,6 @@ auth_key() {
 
   # ===== 可改参数 =====
   local target_user="${1:-root}"     # auth_key root / auth_key ubuntu
-  local ssh_port="${2:-22}"          # 预留：如果你要改端口可用
   # ===================
 
   if [ "$(id -u)" -ne 0 ]; then
@@ -1169,11 +1168,113 @@ auth_key() {
     return 1
   fi
 
-  read -r -p "是否设置密钥登录方式？[y/N] " yn
-  case "$yn" in
-    y|Y|yes|YES) ;;
-    *) echo "已取消。"; return 0 ;;
-  esac
+  # ---------- 检测：是否 SSH 会话 ----------
+  local is_ssh_session="no"
+  if [ -n "${SSH_CONNECTION:-}" ] || [ -n "${SSH_TTY:-}" ]; then
+    is_ssh_session="yes"
+  fi
+
+  # ---------- 检测：当前 sshd 生效配置 ----------
+  # 用 sshd -T 读取“最终生效值”，比看配置文件准
+  local pubkeyauth passwordauth kbdauth
+  pubkeyauth="$(sshd -T 2>/dev/null | awk '/^pubkeyauthentication /{print $2; exit}')"
+  passwordauth="$(sshd -T 2>/dev/null | awk '/^passwordauthentication /{print $2; exit}')"
+  kbdauth="$(sshd -T 2>/dev/null | awk '/^kbdinteractiveauthentication /{print $2; exit}')"
+
+  # 容错：万一没读到（极少）
+  pubkeyauth="${pubkeyauth:-unknown}"
+  passwordauth="${passwordauth:-unknown}"
+  kbdauth="${kbdauth:-unknown}"
+
+  # 你要的“当前登录状态”我按“系统当前是否允许端口/口令登录”来判断：
+  # - passwordauthentication=yes => 允许口令（你称“端口登录”）
+  # - passwordauthentication=no  => 仅密钥
+  local mode="unknown"
+  if [ "$passwordauth" = "no" ]; then
+    mode="key_only"
+  elif [ "$passwordauth" = "yes" ]; then
+    mode="password_allowed"
+  fi
+
+  echo "=== 当前检测结果 ==="
+  echo "会话类型: ${is_ssh_session}"
+  echo "sshd生效配置: PubkeyAuthentication=${pubkeyauth}, PasswordAuthentication=${passwordauth}, KbdInteractiveAuthentication=${kbdauth}"
+  echo "模式判断: ${mode}"
+  echo "===================="
+
+  # ---------- 分支询问 ----------
+  if [ "$mode" = "password_allowed" ]; then
+    # 你说的“端口登录则询问是否开启密钥登录”
+    read -r -p "当前允许密码/端口登录。是否开启密钥登录流程？[y/N] " yn
+    case "$yn" in
+      y|Y|yes|YES) ;;
+      *) echo "未执行任何更改，退出。"; return 0 ;;
+    esac
+  elif [ "$mode" = "key_only" ]; then
+    # “如果当前已经是秘钥登录了，则询问是否开启端口登录”
+    read -r -p "当前已是仅密钥登录（密码登录关闭）。是否开启端口/密码登录？[y/N] " yn
+    case "$yn" in
+      y|Y|yes|YES)
+        # 开启端口/密码登录：直接改 sshd_config 并重启，然后退出（按你描述：是就继续执行；这里继续执行=完成开启端口登录动作）
+        local cfg="/etc/ssh/sshd_config"
+        if [ ! -f "$cfg" ]; then
+          echo "ERROR: 找不到 $cfg"
+          return 1
+        fi
+        local bak="${cfg}.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$cfg" "$bak"
+        echo "已备份：$bak"
+
+        _set_sshd_kv() {
+          local k="$1" v="$2"
+          local tmp
+          tmp="$(mktemp)"
+          awk -v K="$k" -v V="$v" '
+            BEGIN { done=0 }
+            {
+              if (!done && $0 ~ "^[[:space:]]*#?[[:space:]]*" K "[[:space:]]+") {
+                print K " " V
+                done=1
+              } else {
+                print $0
+              }
+            }
+            END {
+              if (!done) { print ""; print K " " V }
+            }
+          ' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
+          rm -f "$tmp"
+        }
+
+        _set_sshd_kv "PasswordAuthentication" "yes"
+        _set_sshd_kv "KbdInteractiveAuthentication" "yes"
+        # 也可以显式确保 pubkey 仍然可用
+        _set_sshd_kv "PubkeyAuthentication" "yes"
+        _set_sshd_kv "AuthorizedKeysFile" ".ssh/authorized_keys"
+
+        if command -v systemctl >/dev/null 2>&1; then
+          systemctl restart ssh 2>/dev/null || systemctl restart sshd
+        else
+          service ssh restart 2>/dev/null || service sshd restart
+        fi
+        echo "已开启密码/端口登录并重启 SSH。退出。"
+        return 0
+        ;;
+      *)
+        echo "未执行任何更改，退出。"
+        return 0
+        ;;
+    esac
+  else
+    # unknown 模式：保守处理
+    read -r -p "无法判定当前模式。是否继续执行“开启密钥登录”流程？[y/N] " yn
+    case "$yn" in
+      y|Y|yes|YES) ;;
+      *) echo "退出。"; return 0 ;;
+    esac
+  fi
+
+  # ========== 下面是“开启密钥登录流程”（沿用你现有实现）==========
 
   # 获取用户家目录
   local user_home
@@ -1221,40 +1322,32 @@ auth_key() {
   cp -a "$cfg" "$bak"
   echo "已备份：$bak"
 
-  # 设置/追加配置项的 helper
- _set_sshd_kv() {
-  local k="$1" v="$2"
-  local tmp
-  tmp="$(mktemp)"
-
-  awk -v K="$k" -v V="$v" '
-    BEGIN { done=0 }
-    {
-      # 匹配：可选空白 + 可选# + 空白 + Key + 至少一个空白
-      # 只替换第一条命中的
-      if (!done && $0 ~ "^[[:space:]]*#?[[:space:]]*" K "[[:space:]]+") {
-        print K " " V
-        done=1
-      } else {
-        print $0
+  # 设置/追加配置项的 helper（awk版，避免 / 转义问题）
+  _set_sshd_kv() {
+    local k="$1" v="$2"
+    local tmp
+    tmp="$(mktemp)"
+    awk -v K="$k" -v V="$v" '
+      BEGIN { done=0 }
+      {
+        if (!done && $0 ~ "^[[:space:]]*#?[[:space:]]*" K "[[:space:]]+") {
+          print K " " V
+          done=1
+        } else {
+          print $0
+        }
       }
-    }
-    END {
-      if (!done) {
-        print ""
-        print K " " V
+      END {
+        if (!done) { print ""; print K " " V }
       }
-    }
-  ' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
-
-  rm -f "$tmp"
-}
-
+    ' "$cfg" > "$tmp" && cat "$tmp" > "$cfg"
+    rm -f "$tmp"
+  }
 
   _set_sshd_kv "PubkeyAuthentication" "yes"
   _set_sshd_kv "AuthorizedKeysFile" ".ssh/authorized_keys"
 
-  # “关闭端口访问功能”——这里实现为关闭密码登录
+  # 关闭“端口访问功能”——按你的历史约定：关闭密码登录
   read -r -p "是否关闭密码登录（仅允许密钥登录）？[y/N] " dis_pw
   case "$dis_pw" in
     y|Y|yes|YES)
@@ -1275,8 +1368,14 @@ auth_key() {
   fi
   echo "SSH 服务已重启。"
 
+  # 最后再打印一次生效状态
+  echo "=== 更新后生效配置 ==="
+  sshd -T | egrep -i 'pubkeyauthentication|authorizedkeysfile|passwordauthentication|kbdinteractiveauthentication' || true
+  echo "======================"
+
   echo "完成。建议：打开新终端测试密钥登录成功后，再退出当前会话。"
 }
+
 
 
 changeconf() {
