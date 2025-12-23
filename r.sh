@@ -1405,61 +1405,63 @@ sys_cle() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_cle.sh"
   local script="/root/sys_cle.sh"
   local cron_line='0 0 * * * /bin/bash /root/sys_cle.sh >> /root/sys_cle.cron.log 2>&1'
-  local action="${1:-add}"
 
-  # 下载/更新脚本
-  _sys_cle_update() {
-    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-      apt-get update -y >/dev/null 2>&1 || true
-      apt-get install -y curl wget >/dev/null 2>&1 || true
-    fi
+  # 1) 先下载/更新脚本
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl wget >/dev/null 2>&1 || true
+  fi
 
-    if command -v curl >/dev/null 2>&1; then
-      curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
-    else
-      wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
-    fi
-    chmod +x "$script" || true
-  }
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
+  else
+    wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
+  fi
+  chmod +x "$script" >/dev/null 2>&1 || true
 
-  # 添加 cron（去重）
-  _sys_cle_add_cron() {
-    ( crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" ; echo "$cron_line" ) | crontab -
-  }
+  # 2) 对话菜单
+  echo ""
+  echo "=============================="
+  echo "sys_cle 管理菜单（已更新脚本）"
+  echo "脚本位置: $script"
+  echo "=============================="
+  echo "1) 添加 cron：每天 00:00 执行"
+  echo "2) 删除 cron：移除该定时任务"
+  echo "3) 立即执行一次清理"
+  echo "4) 查看当前 cron 状态"
+  echo "0) 退出"
+  echo "------------------------------"
+  read -r -p "请选择 [0-4]: " choice
 
-  # 删除 cron（删掉包含 /root/sys_cle.sh 的行）
-  _sys_cle_del_cron() {
-    crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" | crontab - 2>/dev/null || true
-  }
-
-  case "$action" in
-    add)
-      _sys_cle_update && _sys_cle_add_cron
-      echo "OK: 已下载 $script 并添加每日 00:00 cron"
+  case "$choice" in
+    1)
+      # 去重后添加
+      ( crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" ; echo "$cron_line" ) | crontab -
+      echo "OK: 已添加每日 00:00 cron"
       ;;
-    del|delete|rm)
-      _sys_cle_del_cron
+    2)
+      # 删除包含 /root/sys_cle.sh 的行
+      crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" | crontab - 2>/dev/null || true
       echo "OK: 已删除 sys_cle 的 cron"
       ;;
-    run)
-      _sys_cle_update || return 1
+    3)
       /bin/bash "$script"
+      echo "OK: 已执行一次清理"
       ;;
-    update)
-      _sys_cle_update
-      echo "OK: 已更新 $script"
-      ;;
-    status)
-      echo "脚本: $script"
-      echo "Cron:"
+    4)
+      echo "当前 crontab 中与 sys_cle 相关的条目："
       crontab -l 2>/dev/null | grep -F "/root/sys_cle.sh" || echo "（未设置）"
       ;;
+    0)
+      echo "已退出"
+      ;;
     *)
-      echo "用法: sys_cle {add|del|run|update|status}"
+      echo "输入无效：$choice（只允许 0-4）"
       return 1
       ;;
   esac
 }
+
 
 # -----------------------------
 #  参数修改
