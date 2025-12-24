@@ -1,6 +1,8 @@
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/h.sh && bash h.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/r.sh && bash r.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/dd_sys.sh && bash dd_sys.sh -debian 12 -pwd 'password'
 
+bash InstallNET.sh -debian 12 -pwd 'password'
 脚本可上传到服务器后root/ hy.sh,同路径下使用bash hy.sh.
 
 配置后
@@ -20,6 +22,7 @@ TLS：填www.bing.com
 心跳：105
 sni: 如果你用的是ca证书，这里填入你的域名,如果你是自签证书，这里填入www.bing.com;(有的协议填伪装域名)
 insecure: 如果你用的是ca证书,insecure为false;如果你是自签证书，insecure要改成true
+
 
 
 
