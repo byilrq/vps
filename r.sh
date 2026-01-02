@@ -512,7 +512,7 @@ input_shortid() {
 
 input_domain() {
   local out=""
-  local def="www.cloudflare.com"
+  local def="www.bing.com"
   while :; do
     read_tty "SNI（回车默认 ${def}）: " out
     if [[ -z "${out}" ]]; then
@@ -529,7 +529,7 @@ input_domain() {
       return 0
     fi
     error
-    echo -e "${yellow}域名示例：www.cloudflare.com${none}"
+    echo -e "${yellow}域名示例：www.bing.com${none}"
   done
 }
 
