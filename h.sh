@@ -744,77 +744,113 @@ linux_update() {
 # -----------------------------------------
 #  设置/重建 Swap 缓存（swap_cache）
 # -----------------------------------------
+# -----------------------------
+#  设置SWAP缓存（确保最终只保留 /swapfile 这一份）
+# -----------------------------
 swap_cache() {
-    echo "=== 硬盘缓存设置工具 ==="
+  local size_mb confirm fs_type SUDO
+  local keep="/swapfile"
 
-    # 检查是否是 root 用户
-    if [ "$EUID" -ne 0 ]; then
-        echo "错误：请以 root 权限运行此脚本。"
-        exit 1
+  # 判断是否需要 sudo
+  if [[ $EUID -ne 0 ]]; then
+    SUDO="sudo"
+  else
+    SUDO=""
+  fi
+
+  echo "当前 Swap："
+  free -h | awk 'NR==1 || /Swap:/ {print}'
+  echo ""
+
+  read_tty "请输入 Swap 大小（MB，建议 >=512）: " size_mb
+  [[ "$size_mb" =~ ^[0-9]+$ ]] || { warn "请输入有效数字"; return 1; }
+
+  read_tty "确认创建/重建 Swap=${size_mb}MB ? (y/n): " confirm
+  [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { warn "已取消"; return 0; }
+
+  # 1) 禁用并清理除 /swapfile 之外的所有 swap（比如 /swap、分区 swap 等）
+  #    同时把 /etc/fstab 里对应条目注释掉，避免重启恢复
+  while read -r sw; do
+    [[ -z "$sw" ]] && continue
+    [[ "$sw" == "$keep" ]] && continue
+
+    # 关闭 swap
+    $SUDO swapoff "$sw" >/dev/null 2>&1 || true
+
+    # fstab 里注释掉该 swap 条目（匹配第一列为该路径）
+    if [[ -f /etc/fstab ]]; then
+      $SUDO sed -i -E "s|^(\s*${sw//\//\\/}\s+.*\s+swap\s+.*)$|# disabled_by_swap_cache: \1|g" /etc/fstab >/dev/null 2>&1 || true
     fi
 
-    # 检测当前的 Swap 配置
-    echo "检测当前 Swap 缓存配置..."
-    current_swap=$(free -m | awk '/Swap:/ {print $2}')
-    echo "当前 Swap 缓存大小为：${current_swap} MB"
-    echo ""
-
-    # 获取用户输入的缓存大小
-    read -p "请输入要设置的 Swap 缓存大小（单位：MB，建议值 >= 512）： " size_mb
-
-    # 验证输入是否为正整数
-    if ! [[ "$size_mb" =~ ^[0-9]+$ ]] || [ "$size_mb" -lt 1 ]; then
-        echo "错误：请输入有效的正整数（单位：MB）。"
-        exit 1
+    # 如果是文件 swap（绝对路径文件），删除掉（如 /swap）
+    if [[ "$sw" == /* && -f "$sw" ]]; then
+      $SUDO rm -f "$sw" >/dev/null 2>&1 || true
     fi
+  done < <(swapon --noheadings --raw --show=NAME 2>/dev/null)
 
-    # 确认用户输入
-    echo "准备设置 Swap 缓存大小为 ${size_mb} MB..."
-    read -p "是否继续操作？(y/n): " confirm
-    if [[ "$confirm" != "y" ]]; then
-        echo "操作已取消。"
-        exit 0
+  # 2) 如果已有 /swapfile，先卸载删除（重建）
+  if swapon --noheadings --raw --show=NAME 2>/dev/null | grep -qx "$keep"; then
+    $SUDO swapoff "$keep" >/dev/null 2>&1 || true
+  fi
+  $SUDO rm -f "$keep" >/dev/null 2>&1 || true
+
+  # 3) 检测文件系统类型（用于 btrfs 特殊处理）
+  fs_type="$(stat -f -c %T / 2>/dev/null || true)"
+
+  # 4) 创建 swapfile：优先 fallocate，失败降级 dd
+  if ! $SUDO touch "$keep" 2>/dev/null; then
+    warn "无法创建 $keep（权限不足？）"
+    return 1
+  fi
+
+  # btrfs：尽量关闭 COW；不可用则忽略
+  if [[ "$fs_type" == "btrfs" ]] && command -v chattr >/dev/null 2>&1; then
+    $SUDO chattr +C "$keep" >/dev/null 2>&1 || true
+  fi
+
+  if command -v fallocate >/dev/null 2>&1; then
+    if ! $SUDO fallocate -l "${size_mb}M" "$keep" 2>/dev/null; then
+      warn "fallocate 不支持或失败，改用 dd 写零创建 swapfile（会慢一点）"
+      if ! $SUDO dd if=/dev/zero of="$keep" bs=1M count="${size_mb}" conv=fsync status=progress; then
+        warn "dd 创建 swapfile 失败（可能磁盘空间不足、权限受限或文件系统限制）"
+        $SUDO rm -f "$keep" >/dev/null 2>&1 || true
+        return 1
+      fi
     fi
-
-    # 停用现有的 Swap 文件（如果存在）
-    if swapon --show | grep -q "/swapfile"; then
-        echo "检测到现有 Swap 文件，正在停用..."
-        swapoff /swapfile
-        echo "已停用现有 Swap 文件。"
-        echo "正在删除旧的 Swap 文件..."
-        rm -f /swapfile
+  else
+    warn "系统无 fallocate，使用 dd 写零创建 swapfile（会慢一点）"
+    if ! $SUDO dd if=/dev/zero of="$keep" bs=1M count="${size_mb}" conv=fsync status=progress; then
+      warn "dd 创建 swapfile 失败（可能磁盘空间不足、权限受限或文件系统限制）"
+      $SUDO rm -f "$keep" >/dev/null 2>&1 || true
+      return 1
     fi
+  fi
 
-    # 创建新的 Swap 文件
-    echo "正在创建新的 Swap 文件 (${size_mb} MB)..."
-    fallocate -l "${size_mb}M" /swapfile
-    if [ $? -ne 0 ]; then
-        echo "错误：无法创建 Swap 文件，请检查磁盘空间或权限。"
-        exit 1
-    fi
+  # 5) 权限与启用
+  $SUDO chmod 600 "$keep" || { warn "chmod 600 失败"; $SUDO rm -f "$keep" >/dev/null 2>&1 || true; return 1; }
 
-    # 设置权限和格式化
-    chmod 600 /swapfile
-    echo "正在格式化 Swap 文件..."
-    mkswap /swapfile
+  $SUDO mkswap "$keep" >/dev/null 2>&1 || {
+    warn "mkswap 失败（文件系统可能不支持 swapfile）"
+    $SUDO rm -f "$keep" >/dev/null 2>&1 || true
+    return 1
+  }
 
-    # 启用新的 Swap
-    echo "正在启用 Swap 文件..."
-    swapon /swapfile
+  $SUDO swapon "$keep" >/dev/null 2>&1 || {
+    warn "swapon 失败（可能是容器/虚拟化限制或文件系统限制）"
+    $SUDO rm -f "$keep" >/dev/null 2>&1 || true
+    return 1
+  }
 
-    # 更新 /etc/fstab 以支持开机自动挂载
-    if ! grep -q "^/swapfile" /etc/fstab; then
-        echo "正在配置开机自动挂载..."
-        echo "/swapfile none swap sw 0 0" >> /etc/fstab
-    fi
+  # 6) 写入 fstab（幂等：存在就不重复写）
+  if ! grep -qE '^\s*/swapfile\s' /etc/fstab 2>/dev/null; then
+    echo "/swapfile none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
+  fi
 
-    # 显示新的 Swap 配置
-    echo "新的 Swap 文件已启用。当前 Swap 配置："
-    swapon --show
-    free -h
-
-    echo "操作完成！新的 Swap 缓存大小为 ${size_mb} MB。"
+  ok "Swap 已启用（只保留 /swapfile）："
+  $SUDO swapon --show
+  free -h | awk 'NR==1 || /Swap:/ {print}'
 }
+
 
 # -----------------------------------------
 #  回程测试（besttrace）
