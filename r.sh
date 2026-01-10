@@ -965,10 +965,11 @@ EOF
   fi
 }
 # -----------------------------
-#  设置SWAP缓存（支持 fallocate 不可用时自动降级 dd）
+#  设置SWAP缓存（确保最终只保留 /swapfile 这一份）
 # -----------------------------
 swap_cache() {
   local size_mb confirm fs_type SUDO
+  local keep="/swapfile"
 
   # 判断是否需要 sudo
   if [[ $EUID -ne 0 ]]; then
@@ -987,79 +988,89 @@ swap_cache() {
   read_tty "确认创建/重建 Swap=${size_mb}MB ? (y/n): " confirm
   [[ "$confirm" == "y" || "$confirm" == "Y" ]] || { warn "已取消"; return 0; }
 
-  # 如果已有 /swapfile 则先卸载并删除
-  if swapon --show 2>/dev/null | awk '{print $1}' | grep -qx "/swapfile"; then
-    $SUDO swapoff /swapfile >/dev/null 2>&1 || true
-  fi
-  $SUDO rm -f /swapfile >/dev/null 2>&1 || true
+  # 1) 禁用并清理除 /swapfile 之外的所有 swap（比如 /swap、分区 swap 等）
+  #    同时把 /etc/fstab 里对应条目注释掉，避免重启恢复
+  while read -r sw; do
+    [[ -z "$sw" ]] && continue
+    [[ "$sw" == "$keep" ]] && continue
 
-  # 检测根分区文件系统类型（用于 btrfs 特殊处理）
+    # 关闭 swap
+    $SUDO swapoff "$sw" >/dev/null 2>&1 || true
+
+    # fstab 里注释掉该 swap 条目（匹配第一列为该路径）
+    if [[ -f /etc/fstab ]]; then
+      $SUDO sed -i -E "s|^(\s*${sw//\//\\/}\s+.*\s+swap\s+.*)$|# disabled_by_swap_cache: \1|g" /etc/fstab >/dev/null 2>&1 || true
+    fi
+
+    # 如果是文件 swap（绝对路径文件），删除掉（如 /swap）
+    if [[ "$sw" == /* && -f "$sw" ]]; then
+      $SUDO rm -f "$sw" >/dev/null 2>&1 || true
+    fi
+  done < <(swapon --noheadings --raw --show=NAME 2>/dev/null)
+
+  # 2) 如果已有 /swapfile，先卸载删除（重建）
+  if swapon --noheadings --raw --show=NAME 2>/dev/null | grep -qx "$keep"; then
+    $SUDO swapoff "$keep" >/dev/null 2>&1 || true
+  fi
+  $SUDO rm -f "$keep" >/dev/null 2>&1 || true
+
+  # 3) 检测文件系统类型（用于 btrfs 特殊处理）
   fs_type="$(stat -f -c %T / 2>/dev/null || true)"
 
-  # 先创建空文件
-  if ! $SUDO touch /swapfile 2>/dev/null; then
-    warn "无法创建 /swapfile（权限不足？）"
+  # 4) 创建 swapfile：优先 fallocate，失败降级 dd
+  if ! $SUDO touch "$keep" 2>/dev/null; then
+    warn "无法创建 $keep（权限不足？）"
     return 1
   fi
 
-  # btrfs：尽量关闭 COW（否则可能 swapon 失败）；不可用则忽略
-  if [[ "$fs_type" == "btrfs" ]]; then
-    if command -v chattr >/dev/null 2>&1; then
-      $SUDO chattr +C /swapfile >/dev/null 2>&1 || true
-    fi
+  # btrfs：尽量关闭 COW；不可用则忽略
+  if [[ "$fs_type" == "btrfs" ]] && command -v chattr >/dev/null 2>&1; then
+    $SUDO chattr +C "$keep" >/dev/null 2>&1 || true
   fi
 
-  # 优先 fallocate，不支持则降级 dd
   if command -v fallocate >/dev/null 2>&1; then
-    if ! $SUDO fallocate -l "${size_mb}M" /swapfile 2>/dev/null; then
+    if ! $SUDO fallocate -l "${size_mb}M" "$keep" 2>/dev/null; then
       warn "fallocate 不支持或失败，改用 dd 写零创建 swapfile（会慢一点）"
-      if ! $SUDO dd if=/dev/zero of=/swapfile bs=1M count="${size_mb}" conv=fsync status=progress; then
+      if ! $SUDO dd if=/dev/zero of="$keep" bs=1M count="${size_mb}" conv=fsync status=progress; then
         warn "dd 创建 swapfile 失败（可能磁盘空间不足、权限受限或文件系统限制）"
-        $SUDO rm -f /swapfile >/dev/null 2>&1 || true
+        $SUDO rm -f "$keep" >/dev/null 2>&1 || true
         return 1
       fi
     fi
   else
     warn "系统无 fallocate，使用 dd 写零创建 swapfile（会慢一点）"
-    if ! $SUDO dd if=/dev/zero of=/swapfile bs=1M count="${size_mb}" conv=fsync status=progress; then
+    if ! $SUDO dd if=/dev/zero of="$keep" bs=1M count="${size_mb}" conv=fsync status=progress; then
       warn "dd 创建 swapfile 失败（可能磁盘空间不足、权限受限或文件系统限制）"
-      $SUDO rm -f /swapfile >/dev/null 2>&1 || true
+      $SUDO rm -f "$keep" >/dev/null 2>&1 || true
       return 1
     fi
   fi
 
-  # 权限与启用
-  if ! $SUDO chmod 600 /swapfile; then
-    warn "chmod 600 /swapfile 失败"
-    $SUDO rm -f /swapfile >/dev/null 2>&1 || true
-    return 1
-  fi
+  # 5) 权限与启用
+  $SUDO chmod 600 "$keep" || { warn "chmod 600 失败"; $SUDO rm -f "$keep" >/dev/null 2>&1 || true; return 1; }
 
-  if ! $SUDO mkswap /swapfile >/dev/null 2>&1; then
-    warn "mkswap 失败（文件系统可能不支持 swapfile，或 /swapfile 不合规）"
-    $SUDO rm -f /swapfile >/dev/null 2>&1 || true
+  $SUDO mkswap "$keep" >/dev/null 2>&1 || {
+    warn "mkswap 失败（文件系统可能不支持 swapfile）"
+    $SUDO rm -f "$keep" >/dev/null 2>&1 || true
     return 1
-  fi
+  }
 
-  if ! $SUDO swapon /swapfile >/dev/null 2>&1; then
-    warn "swapon 失败（可能是容器/虚拟化限制，或 btrfs/加密/网络盘限制）"
-    # 输出一点诊断信息，方便你日志里定位
-    $SUDO swapon --show 2>/dev/null || true
-    $SUDO file /swapfile 2>/dev/null || true
-    $SUDO ls -l /swapfile 2>/dev/null || true
-    $SUDO rm -f /swapfile >/dev/null 2>&1 || true
+  $SUDO swapon "$keep" >/dev/null 2>&1 || {
+    warn "swapon 失败（可能是容器/虚拟化限制或文件系统限制）"
+    $SUDO rm -f "$keep" >/dev/null 2>&1 || true
     return 1
-  fi
+  }
 
-  # 写入 fstab（幂等）
+  # 6) 写入 fstab（幂等：存在就不重复写）
   if ! grep -qE '^\s*/swapfile\s' /etc/fstab 2>/dev/null; then
     echo "/swapfile none swap sw 0 0" | $SUDO tee -a /etc/fstab >/dev/null
   fi
 
-  ok "Swap 已启用："
+  ok "Swap 已启用（只保留 /swapfile）："
   $SUDO swapon --show
   free -h | awk 'NR==1 || /Swap:/ {print}'
 }
+
 
 
 # -----------------------------
