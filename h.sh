@@ -1,7 +1,7 @@
 #!/bin/bash
-# h.sh - Hysteria 2 installer + separate menus:
-# 4) Modify Hysteria config
-# 5) Modify system config (calls sys_conf.sh)
+# h.sh - Hysteria 2 installer + management script
+# Main menu:
+# 1 Install, 2 Uninstall, 3 Start/Stop/Restart, 4 Modify Hysteria config, 5 System config (calls sys_conf.sh), etc.
 
 export LANG=en_US.UTF-8
 
@@ -46,8 +46,6 @@ REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazo
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora")
 PACKAGE_UPDATE=("apt-get update -y" "apt-get update -y" "yum -y update" "yum -y update" "yum -y update")
 PACKAGE_INSTALL=("apt-get install -y" "apt-get install -y" "yum -y install" "yum -y install" "yum -y install")
-PACKAGE_REMOVE=("apt-get remove -y" "apt-get remove -y" "yum -y remove" "yum -y remove" "yum -y remove")
-PACKAGE_UNINSTALL=("apt-get autoremove -y" "apt-get autoremove -y" "yum -y autoremove" "yum -y autoremove" "yum -y autoremove")
 
 CMD=(
   "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)"
@@ -89,26 +87,71 @@ realip(){
 }
 
 # -----------------------------
+# Fix perms so service User/Group can read config + key
+# -----------------------------
+fix_hysteria_file_perms() {
+  local dir="/etc/hysteria"
+  local cfg="$dir/config.yaml"
+  local crt="$dir/cert.crt"
+  local key="$dir/private.key"
+
+  local svc="/etc/systemd/system/hysteria-server.service"
+  local u="hysteria" g="hysteria"
+  if [[ -f "$svc" ]]; then
+    u=$(grep -E '^\s*User='  "$svc" | tail -n1 | cut -d= -f2 | xargs)
+    g=$(grep -E '^\s*Group=' "$svc" | tail -n1 | cut -d= -f2 | xargs)
+    [[ -z "$u" ]] && u="hysteria"
+    [[ -z "$g" ]] && g="$u"
+  fi
+
+  mkdir -p "$dir" >/dev/null 2>&1 || true
+
+  # Directory must be traversable by service group
+  chown root:"$g" "$dir" 2>/dev/null || chown root:root "$dir"
+  chmod 750 "$dir" 2>/dev/null || true
+
+  # Config readable by service group
+  if [[ -f "$cfg" ]]; then
+    chown root:"$g" "$cfg" 2>/dev/null || chown root:root "$cfg"
+    chmod 640 "$cfg" 2>/dev/null || true
+  fi
+
+  # Key readable by service group
+  if [[ -f "$key" ]]; then
+    chown root:"$g" "$key" 2>/dev/null || chown root:root "$key"
+    chmod 640 "$key" 2>/dev/null || true
+  fi
+
+  # Cert can be world-readable
+  if [[ -f "$crt" ]]; then
+    chown root:root "$crt" 2>/dev/null || true
+    chmod 644 "$crt" 2>/dev/null || true
+  fi
+}
+
+# -----------------------------
 # Cert install
 # -----------------------------
 inst_cert(){
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
   echo -e " ${GREEN}1.${PLAIN} 必应自签证书 ${YELLOW}（默认）${PLAIN}"
-  echo -e " ${GREEN}2.${PLAIN} Acme 脚本自动申请"
+  echo -e " ${GREEN}2.${PLAIN} Acme 脚本自动申请（保存到 /etc/hysteria）"
   echo -e " ${GREEN}3.${PLAIN} 自定义证书路径"
   echo ""
   read -rp "请输入选项 [1-3]: " certInput
 
-  if [[ $certInput == 2 ]]; then
-    cert_path="/root/cert.crt"
-    key_path="/root/private.key"
-    chmod a+x /root >/dev/null 2>&1 || true
+  mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
-    if [[ -f /root/cert.crt && -f /root/private.key && -s /root/cert.crt && -s /root/private.key && -f /root/ca.log ]]; then
-      domain=$(cat /root/ca.log)
-      green "检测到原有域名：$domain 的证书，正在应用"
-      hy_domain=$domain
+  if [[ $certInput == 2 ]]; then
+    cert_path="/etc/hysteria/cert.crt"
+    key_path="/etc/hysteria/private.key"
+
+    # 如果已有证书且记录域名，直接复用
+    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f /etc/hysteria/ca.log ]]; then
+      domain=$(cat /etc/hysteria/ca.log 2>/dev/null)
+      [[ -n "$domain" ]] && green "检测到原有域名：$domain 的证书，正在应用"
+      hy_domain="$domain"
     else
       realip
       read -rp "请输入需要申请证书的域名: " domain
@@ -116,37 +159,43 @@ inst_cert(){
       green "已输入的域名：$domain" && sleep 1
 
       domainIP=$(curl -sm8 ipget.net/?ip="${domain}")
-      if [[ $domainIP == $ip ]]; then
-        ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl cron || true
-        curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com || { red "安装 acme.sh 失败"; exit 1; }
-        source ~/.bashrc >/dev/null 2>&1 || true
-        bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade
-        bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt
-
-        if [[ -n $(echo $ip | grep ":") ]]; then
-          bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure || { red "签发失败"; exit 1; }
-        else
-          bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure || { red "签发失败"; exit 1; }
-        fi
-
-        bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" --key-file /root/private.key --fullchain-file /root/cert.crt --ecc || {
-          red "安装证书失败"
-          exit 1
-        }
-
-        if [[ -f /root/cert.crt && -f /root/private.key && -s /root/cert.crt && -s /root/private.key ]]; then
-          echo "$domain" > /root/ca.log
-          sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1 || true
-          echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
-
-          green "证书申请成功! 已保存到 /root/"
-          yellow "证书路径: /root/cert.crt"
-          yellow "私钥路径: /root/private.key"
-          hy_domain=$domain
-        fi
-      else
-        red "当前域名解析的IP与当前VPS使用的真实IP不匹配"
+      if [[ $domainIP != "$ip" ]]; then
+        red "当前域名解析的IP与当前VPS真实IP不匹配"
         yellow "建议：关闭 Cloudflare 小云朵（仅DNS）、检查解析IP是否为真实IP。"
+        exit 1
+      fi
+
+      ${PACKAGE_UPDATE[int]} >/dev/null 2>&1 || true
+      ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl cron >/dev/null 2>&1 || true
+
+      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com || { red "安装 acme.sh 失败"; exit 1; }
+      source ~/.bashrc >/dev/null 2>&1 || true
+      bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+      bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+      if [[ -n $(echo "$ip" | grep ":") ]]; then
+        bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure || { red "签发失败"; exit 1; }
+      else
+        bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure || { red "签发失败"; exit 1; }
+      fi
+
+      bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
+        --key-file "$key_path" --fullchain-file "$cert_path" --ecc || {
+        red "安装证书失败"
+        exit 1
+      }
+
+      if [[ -s "$cert_path" && -s "$key_path" ]]; then
+        echo "$domain" > /etc/hysteria/ca.log
+        sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1 || true
+        echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
+
+        green "证书申请成功! 已保存到 /etc/hysteria/"
+        yellow "证书路径: $cert_path"
+        yellow "私钥路径: $key_path"
+        hy_domain="$domain"
+      else
+        red "证书文件生成异常，请检查 acme.sh 输出"
         exit 1
       fi
     fi
@@ -157,20 +206,15 @@ inst_cert(){
     read -rp "请输入证书的域名: " domain
     [[ -z "$cert_path" || -z "$key_path" || -z "$domain" ]] && red "参数不完整" && exit 1
     [[ ! -s "$cert_path" || ! -s "$key_path" ]] && red "证书/私钥文件不存在或为空" && exit 1
-    hy_domain=$domain
+    hy_domain="$domain"
 
   else
     green "将使用必应自签证书作为 Hysteria 2 的节点证书"
-    mkdir -p /etc/hysteria
-
     cert_path="/etc/hysteria/cert.crt"
     key_path="/etc/hysteria/private.key"
 
-    openssl ecparam -genkey -name prime256v1 -out "$key_path"
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com"
-
-    chmod 644 "$cert_path"
-    chmod 600 "$key_path"
+    openssl ecparam -genkey -name prime256v1 -out "$key_path" || { red "生成私钥失败"; exit 1; }
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com" || { red "生成证书失败"; exit 1; }
 
     hy_domain="www.bing.com"
     domain="www.bing.com"
@@ -201,6 +245,7 @@ inst_jump(){
     iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
     ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
     netfilter-persistent save >/dev/null 2>&1 || true
+
     green "已启用端口跳跃：$firstport-$endport -> $port"
   else
     yellow "将继续使用单端口模式"
@@ -250,10 +295,9 @@ insthysteria(){
     wait_for_apt_lock || true
   fi
 
-  ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps iptables iptables-persistent netfilter-persistent || {
-    red "依赖安装失败"
-    exit 1
-  }
+  # Base deps (best-effort across distros)
+  ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps iptables >/dev/null 2>&1 || true
+  ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent >/dev/null 2>&1 || true
 
   local url="https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh"
   wget -qO /tmp/install_server.sh "$url" || { red "下载 install_server.sh 失败"; exit 1; }
@@ -269,7 +313,7 @@ insthysteria(){
   inst_pwd
   inst_site
 
-  mkdir -p /etc/hysteria /root/hy
+  mkdir -p /etc/hysteria /root/hy /var/lib/hysteria >/dev/null 2>&1 || true
 
   cat > /etc/hysteria/config.yaml <<EOF
 listen: :$port
@@ -300,13 +344,14 @@ masquerade:
     rewriteHost: true
 EOF
 
-  if [[ -n $(echo $ip | grep ":") ]]; then
+  # IP for display + link
+  if [[ -n $(echo "$ip" | grep ":") ]]; then
     last_ip="[$ip]"
   else
     last_ip="$ip"
   fi
 
-  # client server always use real listening port
+  # Client config: server uses the real listening port
   cat > /root/hy/hy-client.yaml <<EOF
 server: $last_ip:$port
 
@@ -335,8 +380,8 @@ transport:
     hopInterval: 15s
 EOF
 
+  # mport param: single or range
   if [[ -n "$firstport" && -n "$endport" ]]; then
-    echo "    portRange: \"$firstport-$endport\"" >> /root/hy/hy-client.yaml
     port_range="$firstport-$endport"
   else
     port_range="$port"
@@ -345,9 +390,12 @@ EOF
   ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
   echo "$ur1" > /root/hy/ur1.txt
 
+  # IMPORTANT: ensure permissions for service user/group
+  fix_hysteria_file_perms
+
   systemctl daemon-reload
   systemctl enable hysteria-server >/dev/null 2>&1 || true
-  systemctl start hysteria-server
+  systemctl restart hysteria-server
 
   if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
     green "Hysteria 2 服务启动成功"
@@ -366,6 +414,7 @@ EOF
   green "$(cat /root/hy/ur1.txt)"
   yellow "二维码："
   qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+  read -rp "回车返回菜单..." _
 }
 
 # -----------------------------
@@ -379,6 +428,7 @@ unsthysteria(){
   iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
   netfilter-persistent save >/dev/null 2>&1 || true
   green "Hysteria 2 已彻底卸载完成！"
+  read -rp "回车返回菜单..." _
 }
 
 starthysteria(){ systemctl enable --now hysteria-server >/dev/null 2>&1 || systemctl start hysteria-server; }
@@ -398,12 +448,16 @@ hysteriaswitch(){
     3 ) stophysteria && starthysteria ;;
     * ) return 1 ;;
   esac
+  read -rp "回车返回菜单..." _
 }
 
 # -----------------------------
 # Show status / config
 # -----------------------------
-showstatus(){ systemctl status hysteria-server.service; }
+showstatus(){
+  systemctl status hysteria-server.service --no-pager -l
+  read -rp "回车返回菜单..." _
+}
 
 showconf(){
   yellow "服务端配置 /etc/hysteria/config.yaml："
@@ -414,7 +468,7 @@ showconf(){
   green "$(cat /root/hy/ur1.txt 2>/dev/null)"
   yellow "二维码："
   [[ -f /root/hy/ur1.txt ]] && qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
-  systemctl restart hysteria-server.service >/dev/null 2>&1 || true
+  read -rp "回车返回菜单..." _
 }
 
 # -----------------------------
@@ -437,7 +491,8 @@ changeport(){
   sed -i "s/:$oldport/:$port/g" /root/hy/hy-client.yaml 2>/dev/null || true
   [[ -f /root/hy/ur1.txt ]] && sed -i "s/:$oldport\/?/:$port\/?/g" /root/hy/ur1.txt 2>/dev/null || true
 
-  stophysteria && starthysteria
+  fix_hysteria_file_perms
+  systemctl restart hysteria-server.service >/dev/null 2>&1 || true
 
   green "Hysteria 2 端口已成功修改为：$port"
   showconf
@@ -487,9 +542,11 @@ changepasswd() {
     echo "auth: $passwd" >> "$client_file"
   fi
 
-  update_hysteria_link "$passwd" "$link_file" || true
+  update_hysteria_link "$passwd" "$link_file" >/dev/null 2>&1 || true
 
+  fix_hysteria_file_perms
   systemctl restart hysteria-server.service || { red "服务重启失败"; return 1; }
+
   green "密码已修改并生效"
   showconf
 }
@@ -497,16 +554,18 @@ changepasswd() {
 change_cert(){
   local old_cert old_key old_hydomain
   old_cert=$(grep -E '^\s*cert:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
-  old_key=$(grep -E '^\s*key:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
+  old_key=$(grep -E '^\s*key:'  /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_hydomain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
 
   inst_cert
 
   [[ -n "$old_cert" ]] && sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
-  [[ -n "$old_key" ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
+  [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g"   /etc/hysteria/config.yaml
   [[ -n "$old_hydomain" ]] && sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/hy-client.yaml
 
-  stophysteria && starthysteria
+  fix_hysteria_file_perms
+  systemctl restart hysteria-server.service >/dev/null 2>&1 || true
+
   green "证书类型/路径已修改"
   showconf
 }
@@ -523,7 +582,9 @@ changeproxysite(){
     sed -i "s#url: https://.*#url: https://$proxysite#g" /etc/hysteria/config.yaml 2>/dev/null || true
   fi
 
-  stophysteria && starthysteria
+  fix_hysteria_file_perms
+  systemctl restart hysteria-server.service >/dev/null 2>&1 || true
+
   green "伪装网站已修改为：$proxysite"
   showconf
 }
@@ -562,6 +623,7 @@ update_core1(){
   systemctl enable --now hysteria-server.service >/dev/null 2>&1 || true
   systemctl restart hysteria-server.service
   green "Hysteria 内核已更新并重启"
+  read -rp "回车返回菜单..." _
 }
 
 update_core2(){
@@ -573,15 +635,18 @@ update_core2(){
   rm -f /tmp/install_server.sh
   systemctl restart hysteria-server.service
   green "Hysteria 内核已更新并重启"
+  read -rp "回车返回菜单..." _
 }
 
-besttrace(){ wget -qO- git.io/besttrace | bash; }
-ipquality(){ curl -sL https://Check.Place | bash -s - -I; }
+besttrace(){ wget -qO- git.io/besttrace | bash; read -rp "回车返回菜单..." _; }
+ipquality(){ curl -sL https://Check.Place | bash -s - -I; read -rp "回车返回菜单..." _; }
 
+# -----------------------------
+# Full system info (NO simplification)
+# -----------------------------
 linux_ps() {
   clear
 
-  # --- 基础信息 ---
   local cpu_info cpu_arch hostname kernel_version os_info current_time timezone
   cpu_info=$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')
   cpu_arch=$(uname -m)
@@ -592,13 +657,11 @@ linux_ps() {
   [[ -z "$timezone" ]] && timezone="unknown"
   current_time=$(date "+%Y-%m-%d %I:%M %p")
 
-  # --- CPU 核心数/频率 ---
   local cpu_cores cpu_freq
   cpu_cores=$(nproc 2>/dev/null)
   cpu_freq=$(grep -m1 "MHz" /proc/cpuinfo 2>/dev/null | awk '{printf "%.1f GHz\n", $4/1000}')
   [[ -z "$cpu_freq" ]] && cpu_freq="unknown"
 
-  # --- CPU 实时占用（1秒采样）---
   local cpu_usage_percent
   cpu_usage_percent=$(
     awk '
@@ -608,7 +671,6 @@ linux_ps() {
   )
   [[ -z "$cpu_usage_percent" ]] && cpu_usage_percent="0"
 
-  # --- 内存：nocache used 口径 ---
   local mem_info
   mem_info=$(awk '
     /MemTotal/{t=$2}
@@ -626,7 +688,6 @@ linux_ps() {
   )
   [[ -z "$mem_info" ]] && mem_info="unknown"
 
-  # --- MemAvailable 风险参考 ---
   local mem_pressure
   mem_pressure=$(
     awk '
@@ -644,17 +705,14 @@ linux_ps() {
   )
   [[ -z "$mem_pressure" ]] && mem_pressure="unknown"
 
-  # --- 磁盘 ---
   local disk_info
   disk_info=$(df -h 2>/dev/null | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}')
   [[ -z "$disk_info" ]] && disk_info="unknown"
 
-  # --- 负载 ---
   local load
   load=$(uptime 2>/dev/null | awk '{print $(NF-2), $(NF-1), $NF}' | tr -d ',')
   [[ -z "$load" ]] && load="unknown"
 
-  # --- DNS：优先 resolv.conf，兜底 resolvectl ---
   local dns_addresses
   dns_addresses=""
   if [[ -f /etc/resolv.conf ]]; then
@@ -667,12 +725,10 @@ linux_ps() {
   fi
   [[ -z "${dns_addresses// /}" ]] && dns_addresses="unknown"
 
-  # --- IPv4/IPv6（尽量取到）---
   local ipv4_address ipv6_address
   ipv4_address=$(curl -s4m6 ip.sb -k 2>/dev/null || true)
   ipv6_address=$(curl -s6m6 ip.sb -k 2>/dev/null || true)
 
-  # --- 运营商/地理（ipinfo.io 可能被墙/限流，失败就显示 unknown）---
   local ipinfo country city isp_info
   ipinfo=$(curl -s --max-time 4 ipinfo.io 2>/dev/null || true)
   country=$(echo "$ipinfo" | grep -m1 'country' | awk -F': ' '{print $2}' | tr -d '",')
@@ -682,19 +738,16 @@ linux_ps() {
   [[ -z "$city" ]] && city="unknown"
   [[ -z "$isp_info" ]] && isp_info="unknown"
 
-  # --- 网络算法 ---
   local congestion_algorithm queue_algorithm
   congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
   queue_algorithm=$(sysctl -n net.core.default_qdisc 2>/dev/null)
   [[ -z "$congestion_algorithm" ]] && congestion_algorithm="unknown"
   [[ -z "$queue_algorithm" ]] && queue_algorithm="unknown"
 
-  # --- Swap ---
   local swap_info
   swap_info=$(free -m 2>/dev/null | awk 'NR==3{used=$3; total=$2; if(total==0) pct=0; else pct=used*100/total; printf "%dMB/%dMB (%d%%)", used, total, pct}')
   [[ -z "$swap_info" ]] && swap_info="unknown"
 
-  # --- 运行时长（更像你原版的天/时/分）---
   local runtime
   runtime=$(awk -F. '{
       run_days=int($1/86400);
@@ -740,8 +793,6 @@ linux_ps() {
   read -rp "回车返回菜单..." _
 }
 
-
-
 linux_update() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
@@ -766,8 +817,8 @@ linux_update() {
 run_sys_conf() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_conf.sh"
   local tmp="/tmp/sys_conf.sh"
-  wget -qO "$tmp" "$url" || { red "下载 sys_conf.sh 失败"; return 1; }
-  [[ -s "$tmp" ]] || { red "sys_conf.sh 文件为空"; return 1; }
+  wget -qO "$tmp" "$url" || { red "下载 sys_conf.sh 失败"; read -rp "回车返回..." _; return 1; }
+  [[ -s "$tmp" ]] || { red "sys_conf.sh 文件为空"; read -rp "回车返回..." _; return 1; }
   bash "$tmp"
 }
 
@@ -786,7 +837,7 @@ menu() {
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hysteria 2"
     echo -e " ${GREEN}4.${tianlan} 修改 Hysteria 配置"
-    echo -e " ${GREEN}5.${tianlan} 修改 系统配置"
+    echo -e " ${GREEN}5.${tianlan} 修改 系统配置（调用 sys_conf.sh）"
     echo -e " ${GREEN}6.${tianlan} 显示 配置文件"
     echo -e " ${GREEN}7.${tianlan} 查询 运行状态"
     echo -e " ${GREEN}8.${tianlan} 更新内核方式1（官方）"
