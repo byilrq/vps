@@ -580,36 +580,167 @@ ipquality(){ curl -sL https://Check.Place | bash -s - -I; }
 
 linux_ps() {
   clear
-  local os_info kernel cpu_model cpu_cores mem disk ipv4 ipv6 dns load uptime_str
+
+  # --- 基础信息 ---
+  local cpu_info cpu_arch hostname kernel_version os_info current_time timezone
+  cpu_info=$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')
+  cpu_arch=$(uname -m)
+  hostname=$(uname -n)
+  kernel_version=$(uname -r)
   os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d '=' -f2 | tr -d '"')
-  kernel=$(uname -r)
-  cpu_model=$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')
+  timezone=$(timedatectl 2>/dev/null | awk -F': ' '/Time zone/ {print $2}' | awk '{print $1}')
+  [[ -z "$timezone" ]] && timezone="unknown"
+  current_time=$(date "+%Y-%m-%d %I:%M %p")
+
+  # --- CPU 核心数/频率 ---
+  local cpu_cores cpu_freq
   cpu_cores=$(nproc 2>/dev/null)
-  mem=$(free -h | awk '/Mem:/ {print $3 "/" $2}')
-  disk=$(df -h / | awk 'NR==2{print $3 "/" $2 " (" $5 ")"}')
-  ipv4=$(curl -s4m6 ip.sb -k 2>/dev/null || true)
-  ipv6=$(curl -s6m6 ip.sb -k 2>/dev/null || true)
-  dns=$(awk '/^nameserver[ \t]+/{printf "%s ", $2} END{print ""}' /etc/resolv.conf 2>/dev/null)
-  load=$(uptime | awk -F'load average:' '{print $2}' | xargs)
-  uptime_str=$(uptime -p 2>/dev/null)
+  cpu_freq=$(grep -m1 "MHz" /proc/cpuinfo 2>/dev/null | awk '{printf "%.1f GHz\n", $4/1000}')
+  [[ -z "$cpu_freq" ]] && cpu_freq="unknown"
+
+  # --- CPU 实时占用（1秒采样）---
+  local cpu_usage_percent
+  cpu_usage_percent=$(
+    awk '
+      NR==1 {u=$2+$4; t=$2+$4+$5; u1=u; t1=t; next}
+      NR==2 {u=$2+$4; t=$2+$4+$5; du=u-u1; dt=t-t1; if(dt>0) printf "%.0f\n", du*100/dt; else print "0"}
+    ' <(grep 'cpu ' /proc/stat) <(sleep 1; grep 'cpu ' /proc/stat) 2>/dev/null
+  )
+  [[ -z "$cpu_usage_percent" ]] && cpu_usage_percent="0"
+
+  # --- 内存：nocache used 口径 ---
+  local mem_info
+  mem_info=$(awk '
+    /MemTotal/{t=$2}
+    /MemFree/{f=$2}
+    /^Buffers:/{b=$2}
+    /^Cached:/{c=$2}
+    /SReclaimable/{r=$2}
+    /Shmem:/{s=$2}
+    END{
+      used=t-f-b-c-r+s;
+      if(used<0) used=0;
+      if(t>0) printf "%.2f/%.2f MB (%.2f%%)", used/1024, t/1024, used*100/t;
+      else print "unknown"
+    }' /proc/meminfo 2>/dev/null
+  )
+  [[ -z "$mem_info" ]] && mem_info="unknown"
+
+  # --- MemAvailable 风险参考 ---
+  local mem_pressure
+  mem_pressure=$(
+    awk '
+      /MemTotal/     {t=$2}
+      /MemAvailable/ {a=$2}
+      END{
+        if(t<=0){print "unknown"; exit}
+        p = a*100/t;
+        mb = a/1024;
+        status="安全";
+        if(p<5) status="高危";
+        else if(p<10) status="警告";
+        printf "%.0fMB available (%.0f%%) %s", mb, p, status
+      }' /proc/meminfo 2>/dev/null
+  )
+  [[ -z "$mem_pressure" ]] && mem_pressure="unknown"
+
+  # --- 磁盘 ---
+  local disk_info
+  disk_info=$(df -h 2>/dev/null | awk '$NF=="/"{printf "%s/%s (%s)", $3, $2, $5}')
+  [[ -z "$disk_info" ]] && disk_info="unknown"
+
+  # --- 负载 ---
+  local load
+  load=$(uptime 2>/dev/null | awk '{print $(NF-2), $(NF-1), $NF}' | tr -d ',')
+  [[ -z "$load" ]] && load="unknown"
+
+  # --- DNS：优先 resolv.conf，兜底 resolvectl ---
+  local dns_addresses
+  dns_addresses=""
+  if [[ -f /etc/resolv.conf ]]; then
+    dns_addresses=$(awk '/^nameserver[ \t]+/{printf "%s ", $2} END {print ""}' /etc/resolv.conf 2>/dev/null)
+  fi
+  if [[ -z "${dns_addresses// /}" ]]; then
+    dns_addresses=$(resolvectl status 2>/dev/null | awk '
+      /^ *DNS Servers:/ {for (i=3;i<=NF;i++) printf "%s ", $i}
+      END {print ""}')
+  fi
+  [[ -z "${dns_addresses// /}" ]] && dns_addresses="unknown"
+
+  # --- IPv4/IPv6（尽量取到）---
+  local ipv4_address ipv6_address
+  ipv4_address=$(curl -s4m6 ip.sb -k 2>/dev/null || true)
+  ipv6_address=$(curl -s6m6 ip.sb -k 2>/dev/null || true)
+
+  # --- 运营商/地理（ipinfo.io 可能被墙/限流，失败就显示 unknown）---
+  local ipinfo country city isp_info
+  ipinfo=$(curl -s --max-time 4 ipinfo.io 2>/dev/null || true)
+  country=$(echo "$ipinfo" | grep -m1 'country' | awk -F': ' '{print $2}' | tr -d '",')
+  city=$(echo "$ipinfo" | grep -m1 'city'    | awk -F': ' '{print $2}' | tr -d '",')
+  isp_info=$(echo "$ipinfo" | grep -m1 'org' | awk -F': ' '{print $2}' | tr -d '",')
+  [[ -z "$country" ]] && country="unknown"
+  [[ -z "$city" ]] && city="unknown"
+  [[ -z "$isp_info" ]] && isp_info="unknown"
+
+  # --- 网络算法 ---
+  local congestion_algorithm queue_algorithm
+  congestion_algorithm=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)
+  queue_algorithm=$(sysctl -n net.core.default_qdisc 2>/dev/null)
+  [[ -z "$congestion_algorithm" ]] && congestion_algorithm="unknown"
+  [[ -z "$queue_algorithm" ]] && queue_algorithm="unknown"
+
+  # --- Swap ---
+  local swap_info
+  swap_info=$(free -m 2>/dev/null | awk 'NR==3{used=$3; total=$2; if(total==0) pct=0; else pct=used*100/total; printf "%dMB/%dMB (%d%%)", used, total, pct}')
+  [[ -z "$swap_info" ]] && swap_info="unknown"
+
+  # --- 运行时长（更像你原版的天/时/分）---
+  local runtime
+  runtime=$(awk -F. '{
+      run_days=int($1/86400);
+      run_hours=int(($1%86400)/3600);
+      run_minutes=int(($1%3600)/60);
+      if (run_days>0) printf("%d天 ", run_days);
+      if (run_hours>0) printf("%d时 ", run_hours);
+      printf("%d分\n", run_minutes)
+    }' /proc/uptime 2>/dev/null
+  )
+  [[ -z "$runtime" ]] && runtime="unknown"
 
   echo ""
   echo -e "系统信息查询"
   echo -e "${tianlan}-------------"
-  echo -e "${tianlan}系统版本:     ${hui}${os_info}"
-  echo -e "${tianlan}Linux版本:    ${hui}${kernel}"
-  echo -e "${tianlan}CPU型号:      ${hui}${cpu_model}"
-  echo -e "${tianlan}CPU核心数:    ${hui}${cpu_cores}"
-  echo -e "${tianlan}内存使用:     ${hui}${mem}"
-  echo -e "${tianlan}硬盘占用:     ${hui}${disk}"
-  echo -e "${tianlan}系统负载:     ${hui}${load}"
-  echo -e "${tianlan}运行时长:     ${hui}${uptime_str}"
-  [[ -n "$ipv4" ]] && echo -e "${tianlan}IPv4:         ${hui}${ipv4}"
-  [[ -n "$ipv6" ]] && echo -e "${tianlan}IPv6:         ${hui}${ipv6}"
-  echo -e "${tianlan}DNS:          ${hui}${dns}"
+  echo -e "${tianlan}主机名:       ${hui}$hostname"
+  echo -e "${tianlan}系统版本:     ${hui}$os_info"
+  echo -e "${tianlan}Linux版本:    ${hui}$kernel_version"
+  echo -e "${tianlan}-------------"
+  echo -e "${tianlan}CPU架构:      ${hui}$cpu_arch"
+  echo -e "${tianlan}CPU型号:      ${hui}$cpu_info"
+  echo -e "${tianlan}CPU核心数:    ${hui}$cpu_cores"
+  echo -e "${tianlan}CPU频率:      ${hui}$cpu_freq"
+  echo -e "${tianlan}-------------"
+  echo -e "${tianlan}CPU占用:      ${hui}${cpu_usage_percent}%"
+  echo -e "${tianlan}系统负载:     ${hui}$load"
+  echo -e "${tianlan}物理内存:     ${hui}$mem_info"
+  echo -e "${tianlan}可用内存:     ${hui}$mem_pressure"
+  echo -e "${tianlan}虚拟内存:     ${hui}$swap_info"
+  echo -e "${tianlan}硬盘占用:     ${hui}$disk_info"
+  echo -e "${tianlan}-------------"
+  echo -e "${tianlan}网络算法:     ${hui}$congestion_algorithm $queue_algorithm"
+  echo -e "${tianlan}-------------"
+  echo -e "${tianlan}运营商:       ${hui}$isp_info"
+  [[ -n "$ipv4_address" ]] && echo -e "${tianlan}IPv4地址:     ${hui}$ipv4_address"
+  [[ -n "$ipv6_address" ]] && echo -e "${tianlan}IPv6地址:     ${hui}$ipv6_address"
+  echo -e "${tianlan}DNS地址:      ${hui}$dns_addresses"
+  echo -e "${tianlan}地理位置:     ${hui}$country $city"
+  echo -e "${tianlan}系统时间:     ${hui}$timezone $current_time"
+  echo -e "${tianlan}-------------"
+  echo -e "${tianlan}运行时长:     ${hui}$runtime"
   echo
   read -rp "回车返回菜单..." _
 }
+
+
 
 linux_update() {
   if command -v apt-get >/dev/null 2>&1; then
