@@ -299,11 +299,11 @@ insthysteria(){
   ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps iptables >/dev/null 2>&1 || true
   ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent >/dev/null 2>&1 || true
 
-  local url="https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh"
-  wget -qO /tmp/install_server.sh "$url" || { red "下载 install_server.sh 失败"; exit 1; }
-  [[ -s /tmp/install_server.sh ]] || { red "install_server.sh 文件为空"; exit 1; }
-  bash /tmp/install_server.sh
-  rm -f /tmp/install_server.sh
+  local url="https://raw.githubusercontent.com/byilrq/vps/main/install_h.sh"
+  wget -qO /tmp/install_h.sh "$url" || { red "下载 install_h.sh 失败"; exit 1; }
+  [[ -s /tmp/install_h.sh ]] || { red "install_h.sh 文件为空"; exit 1; }
+  bash /tmp/install_h.sh
+  rm -f /tmp/install_h.sh
 
   [[ -f "/usr/local/bin/hysteria" ]] || { red "Hysteria 2 安装失败！"; exit 1; }
   green "Hysteria 2 安装成功！"
