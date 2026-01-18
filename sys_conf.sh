@@ -442,7 +442,69 @@ firewall() {
     esac
   done
 }
+# -----------------------------
+#  系统清理
+# -----------------------------
+sys_cle() {
+  local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_cle.sh"
+  local script="/root/sys_cle.sh"
+  local cron_line='0 0 * * * /bin/bash /root/sys_cle.sh >> /root/sys_cle.cron.log 2>&1'
 
+  # 1) 先下载/更新脚本
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    apt-get update -y >/dev/null 2>&1 || true
+    apt-get install -y curl wget >/dev/null 2>&1 || true
+  fi
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
+  else
+    wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
+  fi
+  chmod +x "$script" >/dev/null 2>&1 || true
+
+  # 2) 对话菜单
+  echo ""
+  echo "=============================="
+  echo "sys_cle 管理菜单（已更新脚本）"
+  echo "脚本位置: $script"
+  echo "=============================="
+  echo "1) 添加 cron：每天 00:00 执行"
+  echo "2) 删除 cron：移除该定时任务"
+  echo "3) 立即执行一次清理"
+  echo "4) 查看当前 cron 状态"
+  echo "0) 退出"
+  echo "------------------------------"
+  read -r -p "请选择 [0-4]: " choice
+
+  case "$choice" in
+    1)
+      # 去重后添加
+      ( crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" ; echo "$cron_line" ) | crontab -
+      echo "OK: 已添加每日 00:00 cron"
+      ;;
+    2)
+      # 删除包含 /root/sys_cle.sh 的行
+      crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" | crontab - 2>/dev/null || true
+      echo "OK: 已删除 sys_cle 的 cron"
+      ;;
+    3)
+      /bin/bash "$script"
+      echo "OK: 已执行一次清理"
+      ;;
+    4)
+      echo "当前 crontab 中与 sys_cle 相关的条目："
+      crontab -l 2>/dev/null | grep -F "/root/sys_cle.sh" || echo "（未设置）"
+      ;;
+    0)
+      echo "已退出"
+      ;;
+    *)
+      echo "输入无效：$choice（只允许 0-4）"
+      return 1
+      ;;
+  esac
+}
 # -----------------------------
 # Menu (1..9)
 # -----------------------------
@@ -463,10 +525,11 @@ menu_sys_conf() {
     echo -e " ${GREEN}7.${tianlan} 设置定时重启"
     echo -e " ${GREEN}8.${tianlan} 修改SSH端口2222"
     echo -e " ${GREEN}9.${tianlan} 设置防火墙"
+    echo -e " ${GREEN}10.${tianlan} 系统清理"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-9]: " choice
+    read -rp "请选择 [0-10]: " choice
     case "$choice" in
       1) change_tz ;;
       2) set_dns_ui ;;
@@ -477,6 +540,7 @@ menu_sys_conf() {
       7) cron_reboot ;;
       8) ssh_port 2222 ;;
       9) firewall ;;
+      10）sys_cle ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
