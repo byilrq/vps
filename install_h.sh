@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-#
-# install_server.sh - hysteria server install script
-# Try `install_server.sh --help` for usage.
-#
-# SPDX-License-Identifier: MIT
+# hysteria server install script
 # Copyright (c) 2023 Aperture Internet Laboratory
-#
 
 set -e
+
+# -----------------------------
+# 执行策略 - 发生错误立即退出
+# set -e：任一命令返回非0即退出脚本
+# -----------------------------
 
 
 ###
 # SCRIPT CONFIGURATION
 ###
+
+# -----------------------------
+# 脚本基础配置 - 名称/参数/安装路径/目录/仓库URL/curl默认参数
+# -----------------------------
 
 # Basename of this script
 SCRIPT_NAME="$(basename "$0")"
@@ -43,6 +47,11 @@ CURL_FLAGS=(-L -f -q --retry 5 --retry-delay 10 --retry-max-time 60)
 # AUTO DETECTED GLOBAL VARIABLE
 ###
 
+# -----------------------------
+# 自动探测变量 - 包管理器/系统/架构/运行用户/证书存储目录
+# 允许通过环境变量覆盖默认探测结果
+# -----------------------------
+
 # Package manager
 PACKAGE_MANAGEMENT_INSTALL="${PACKAGE_MANAGEMENT_INSTALL:-}"
 
@@ -63,6 +72,10 @@ HYSTERIA_HOME_DIR="${HYSTERIA_HOME_DIR:-}"
 # ARGUMENTS
 ###
 
+# -----------------------------
+# 命令行参数（解析结果）- 操作类型/版本/强制/本地二进制路径
+# -----------------------------
+
 # Supported operation: install, remove, check_update
 OPERATION=
 
@@ -80,26 +93,51 @@ LOCAL_FILE=
 # COMMAND REPLACEMENT & UTILITIES
 ###
 
+# -----------------------------
+# 命令封装与通用工具函数
+# - 封装 curl/mktemp/tput/systemctl 等，统一参数/兼容无systemd环境
+# - 输出彩色日志、错误提示、文件安装/删除等
+# -----------------------------
+
+# -----------------------------
+# has_command - 判断命令是否存在
+# 返回：0 存在；非0 不存在
+# -----------------------------
 has_command() {
   local _command=$1
 
   type -P "$_command" > /dev/null 2>&1
 }
 
+# -----------------------------
+# curl - curl命令包装器
+# 统一使用脚本预设的 CURL_FLAGS
+# -----------------------------
 curl() {
   command curl "${CURL_FLAGS[@]}" "$@"
 }
 
+# -----------------------------
+# mktemp - 创建临时文件
+# 固定前缀 /tmp/hyservinst.*
+# -----------------------------
 mktemp() {
   command mktemp "$@" "/tmp/hyservinst.XXXXXXXXXX"
 }
 
+# -----------------------------
+# tput - 终端能力检测封装
+# 若系统无tput则忽略（避免报错）
+# -----------------------------
 tput() {
   if has_command tput; then
     command tput "$@"
   fi
 }
 
+# -----------------------------
+# tred/tgreen/tyellow/tblue/taoi - 设置终端字体颜色
+# -----------------------------
 tred() {
   tput setaf 1
 }
@@ -120,6 +158,9 @@ taoi() {
   tput setaf 6
 }
 
+# -----------------------------
+# tbold/treset - 终端字体加粗/重置
+# -----------------------------
 tbold() {
   tput bold
 }
@@ -128,24 +169,38 @@ treset() {
   tput sgr0
 }
 
+# -----------------------------
+# note - 输出提示信息（note级别）
+# -----------------------------
 note() {
   local _msg="$1"
 
   echo -e "$SCRIPT_NAME: $(tbold)note: $_msg$(treset)"
 }
 
+# -----------------------------
+# warning - 输出警告信息（warning级别，黄色）
+# -----------------------------
 warning() {
   local _msg="$1"
 
   echo -e "$SCRIPT_NAME: $(tyellow)warning: $_msg$(treset)"
 }
 
+# -----------------------------
+# error - 输出错误信息（error级别，红色）
+# -----------------------------
 error() {
   local _msg="$1"
 
   echo -e "$SCRIPT_NAME: $(tred)error: $_msg$(treset)"
 }
 
+# -----------------------------
+# has_prefix - 判断字符串是否以指定前缀开头
+# 参数：字符串、前缀
+# 返回：0 匹配；1 不匹配
+# -----------------------------
 has_prefix() {
     local _s="$1"
     local _prefix="$2"
@@ -161,10 +216,18 @@ has_prefix() {
     [[ "x$_s" != "x${_s#"$_prefix"}" ]]
 }
 
+# -----------------------------
+# generate_random_password - 生成随机密码
+# 来源：/dev/random 读取18字节 -> base64输出
+# -----------------------------
 generate_random_password() {
   dd if=/dev/random bs=18 count=1 status=none | base64
 }
 
+# -----------------------------
+# systemctl - systemctl命令封装
+# FORCE_NO_SYSTEMD=2 或系统无systemctl时跳过执行
+# -----------------------------
 systemctl() {
   if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]] || ! has_command systemctl; then
     warning "Ignored systemd command: systemctl $@"
@@ -174,6 +237,10 @@ systemctl() {
   command systemctl "$@"
 }
 
+# -----------------------------
+# show_argument_error_and_exit - 参数错误提示并退出
+# 退出码：22（EINVAL）
+# -----------------------------
 show_argument_error_and_exit() {
   local _error_msg="$1"
 
@@ -182,6 +249,14 @@ show_argument_error_and_exit() {
   exit 22
 }
 
+# -----------------------------
+# install_content - 将给定内容写入目标文件并安装到指定位置
+# 参数：
+#  1) install flags（如 -Dm644）
+#  2) content（文本内容）
+#  3) destination（目标路径）
+#  4) overwrite（非空则覆盖）
+# -----------------------------
 install_content() {
   local _install_flags="$1"
   local _content="$2"
@@ -201,6 +276,9 @@ install_content() {
   rm -f "$_tmpfile"
 }
 
+# -----------------------------
+# remove_file - 删除指定文件并打印结果
+# -----------------------------
 remove_file() {
   local _target="$1"
 
@@ -210,6 +288,10 @@ remove_file() {
   fi
 }
 
+# -----------------------------
+# exec_sudo - 使用sudo重新执行命令并保留关键环境变量
+# 用途：root权限提升同时保留脚本探测/配置变量
+# -----------------------------
 exec_sudo() {
   # exec sudo with configurable environ preserved.
   local _saved_ifs="$IFS"
@@ -228,6 +310,11 @@ exec_sudo() {
     "$@"
 }
 
+# -----------------------------
+# detect_package_manager - 探测可用包管理器并设置安装命令
+# 支持：apt/dnf/yum/zypper/pacman
+# 返回：0 成功；1 未探测到
+# -----------------------------
 detect_package_manager() {
   if [[ -n "$PACKAGE_MANAGEMENT_INSTALL" ]]; then
     return 0
@@ -261,6 +348,10 @@ detect_package_manager() {
   return 1
 }
 
+# -----------------------------
+# install_software - 安装缺失依赖软件包
+# 未探测到包管理器或安装失败则退出（65）
+# -----------------------------
 install_software() {
   local _package_name="$1"
 
@@ -281,12 +372,21 @@ install_software() {
   fi
 }
 
+# -----------------------------
+# is_user_exists - 判断系统用户是否存在
+# 返回：0 存在；非0 不存在
+# -----------------------------
 is_user_exists() {
   local _user="$1"
 
   id "$_user" > /dev/null 2>&1
 }
 
+# -----------------------------
+# rerun_with_sudo - 使用sudo重新运行脚本
+# 特殊情况：若从 /dev/fd/* 执行，则重新下载脚本到临时文件后再sudo执行
+# 返回：13 无sudo；127 无curl/wget
+# -----------------------------
 rerun_with_sudo() {
   if ! has_command sudo; then
     return 13
@@ -315,6 +415,10 @@ rerun_with_sudo() {
   exec_sudo "$_target_script" "${SCRIPT_ARGS[@]}"
 }
 
+# -----------------------------
+# check_permission - 检查是否root执行
+# 非root：尝试sudo重跑，或 FORCE_NO_ROOT=1 继续执行
+# -----------------------------
 check_permission() {
   if [[ "$UID" -eq '0' ]]; then
     return
@@ -335,6 +439,10 @@ check_permission() {
   esac
 }
 
+# -----------------------------
+# check_environment_operating_system - 检测操作系统
+# 默认仅支持Linux；可通过 OPERATING_SYSTEM 绕过检测
+# -----------------------------
 check_environment_operating_system() {
   if [[ -n "$OPERATING_SYSTEM" ]]; then
     warning "OPERATING_SYSTEM=$OPERATING_SYSTEM detected, operating system detection will not be performed."
@@ -351,6 +459,10 @@ check_environment_operating_system() {
   exit 95
 }
 
+# -----------------------------
+# check_environment_architecture - 检测CPU架构
+# 支持：386/amd64/arm/arm64/mipsle/s390x；可通过 ARCHITECTURE 绕过
+# -----------------------------
 check_environment_architecture() {
   if [[ -n "$ARCHITECTURE" ]]; then
     warning "ARCHITECTURE=$ARCHITECTURE detected, architecture detection will not be performed."
@@ -384,6 +496,10 @@ check_environment_architecture() {
   esac
 }
 
+# -----------------------------
+# check_environment_systemd - 检测systemd环境
+# 不存在systemd：默认报错；可通过 FORCE_NO_SYSTEMD=1/2 绕过或跳过
+# -----------------------------
 check_environment_systemd() {
   if [[ -d "/run/systemd/system" ]] || grep -q systemd <(ls -l /sbin/init); then
     return
@@ -404,6 +520,10 @@ check_environment_systemd() {
   esac
 }
 
+# -----------------------------
+# check_environment_curl - 确保curl存在
+# 若缺失则尝试自动安装
+# -----------------------------
 check_environment_curl() {
   if has_command curl; then
     return
@@ -412,6 +532,10 @@ check_environment_curl() {
   install_software curl
 }
 
+# -----------------------------
+# check_environment_grep - 确保grep存在
+# 若缺失则尝试自动安装
+# -----------------------------
 check_environment_grep() {
   if has_command grep; then
     return
@@ -420,6 +544,9 @@ check_environment_grep() {
   install_software grep
 }
 
+# -----------------------------
+# check_environment - 统一环境检测入口
+# -----------------------------
 check_environment() {
   check_environment_operating_system
   check_environment_architecture
@@ -428,6 +555,11 @@ check_environment() {
   check_environment_grep
 }
 
+# -----------------------------
+# vercmp_segment - 版本号片段比较
+# 比较数字部分与后缀（如rc/beta等）
+# 返回：<0 lhs小；0 相等；>0 lhs大
+# -----------------------------
 vercmp_segment() {
   local _lhs="$1"
   local _rhs="$2"
@@ -488,6 +620,11 @@ vercmp_segment() {
   echo 1
 }
 
+# -----------------------------
+# vercmp - 版本号比较（按.分段）
+# 参数：lhs/rhs（可带v前缀）
+# 返回：<0 lhs小；0 相等；>0 lhs大
+# -----------------------------
 vercmp() {
   local _lhs=${1#v}
   local _rhs=${2#v}
@@ -526,6 +663,10 @@ vercmp() {
   return
 }
 
+# -----------------------------
+# check_hysteria_user - 确定hysteria运行用户
+# 若已有service文件则从User=读取，否则使用默认值
+# -----------------------------
 check_hysteria_user() {
   local _default_hysteria_user="$1"
 
@@ -545,6 +686,10 @@ check_hysteria_user() {
   fi
 }
 
+# -----------------------------
+# check_hysteria_homedir - 确定hysteria用户家目录
+# 用户不存在则使用默认目录；存在则读取实际home
+# -----------------------------
 check_hysteria_homedir() {
   local _default_hysteria_homedir="$1"
 
@@ -565,6 +710,9 @@ check_hysteria_homedir() {
 # ARGUMENTS PARSER
 ###
 
+# -----------------------------
+# 参数解析 - 显示帮助信息并退出
+# -----------------------------
 show_usage_and_exit() {
   echo
   echo -e "\t$(tbold)$SCRIPT_NAME$(treset) - hysteria server install script"
@@ -591,6 +739,10 @@ show_usage_and_exit() {
   exit 0
 }
 
+# -----------------------------
+# parse_arguments - 解析命令行参数并校验合法性
+# 支持：install（默认）/ remove / check_update
+# -----------------------------
 parse_arguments() {
   while [[ "$#" -gt '0' ]]; do
     case "$1" in
@@ -663,7 +815,14 @@ parse_arguments() {
 # FILE TEMPLATES
 ###
 
-# /etc/systemd/system/hysteria-server.service
+# -----------------------------
+# 文件模板 - systemd service 与示例配置文件内容生成
+# -----------------------------
+
+# -----------------------------
+# tpl_hysteria_server_service_base - 生成systemd service基础模板
+# 参数：config名（用于拼接配置文件名）
+# -----------------------------
 tpl_hysteria_server_service_base() {
   local _config_name="$1"
 
@@ -688,17 +847,24 @@ WantedBy=multi-user.target
 EOF
 }
 
-# /etc/systemd/system/hysteria-server.service
+# -----------------------------
+# tpl_hysteria_server_service - 生成默认service文件模板（config.yaml）
+# -----------------------------
 tpl_hysteria_server_service() {
   tpl_hysteria_server_service_base 'config'
 }
 
-# /etc/systemd/system/hysteria-server@.service
+# -----------------------------
+# tpl_hysteria_server_x_service - 生成实例化service模板（hysteria-server@.service）
+# -----------------------------
 tpl_hysteria_server_x_service() {
   tpl_hysteria_server_service_base '%i'
 }
 
-# /etc/hysteria/config.yaml
+# -----------------------------
+# tpl_etc_hysteria_config_yaml - 生成 /etc/hysteria/config.yaml 示例配置
+# 包含ACME与password认证的示例，并生成随机密码
+# -----------------------------
 tpl_etc_hysteria_config_yaml() {
   cat << EOF
 # listen: :443
@@ -725,6 +891,14 @@ EOF
 # SYSTEMD
 ###
 
+# -----------------------------
+# systemd 相关 - 查询运行中服务/重启/停止
+# -----------------------------
+
+# -----------------------------
+# get_running_services - 获取当前运行中的 hysteria-server 服务实例列表
+# FORCE_NO_SYSTEMD=2 时跳过
+# -----------------------------
 get_running_services() {
   if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
     return
@@ -734,6 +908,9 @@ get_running_services() {
     | grep -o "hysteria-server@*[^\s]*.service" || true
 }
 
+# -----------------------------
+# restart_running_services - 重启当前运行中的服务实例
+# -----------------------------
 restart_running_services() {
   if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
     return
@@ -748,6 +925,9 @@ restart_running_services() {
   done
 }
 
+# -----------------------------
+# stop_running_services - 停止当前运行中的服务实例
+# -----------------------------
 stop_running_services() {
   if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
     return
@@ -767,6 +947,14 @@ stop_running_services() {
 # HYSTERIA & GITHUB API
 ###
 
+# -----------------------------
+# hysteria 与 GitHub API - 安装检测/版本检测/下载/更新检查
+# -----------------------------
+
+# -----------------------------
+# is_hysteria_installed - 判断hysteria是否已安装
+# 返回：0 已安装；1 未安装
+# -----------------------------
 is_hysteria_installed() {
   # RETURN VALUE
   # 0: hysteria is installed
@@ -778,12 +966,19 @@ is_hysteria_installed() {
   return 1
 }
 
+# -----------------------------
+# is_hysteria1_version - 判断是否为Hysteria 1版本号（v1.* 或 v0.*）
+# -----------------------------
 is_hysteria1_version() {
   local _version="$1"
 
   has_prefix "$_version" "v1." || has_prefix "$_version" "v0."
 }
 
+# -----------------------------
+# get_installed_version - 获取已安装hysteria版本号
+# 兼容 Hysteria 2（hysteria version）与 Hysteria 1（hysteria -v）
+# -----------------------------
 get_installed_version() {
   if is_hysteria_installed; then
     if "$EXECUTABLE_INSTALL_PATH" version > /dev/null 2>&1; then
@@ -795,6 +990,10 @@ get_installed_version() {
   fi
 }
 
+# -----------------------------
+# get_latest_version - 获取最新版本号
+# 若用户指定 VERSION 则直接返回，否则通过 GitHub API 读取 releases/latest
+# -----------------------------
 get_latest_version() {
   if [[ -n "$VERSION" ]]; then
     echo "$VERSION"
@@ -818,6 +1017,10 @@ get_latest_version() {
   rm -f "$_tmpfile"
 }
 
+# -----------------------------
+# download_hysteria - 下载hysteria二进制到指定路径
+# 参数：版本号、目标文件路径
+# -----------------------------
 download_hysteria() {
   local _version="$1"
   local _destination="$2"
@@ -831,6 +1034,11 @@ download_hysteria() {
   return 0
 }
 
+# -----------------------------
+# check_update - 检查是否有更新
+# 返回：0 有更新；1 已是最新或获取失败
+# 副作用：若成功获取最新版本，会把 VERSION 设为最新版本
+# -----------------------------
 check_update() {
   # RETURN VALUE
   # 0: update available
@@ -867,6 +1075,14 @@ check_update() {
 # ENTRY
 ###
 
+# -----------------------------
+# 执行入口 - 安装/卸载/更新检查的具体流程实现
+# -----------------------------
+
+# -----------------------------
+# perform_install_hysteria_binary - 安装hysteria可执行文件
+# 支持本地文件安装（--local），否则从GitHub下载后安装
+# -----------------------------
 perform_install_hysteria_binary() {
   if [[ -n "$LOCAL_FILE" ]]; then
     note "Performing local install: $LOCAL_FILE"
@@ -900,14 +1116,24 @@ perform_install_hysteria_binary() {
   rm -f "$_tmpfile"
 }
 
+# -----------------------------
+# perform_remove_hysteria_binary - 卸载hysteria可执行文件
+# -----------------------------
 perform_remove_hysteria_binary() {
   remove_file "$EXECUTABLE_INSTALL_PATH"
 }
 
+# -----------------------------
+# perform_install_hysteria_example_config - 安装示例配置文件到 /etc/hysteria/config.yaml
+# -----------------------------
 perform_install_hysteria_example_config() {
   install_content -Dm644 "$(tpl_etc_hysteria_config_yaml)" "$CONFIG_DIR/config.yaml" ""
 }
 
+# -----------------------------
+# perform_install_hysteria_systemd - 安装systemd服务文件并daemon-reload
+# FORCE_NO_SYSTEMD=2 时跳过
+# -----------------------------
 perform_install_hysteria_systemd() {
   if [[ "x$FORCE_NO_SYSTEMD" == "x2" ]]; then
     return
@@ -919,6 +1145,9 @@ perform_install_hysteria_systemd() {
   systemctl daemon-reload
 }
 
+# -----------------------------
+# perform_remove_hysteria_systemd - 删除systemd服务文件并daemon-reload
+# -----------------------------
 perform_remove_hysteria_systemd() {
   remove_file "$SYSTEMD_SERVICES_DIR/hysteria-server.service"
   remove_file "$SYSTEMD_SERVICES_DIR/hysteria-server@.service"
@@ -926,6 +1155,10 @@ perform_remove_hysteria_systemd() {
   systemctl daemon-reload
 }
 
+# -----------------------------
+# perform_install_hysteria_home_legacy - legacy行为：创建运行用户（若不存在）
+# 仅在用户不存在时创建 system user，并设置home目录
+# -----------------------------
 perform_install_hysteria_home_legacy() {
   if ! is_user_exists "$HYSTERIA_USER"; then
     echo -ne "Creating user $HYSTERIA_USER ... "
@@ -934,6 +1167,13 @@ perform_install_hysteria_home_legacy() {
   fi
 }
 
+# -----------------------------
+# perform_install - 执行安装/升级主流程
+# - 判断是否首次安装/从Hysteria1升级
+# - 判断是否需要更新（或--force强制）
+# - 安装二进制、示例配置、用户、systemd文件
+# - 根据场景输出后续操作指引
+# -----------------------------
 perform_install() {
   local _is_frash_install
   local _is_upgrade_from_hysteria1
@@ -1006,6 +1246,13 @@ perform_install() {
   fi
 }
 
+# -----------------------------
+# perform_remove - 执行卸载流程
+# - 删除二进制
+# - 停止服务
+# - 删除systemd文件
+# - 输出残留文件/用户清理指引
+# -----------------------------
 perform_remove() {
   perform_remove_hysteria_binary
   stop_running_services
@@ -1031,6 +1278,9 @@ perform_remove() {
   echo
 }
 
+# -----------------------------
+# perform_check_update - 执行更新检查并输出提示
+# -----------------------------
 perform_check_update() {
   if check_update; then
     echo
@@ -1045,6 +1295,13 @@ perform_check_update() {
   fi
 }
 
+# -----------------------------
+# main - 脚本主入口
+# - 解析参数
+# - 权限与环境检测
+# - 确定运行用户与home目录
+# - 按操作分发到 install/remove/check_update
+# -----------------------------
 main() {
   parse_arguments "$@"
 
@@ -1069,6 +1326,9 @@ main() {
   esac
 }
 
+# -----------------------------
+# 程序执行入口 - 调用main并传入脚本参数
+# -----------------------------
 main "$@"
 
 # vim:set ft=bash ts=2 sw=2 sts=2 et:
