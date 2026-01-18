@@ -837,7 +837,7 @@ menu() {
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hysteria 2"
     echo -e " ${GREEN}4.${tianlan} 修改 Hysteria 配置"
-    echo -e " ${GREEN}5.${tianlan} 修改 系统配置（调用 sys_conf.sh）"
+    echo -e " ${GREEN}5.${tianlan} 修改 系统配置"
     echo -e " ${GREEN}6.${tianlan} 显示 配置文件"
     echo -e " ${GREEN}7.${tianlan} 查询 运行状态"
     echo -e " ${GREEN}8.${tianlan} 更新内核方式1（官方）"
