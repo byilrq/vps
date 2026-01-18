@@ -540,7 +540,7 @@ menu_sys_conf() {
       7) cron_reboot ;;
       8) ssh_port 2222 ;;
       9) firewall ;;
-      10）sys_cle ;;
+      10) sys_cle ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
