@@ -805,7 +805,7 @@ reset_keypair() {
 }
 
 # -----------------------------
-#  状态
+#  xray 状态
 # -----------------------------
 status_xray() {
   echo
@@ -813,19 +813,31 @@ status_xray() {
   systemctl status "$SERVICE" --no-pager -l 2>/dev/null || service "$SERVICE" status || true
   echo
 
-  # Xray Reality（Xray-core）版本号：只显示 vX.Y.Z
-  local xver_raw="" xver=""
+  # 当前版本：从 xray version 输出中提取 vX.Y.Z
+  local cur_raw="" cur_ver="unknown"
   if command -v xray >/dev/null 2>&1; then
-    xver_raw="$(xray version 2>/dev/null | head -n1 || true)"
-    [[ -z "$xver_raw" ]] && xver_raw="$(xray --version 2>/dev/null | head -n1 || true)"
-
-    # 从输出中提取版本号（可能是 v26.2.6 或 26.2.6）
-    xver="$(echo "$xver_raw" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
-    # 没有 v 前缀则补上
-    [[ -n "$xver" && "$xver" != v* ]] && xver="v${xver}"
+    cur_raw="$(xray version 2>/dev/null | head -n1 || true)"
+    [[ -z "$cur_raw" ]] && cur_raw="$(xray --version 2>/dev/null | head -n1 || true)"
+    cur_ver="$(echo "$cur_raw" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    [[ -n "$cur_ver" && "$cur_ver" != v* ]] && cur_ver="v${cur_ver}"
+    [[ -z "$cur_ver" ]] && cur_ver="unknown"
   fi
-  [[ -z "$xver" ]] && xver="unknown"
-  echo -e "${yellow}Xray Reality 版本：${cyan}${xver}${none}"
+
+  # 最新版本：复用你已有的 get_latest_xray_version（若没定义则内置兜底）
+  local latest_ver="unknown"
+  if declare -F get_latest_xray_version >/dev/null 2>&1; then
+    latest_ver="$(get_latest_xray_version 2>/dev/null || true)"
+  else
+    # 兜底：与 get_latest_xray_version 相同逻辑
+    latest_ver="$(
+      curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
+      | jq -r '.tag_name // empty' 2>/dev/null || true
+    )"
+    [[ "$latest_ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || latest_ver="unknown"
+  fi
+
+  echo -e "${yellow}当前版本：${cyan}${cur_ver}${none}"
+  echo -e "${yellow}最新版本：${cyan}${latest_ver}${none}"
   echo
 
   if [[ -f "$CONFIG" ]]; then
