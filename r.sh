@@ -235,6 +235,49 @@ apt_update_safe() {
 apt_install_safe() { wait_apt_lock; DEBIAN_FRONTEND=noninteractive apt-get -y install "$@"; }
 
 # -----------------------------
+#  更新内核
+# -----------------------------
+update_xray_reality() {
+  echo -e "${yellow}开始更新 Xray Reality...${none}"
+
+  if ! apt_update_safe; then
+    warn "APT update 失败：请先修复 sources.list 再运行脚本。"
+    return 1
+  fi
+
+  # 更新需要的基础命令
+  apt_install_safe curl wget sudo jq >/dev/null 2>&1 || true
+
+  local XRAY_VER
+  XRAY_VER="$(choose_xray_version "v25.10.15")"
+
+  echo -e "${yellow}将更新到版本：${cyan}${XRAY_VER}${none}"
+  echo -e "${yellow}（更新不会修改你的配置文件：${cyan}${CONFIG}${none}）${none}"
+
+  # 更新 core
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "${XRAY_VER}"
+
+  # 更新 geodata
+  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata
+
+  # 重启服务
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl restart "$SERVICE" >/dev/null 2>&1 || service "$SERVICE" restart || true
+
+  echo ""
+  ok "更新完成。当前版本："
+  if command -v xray >/dev/null 2>&1; then
+    xray version 2>/dev/null || xray --version 2>/dev/null || true
+  else
+    warn "未找到 xray 命令（可能安装路径异常）"
+  fi
+
+  echo ""
+  echo -e "${yellow}服务状态：${none}"
+  systemctl status "$SERVICE" --no-pager -l 2>/dev/null || service "$SERVICE" status || true
+}
+
+# -----------------------------
 #  获取公网 IP
 # -----------------------------
 get_public_ips() {
@@ -1656,31 +1699,33 @@ echo -e "${cyan}${bold}   🚀  Xray Reality 管理界面"${none}
 echo -e "${cyan}${bold}══════════════════════════════════════════${none}"
 echo -e "${gray}──────────────────────────────────────────────────${none}"
 echo -e "  ${green}${bold}1)${none} ${green}安装"
-echo -e "  ${red}${bold}2)${none} ${red}卸载"
+echo -e "  ${yellow}${bold}2)${none} ${yellow}更新"
+echo -e "  ${red}${bold}3)${none} ${red}卸载"
 echo -e "${gray}──────────────────────────────────────────────────${none}"
-echo -e "  ${yellow}${bold}3)${none} ${yellow}打印节点信息"
-echo -e "  ${yellow}${bold}4)${none} ${yellow}系统参数配置"
-echo -e "  ${yellow}${bold}5)${none} ${yellow}回程路由测试"
-echo -e "  ${yellow}${bold}6)${none} ${yellow}IP质量检测"
-echo -e "  ${yellow}${bold}7)${none} ${yellow}系统查询"
-echo -e "  ${yellow}${bold}8)${none} ${yellow}查看状态"
+echo -e "  ${yellow}${bold}4)${none} ${yellow}打印节点信息"
+echo -e "  ${yellow}${bold}5)${none} ${yellow}系统参数配置"
+echo -e "  ${yellow}${bold}6)${none} ${yellow}回程路由测试"
+echo -e "  ${yellow}${bold}7)${none} ${yellow}IP质量检测"
+echo -e "  ${yellow}${bold}8)${none} ${yellow}系统查询"
+echo -e "  ${yellow}${bold}9)${none} ${yellow}查看状态"
 echo -e "  ${red}${bold}0)${none} ${red}${bold}退出${none}"
 echo -e "${gray}提示：输入对应数字并回车${none}"
 echo -e "${gray}──────────────────────────────────────────────────${none}"
-    echo -ne "${green}${bold}请选择 [0-8]${none}${green}: ${none}"
+echo -ne "${green}${bold}请选择 [0-9]${none}${green}: ${none}"
 
     local choice=""
     read_tty "" choice
 
     case "${choice}" in
       1) install_xray; pause ;;
-      2) uninstall_xray; pause ;;
-      3) showconf; pause ;;
-      4) changeconf ;;
-      5) besttrace; pause ;;
-      6) ipquality; pause ;;
-      7) linux_ps; pause ;;
-      8) status_xray; pause ;;
+      2) update_xray_reality; pause ;;
+      3) uninstall_xray; pause ;;
+      4) showconf; pause ;;
+      5) changeconf ;;
+      6) besttrace; pause ;;
+      7) ipquality; pause ;;
+      8) linux_ps; pause ;;
+      9) status_xray; pause ;;
       0) exit 0 ;;
       *) error; pause ;;
     esac
