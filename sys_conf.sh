@@ -385,135 +385,141 @@ ssh_port() {
 firewall() {
   need_root
 
-  local PERSIST_FILE="/etc/ufw/extra_ports.conf"
-
-  _ufw_install_if_needed() {
-    if ! command -v ufw >/dev/null 2>&1; then
-      yellow "未检测到 ufw，尝试安装"
-      pkg_update || true
-      pkg_install ufw || return 1
-    fi
-    return 0
-  }
-
-  _normalize_ports_str() {
-    # 逗号/中文逗号转空格，去掉多余空白
-    local s="$1"
-    s="${s//,/ }"
-    s="${s//，/ }"
-    echo "$s"
-  }
-
-  _port_item_valid() {
-    local p="$1"
-    [[ "$p" =~ ^[0-9]+$ ]] || [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]
-  }
-
-  _port_item_to_ufw_syntax() {
-    # 51000-52000 -> 51000:52000 ;  2222 -> 2222
-    local p="$1"
-    if [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
-      echo "${p/-/:}"
-    else
-      echo "$p"
-    fi
-  }
-
-  _ensure_rule() {
-    # 幂等添加：已存在则不重复加
-    # 用 ufw status 的文本匹配（够用且简单）
-    local spec="$1" proto="$2"  # spec: 2222 或 51000:52000
-    if ufw status | grep -Eq "^\s*${spec}\/${proto}\s+ALLOW"; then
-      return 0
-    fi
-    ufw allow "${spec}/${proto}" >/dev/null 2>&1 || true
-  }
-
-  _apply_persist_ports() {
-    # 读取持久化端口清单并补齐规则
-    [[ -f "$PERSIST_FILE" ]] || return 0
-    local ports line p spec
-    ports="$(tr '\n' ' ' < "$PERSIST_FILE")"
-    ports="$(_normalize_ports_str "$ports")"
-
-    for p in $ports; do
-      _port_item_valid "$p" || continue
-      spec="$(_port_item_to_ufw_syntax "$p")"
-      _ensure_rule "$spec" tcp
-      _ensure_rule "$spec" udp
-    done
-  }
-
-  _persist_add_ports() {
-    # 把用户输入追加到持久化文件（去重）
+  _check_listen_ports() {
     local ports="$1"
-    ports="$(_normalize_ports_str "$ports")"
+    ports="${ports//,/ }"
+    ports="${ports//，/ }"
 
-    mkdir -p "$(dirname "$PERSIST_FILE")"
-    touch "$PERSIST_FILE"
-    chmod 600 "$PERSIST_FILE"
+    local listen_ports
+    listen_ports="$(ss -lntuH 2>/dev/null | awk '{print $5}' | sed 's/.*://')"
 
-    local p
+    local p start end i found any=0
     for p in $ports; do
-      _port_item_valid "$p" || continue
-      # 去重：整词匹配
-      if ! grep -Eq "(^|[[:space:]])${p}([[:space:]]|$)" "$PERSIST_FILE"; then
-        echo "$p" >> "$PERSIST_FILE"
+      [[ -z "$p" ]] && continue
+      any=1
+      if [[ "$p" =~ ^[0-9]+$ ]]; then
+        if echo "$listen_ports" | grep -qx "$p"; then
+          echo "  ✅ 端口 $p 正在监听"
+        else
+          echo "  ❌ 端口 $p 未监听（防火墙放行≠服务已启动）"
+        fi
+      elif [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
+        IFS='-' read -r start end <<< "$p"
+        found=0
+        for i in "$start" "$(( (start+end)/2 ))" "$end"; do
+          if echo "$listen_ports" | grep -qx "$i"; then
+            found=1
+            break
+          fi
+        done
+        if [[ $found -eq 1 ]]; then
+          echo "  ✅ 端口范围 $p 内检测到有端口在监听（抽样）"
+        else
+          echo "  ❌ 端口范围 $p 内未检测到监听（抽样：$start,$(( (start+end)/2 )),$end）"
+        fi
+      else
+        echo "  ⚠️ 忽略非法端口格式：$p"
       fi
     done
+    [[ $any -eq 0 ]] && echo "  （未提供额外端口，略过监听检查）"
+  }
+
+  _purge_except_ssh() {
+    if ! command -v ufw >/dev/null 2>&1; then
+      yellow "未检测到 ufw。"
+      return 1
+    fi
+
+    local sshp
+    sshp="$(get_ssh_port)"
+    yellow "将清除除 SSH(${sshp}) 以外的所有 UFW 入站规则（含 v6），SSH tcp/udp 会保留。"
+    read -rp "确认执行？输入 YES 继续: " confirm
+    [[ "$confirm" == "YES" ]] || { yellow "已取消"; return 0; }
+
+    # 取编号并从大到小删除，避免编号重排影响
+    # 只删除“不是 ssh 端口”的规则
+    local nums
+    nums="$(
+      ufw status numbered 2>/dev/null \
+      | sed -nE 's/^\[\s*([0-9]+)\]\s+(.+)$/\1|\2/p' \
+      | awk -F'|' -v p="$sshp" '
+          {
+            line=$2
+            # 保留 SSH 规则：端口/tcp 或端口/udp，含 (v6)
+            if (line ~ ("^" p "/tcp") || line ~ ("^" p "/udp") ) next
+            print $1
+          }'
+    )"
+
+    if [[ -z "$nums" ]]; then
+      green "没有需要清除的规则（除了 SSH 外已无其它规则）。"
+      return 0
+    fi
+
+    # sort -nr 倒序
+    while read -r n; do
+      [[ -z "$n" ]] && continue
+      ufw --force delete "$n" >/dev/null 2>&1 || true
+    done < <(echo "$nums" | sort -nr)
+
+    ufw reload >/dev/null 2>&1 || true
+    green "清理完成。当前规则如下："
+    ufw status numbered
+    return 0
   }
 
   while true; do
     clear
-
-    # 进入菜单时也补齐一次（避免你“重启后没补回”）
-    if command -v ufw >/dev/null 2>&1; then
-      _apply_persist_ports || true
-    fi
-
     echo "---------------- 防火墙设置 (ufw) ----------------"
-    echo " 1) 开启防火墙并设置放行端口（并持久化额外端口）"
+    echo " 1) 开启防火墙并设置放行端口"
     echo " 2) 关闭防火墙"
-    echo " 3) 查看当前防火墙状态/规则（含持久化端口清单）"
+    echo " 3) 查看当前防火墙状态/规则（并检查监听）"
+    echo " 4) 清除除 SSH 以外的所有放行规则"
     echo " 0) 返回上级菜单"
     echo "-------------------------------------------------"
-    read -rp " 请选择 [0-3]: " ans
+    read -rp " 请选择 [0-4]: " ans
 
     case "$ans" in
       1)
-        _ufw_install_if_needed || { red "安装 ufw 失败"; read -rp "回车返回..." _; continue; }
+        if ! command -v ufw >/dev/null 2>&1; then
+          yellow "未检测到 ufw，尝试安装"
+          pkg_update || true
+          pkg_install ufw || { red "安装 ufw 失败"; read -rp "回车返回..." _; continue; }
+        fi
 
-        local sshp
+        local sshp ports
         sshp="$(get_ssh_port)"
         yellow "当前 SSH 端口：$sshp，将自动放行 tcp/udp 防止失联。"
+        read -rp "请输入需要额外放行的端口（例如：2222 51000-52000，可留空）: " ports
 
-        read -rp "请输入需要额外放行的端口（如：2222 51000-52000；可用空格/逗号分隔；可留空）: " ports
-        ports="$(_normalize_ports_str "$ports")"
+        ufw --force enable
+        ufw allow "${sshp}/tcp"
+        ufw allow "${sshp}/udp"
 
-        ufw --force enable >/dev/null 2>&1 || true
+        ports="${ports//,/ }"
+        ports="${ports//，/ }"
 
-        # SSH 必放行
-        _ensure_rule "${sshp}" tcp
-        _ensure_rule "${sshp}" udp
-
-        # 额外端口：先持久化，再应用
-        if [[ -n "$ports" ]]; then
-          _persist_add_ports "$ports"
-        fi
-        _apply_persist_ports
+        for p in $ports; do
+          if [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
+            local start end
+            IFS='-' read -r start end <<< "$p"
+            ufw allow "${start}:${end}/tcp"
+            ufw allow "${start}:${end}/udp"
+          elif [[ "$p" =~ ^[0-9]+$ ]]; then
+            ufw allow "${p}/tcp"
+            ufw allow "${p}/udp"
+          else
+            yellow "忽略非法端口格式：$p"
+          fi
+        done
 
         ufw reload >/dev/null 2>&1 || true
 
         echo ""
-        yellow "当前 ufw 状态（含编号规则）："
         ufw status numbered
         echo ""
-        yellow "已持久化的额外端口清单：$PERSIST_FILE"
-        if [[ -s "$PERSIST_FILE" ]]; then
-          sed 's/^/  - /' "$PERSIST_FILE"
-        else
-          echo "  (空)"
-        fi
+        yellow "监听检查（用于判断“端口不通”是否其实是服务没起来）："
+        _check_listen_ports "$ports"
         read -rp "回车返回菜单..." _
         ;;
       2)
@@ -523,8 +529,7 @@ firewall() {
           continue
         fi
         ufw disable
-        echo ""
-        ufw status verbose
+        ufw status
         read -rp "回车返回菜单..." _
         ;;
       3)
@@ -534,21 +539,16 @@ firewall() {
           continue
         fi
         echo ""
-        yellow "ufw 状态（详细）："
         ufw status verbose
         echo ""
-        yellow "ufw 规则（带编号）："
         ufw status numbered
         echo ""
-        yellow "已添加规则（ufw show added）："
-        ufw show added || true
-        echo ""
-        yellow "已持久化的额外端口清单：$PERSIST_FILE"
-        if [[ -s "$PERSIST_FILE" ]]; then
-          sed 's/^/  - /' "$PERSIST_FILE"
-        else
-          echo "  (空)"
-        fi
+        yellow "当前系统监听端口（节选）："
+        ss -lntu | head -n 30
+        read -rp "回车返回菜单..." _
+        ;;
+      4)
+        _purge_except_ssh
         read -rp "回车返回菜单..." _
         ;;
       0) break ;;
