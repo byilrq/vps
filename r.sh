@@ -812,6 +812,22 @@ status_xray() {
   echo -e "${yellow}Xray 服务状态：${none}"
   systemctl status "$SERVICE" --no-pager -l 2>/dev/null || service "$SERVICE" status || true
   echo
+
+  # Xray Reality（Xray-core）版本号：只显示 vX.Y.Z
+  local xver_raw="" xver=""
+  if command -v xray >/dev/null 2>&1; then
+    xver_raw="$(xray version 2>/dev/null | head -n1 || true)"
+    [[ -z "$xver_raw" ]] && xver_raw="$(xray --version 2>/dev/null | head -n1 || true)"
+
+    # 从输出中提取版本号（可能是 v26.2.6 或 26.2.6）
+    xver="$(echo "$xver_raw" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    # 没有 v 前缀则补上
+    [[ -n "$xver" && "$xver" != v* ]] && xver="v${xver}"
+  fi
+  [[ -z "$xver" ]] && xver="unknown"
+  echo -e "${yellow}Xray Reality 版本：${cyan}${xver}${none}"
+  echo
+
   if [[ -f "$CONFIG" ]]; then
     if read_current_config; then
       echo -e "${yellow}当前配置摘要：${none}"
