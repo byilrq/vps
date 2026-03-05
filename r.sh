@@ -1554,19 +1554,106 @@ sys_cle() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_cle.sh"
   local script="/root/sys_cle.sh"
   local cron_line='0 0 * * * /bin/bash /root/sys_cle.sh >> /root/sys_cle.cron.log 2>&1'
+  local cron_d_file="/etc/cron.d/sys_cle"
+
+  _ensure_downloader() {
+    if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+      apt-get update -y >/dev/null 2>&1 || true
+      apt-get install -y curl wget >/dev/null 2>&1 || true
+    fi
+    return 0
+  }
+
+  _download_script() {
+    _ensure_downloader
+    if command -v curl >/dev/null 2>&1; then
+      curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
+    else
+      wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
+    fi
+    chmod +x "$script" >/dev/null 2>&1 || true
+    return 0
+  }
+
+  _restart_cron_service() {
+    # 尽量重启 cron/crond（不同发行版名字不同）
+    systemctl restart cron  >/dev/null 2>&1 && return 0
+    systemctl restart crond >/dev/null 2>&1 && return 0
+    service cron restart    >/dev/null 2>&1 && return 0
+    service crond restart   >/dev/null 2>&1 && return 0
+    /etc/init.d/cron restart  >/dev/null 2>&1 && return 0
+    /etc/init.d/crond restart >/dev/null 2>&1 && return 0
+    return 0
+  }
+
+  _install_cron_via_crontab() {
+    # 用临时文件安装，避免 crontab - 在某些环境/实现下出问题
+    local tmp
+    tmp="$(mktemp /tmp/sys_cle_cron.XXXXXX)" || return 1
+
+    # 取出现有 crontab，去掉包含 sys_cle 的行，追加新行
+    # 同时清理 CRLF（删掉 \r），避免 bad minute
+    {
+      crontab -l 2>/dev/null | tr -d '\r' | grep -Fv "/root/sys_cle.sh" || true
+      printf "%s\n" "$cron_line" | tr -d '\r'
+    } >"$tmp"
+
+    # 安装
+    if crontab "$tmp" >/dev/null 2>&1; then
+      rm -f "$tmp"
+      return 0
+    fi
+
+    # 失败时输出错误并返回失败
+    echo "WARN: 使用 crontab 安装失败，尝试降级到 /etc/cron.d ..."
+    crontab "$tmp" 2>&1 | sed 's/^/crontab: /' >&2 || true
+    rm -f "$tmp"
+    return 1
+  }
+
+  _remove_cron_via_crontab() {
+    local tmp
+    tmp="$(mktemp /tmp/sys_cle_cron.XXXXXX)" || return 1
+    crontab -l 2>/dev/null | tr -d '\r' | grep -Fv "/root/sys_cle.sh" >"$tmp" || true
+    crontab "$tmp" >/dev/null 2>&1 || true
+    rm -f "$tmp"
+    return 0
+  }
+
+  _install_cron_via_cron_d() {
+    # /etc/cron.d 方式（更通用/更稳）：需要 root 字段
+    cat >"$cron_d_file" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
+0 0 * * * root /bin/bash /root/sys_cle.sh >> /root/sys_cle.cron.log 2>&1
+EOF
+    chmod 644 "$cron_d_file" >/dev/null 2>&1 || true
+    _restart_cron_service
+    return 0
+  }
+
+  _remove_cron_via_cron_d() {
+    rm -f "$cron_d_file" >/dev/null 2>&1 || true
+    _restart_cron_service
+    return 0
+  }
+
+  _show_status() {
+    echo "---- crontab 中与 sys_cle 相关的条目 ----"
+    crontab -l 2>/dev/null | tr -d '\r' | grep -F "/root/sys_cle.sh" || echo "（crontab 未设置）"
+    echo ""
+    echo "---- /etc/cron.d/sys_cle ----"
+    if [ -f "$cron_d_file" ]; then
+      echo "存在：$cron_d_file"
+      sed 's/^/  /' "$cron_d_file"
+    else
+      echo "（不存在）"
+    fi
+  }
 
   # 1) 先下载/更新脚本
-  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
-    apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y curl wget >/dev/null 2>&1 || true
-  fi
-
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$script" || { echo "下载失败"; return 1; }
-  else
-    wget -qO "$script" "$url" || { echo "下载失败"; return 1; }
-  fi
-  chmod +x "$script" >/dev/null 2>&1 || true
+  _download_script || return 1
 
   # 2) 对话菜单
   echo ""
@@ -1584,22 +1671,25 @@ sys_cle() {
 
   case "$choice" in
     1)
-      # 去重后添加
-      ( crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" ; echo "$cron_line" ) | crontab -
-      echo "OK: 已添加每日 00:00 cron"
+      # 优先用 crontab 安装；失败则写 /etc/cron.d
+      if _install_cron_via_crontab; then
+        echo "OK: 已添加每日 00:00 cron（crontab）"
+      else
+        _install_cron_via_cron_d
+        echo "OK: 已添加每日 00:00 cron（/etc/cron.d 降级方案）"
+      fi
       ;;
     2)
-      # 删除包含 /root/sys_cle.sh 的行
-      crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" | crontab - 2>/dev/null || true
-      echo "OK: 已删除 sys_cle 的 cron"
+      _remove_cron_via_crontab
+      _remove_cron_via_cron_d
+      echo "OK: 已删除 sys_cle 的 cron（crontab + /etc/cron.d）"
       ;;
     3)
       /bin/bash "$script"
       echo "OK: 已执行一次清理"
       ;;
     4)
-      echo "当前 crontab 中与 sys_cle 相关的条目："
-      crontab -l 2>/dev/null | grep -F "/root/sys_cle.sh" || echo "（未设置）"
+      _show_status
       ;;
     0)
       echo "已退出"
@@ -1610,7 +1700,6 @@ sys_cle() {
       ;;
   esac
 }
-
 
 # -----------------------------
 #  参数修改
