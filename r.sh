@@ -1279,38 +1279,6 @@ firewall() {
 # -----------------------------
 #  BBR设置
 # -----------------------------
-bbrv3() {
-  if [[ ! -r /etc/os-release ]]; then
-    warn "无法判断系统类型"
-    return 1
-  fi
-  . /etc/os-release
-  if [[ "$ID" != "ubuntu" && "$ID" != "debian" ]]; then
-    warn "BBRv3（XanMod）仅支持 Debian/Ubuntu"
-    return 1
-  fi
-
-  apt_install_safe wget gnupg ca-certificates >/dev/null 2>&1 || true
-  wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes
-  echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' >/etc/apt/sources.list.d/xanmod-release.list
-
-  apt_update_safe || true
-
-  local version
-  version="$(wget -qO- https://dl.xanmod.org/check_x86-64_psabi.sh | bash 2>/dev/null | grep -oE 'x86-64-v[0-9]+' | head -n1 | sed 's/x86-64-v//')"
-  [[ -z "$version" ]] && version=3
-
-  apt_install_safe "linux-xanmod-x64v${version}" || { warn "安装 XanMod 内核失败"; return 1; }
-
-  cat >/etc/sysctl.d/99-bbr.conf <<'EOF'
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-  sysctl --system >/dev/null 2>&1 || true
-
-  ok "XanMod 内核已安装并写入 BBR 配置。请重启后生效。"
-}
-
 bbrx() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/tcpx.sh"
   local tmp="/tmp/tcpx.sh"
@@ -1717,13 +1685,12 @@ changeconf() {
     echo "6) 修改DNS"
     echo "7) 设置Swap缓存"
     echo "8) 设置IPv4/IPv6优先级"
-    echo "9) 安装BBR3"
-    echo "10) BBR/TCP 优化"
-    echo "11) 设置定时重启"
-    echo "12) 修改SSH端口2222"
-    echo "13) 设置ufw"
-    echo "14) 设置SSH秘钥"
-    echo "15) 设置系统清理"
+    echo "9) BBR/TCP 优化"
+    echo "10) 设置定时重启"
+    echo "11) 修改SSH端口2222"
+    echo "12) 设置ufw"
+    echo "13) 设置SSH秘钥"
+    echo "14) 设置系统清理"
     echo "0) 返回"
     echo "--------------------------------------------------"
     local c=""
@@ -1736,13 +1703,12 @@ changeconf() {
       6) set_dns_ui; pause ;;
       7) swap_cache; pause ;;
       8) set_ip_priority; pause ;;
-      9) bbrv3; pause ;;
-      10) bbrx; pause ;;
-      11) cron_reboot; pause ;;
-      12) ssh_port 2222; pause ;;
-      13) firewall; pause ;;
-      14) auth_key ;;
-      15) sys_cle ;;
+      9) bbrx; pause ;;
+      10) cron_reboot; pause ;;
+      11) ssh_port 2222; pause ;;
+      12) firewall; pause ;;
+      13) auth_key ;;
+      14) sys_cle ;;
       0) return 0 ;;
       *) error; pause ;;
     esac
