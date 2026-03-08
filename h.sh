@@ -1,4 +1,3 @@
-```bash
 #!/usr/bin/env bash
 # h.sh - Hysteria 2 installer + management script (optimized)
 # Main menu:
@@ -997,4 +996,3 @@ need_root
 detect_os
 ensure_curl
 menu
-```
