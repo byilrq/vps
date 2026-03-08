@@ -1,9 +1,12 @@
-#!/bin/bash
-# h.sh - Hysteria 2 installer + management script
+```bash
+#!/usr/bin/env bash
+# h.sh - Hysteria 2 installer + management script (optimized)
 # Main menu:
-# 1 Install, 2 Uninstall, 3 Start/Stop/Restart, 4 Modify Hysteria config, 5 System config (calls sys_conf.sh), etc.
+# 1 Install, 2 Uninstall, 3 Start/Stop/Restart, 4 Modify Hysteria config,
+# 5 System config (calls sys_conf.sh), etc.
 
 export LANG=en_US.UTF-8
+export DEBIAN_FRONTEND=noninteractive
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -26,7 +29,7 @@ need_root() {
 # Wait apt locks (Debian/Ubuntu)
 # -----------------------------
 wait_for_apt_lock() {
-  local max_attempts=60
+  local max_attempts=120
   local attempt=0
   while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
     if [ $attempt -ge $max_attempts ]; then
@@ -42,7 +45,7 @@ wait_for_apt_lock() {
 # -----------------------------
 # OS detect + package arrays
 # -----------------------------
-REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "'amazon linux'" "fedora")
+REGEX=("debian" "ubuntu" "centos|red hat|kernel|oracle linux|alma|rocky" "amazon linux" "fedora")
 RELEASE=("Debian" "Ubuntu" "CentOS" "CentOS" "Fedora")
 PACKAGE_UPDATE=("apt-get update -y" "apt-get update -y" "yum -y update" "yum -y update" "yum -y update")
 PACKAGE_INSTALL=("apt-get install -y" "apt-get install -y" "yum -y install" "yum -y install" "yum -y install")
@@ -80,10 +83,88 @@ ensure_curl() {
 }
 
 # -----------------------------
+# Package helpers
+# -----------------------------
+pkg_update() {
+  if command -v apt-get >/dev/null 2>&1; then
+    wait_for_apt_lock || true
+    timeout 300 apt-get update -y -o Dpkg::Use-Pty=0
+  elif command -v dnf >/dev/null 2>&1; then
+    timeout 300 dnf -y makecache
+  elif command -v yum >/dev/null 2>&1; then
+    timeout 300 yum -y makecache
+  else
+    return 1
+  fi
+}
+
+pkg_install() {
+  if command -v apt-get >/dev/null 2>&1; then
+    wait_for_apt_lock || true
+    timeout 600 apt-get install -y \
+      -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confnew" \
+      "$@"
+  elif command -v dnf >/dev/null 2>&1; then
+    timeout 600 dnf -y install "$@"
+  elif command -v yum >/dev/null 2>&1; then
+    timeout 600 yum -y install "$@"
+  else
+    return 1
+  fi
+}
+
+download_with_retry() {
+  local url="$1"
+  local out="$2"
+  local i
+  for i in 1 2 3; do
+    yellow "下载中（第 $i 次）：$url"
+    if curl -fsSL --connect-timeout 10 --max-time 120 "$url" -o "$out"; then
+      [[ -s "$out" ]] && return 0
+    fi
+    sleep 2
+  done
+  return 1
+}
+
+# -----------------------------
 # Real IP
 # -----------------------------
-realip(){
-  ip=$(curl -s4m8 ip.sb -k) || ip=$(curl -s6m8 ip.sb -k)
+realip() {
+  ip=$(curl -4fsS --max-time 8 ip.sb 2>/dev/null)
+  [[ -z "$ip" ]] && ip=$(curl -6fsS --max-time 8 ip.sb 2>/dev/null)
+  [[ -z "$ip" ]] && { red "获取本机公网 IP 失败"; return 1; }
+}
+
+# -----------------------------
+# Checkers
+# -----------------------------
+check_port_80_free() {
+  ! ss -lntp 2>/dev/null | grep -q ':80 '
+}
+
+check_domain_ready() {
+  local domain="$1"
+  local resolved_ip4 resolved_ip6
+  realip || return 1
+
+  resolved_ip4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')
+  resolved_ip6=$(getent ahostsv6 "$domain" 2>/dev/null | awk '{print $1; exit}')
+
+  if [[ "$ip" == *:* ]]; then
+    [[ -n "$resolved_ip6" && "$resolved_ip6" == "$ip" ]]
+  else
+    [[ -n "$resolved_ip4" && "$resolved_ip4" == "$ip" ]]
+  fi
+}
+
+save_firewall_rules() {
+  if command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save >/dev/null 2>&1 || true
+  elif command -v service >/dev/null 2>&1 && service iptables save >/dev/null 2>&1; then
+    true
+  fi
 }
 
 # -----------------------------
@@ -106,23 +187,19 @@ fix_hysteria_file_perms() {
 
   mkdir -p "$dir" >/dev/null 2>&1 || true
 
-  # Directory must be traversable by service group
   chown root:"$g" "$dir" 2>/dev/null || chown root:root "$dir"
   chmod 750 "$dir" 2>/dev/null || true
 
-  # Config readable by service group
   if [[ -f "$cfg" ]]; then
     chown root:"$g" "$cfg" 2>/dev/null || chown root:root "$cfg"
     chmod 640 "$cfg" 2>/dev/null || true
   fi
 
-  # Key readable by service group
   if [[ -f "$key" ]]; then
     chown root:"$g" "$key" 2>/dev/null || chown root:root "$key"
     chmod 640 "$key" 2>/dev/null || true
   fi
 
-  # Cert can be world-readable
   if [[ -f "$crt" ]]; then
     chown root:root "$crt" 2>/dev/null || true
     chmod 644 "$crt" 2>/dev/null || true
@@ -132,7 +209,7 @@ fix_hysteria_file_perms() {
 # -----------------------------
 # Cert install
 # -----------------------------
-inst_cert(){
+inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
   echo -e " ${GREEN}1.${PLAIN} 必应自签证书 ${YELLOW}（默认）${PLAIN}"
@@ -147,36 +224,55 @@ inst_cert(){
     cert_path="/etc/hysteria/cert.crt"
     key_path="/etc/hysteria/private.key"
 
-    # 如果已有证书且记录域名，直接复用
     if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f /etc/hysteria/ca.log ]]; then
       domain=$(cat /etc/hysteria/ca.log 2>/dev/null)
       [[ -n "$domain" ]] && green "检测到原有域名：$domain 的证书，正在应用"
       hy_domain="$domain"
     else
-      realip
+      realip || exit 1
       read -rp "请输入需要申请证书的域名: " domain
       [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
-      green "已输入的域名：$domain" && sleep 1
 
-      domainIP=$(curl -sm8 ipget.net/?ip="${domain}")
-      if [[ $domainIP != "$ip" ]]; then
-        red "当前域名解析的IP与当前VPS真实IP不匹配"
+      green "已输入的域名：$domain"
+      green "检查域名解析..."
+      check_domain_ready "$domain" || {
+        red "当前域名解析的 IP 与当前 VPS 真实 IP 不匹配"
         yellow "建议：关闭 Cloudflare 小云朵（仅DNS）、检查解析IP是否为真实IP。"
         exit 1
-      fi
+      }
 
-      ${PACKAGE_UPDATE[int]} >/dev/null 2>&1 || true
-      ${PACKAGE_INSTALL[int]} curl wget sudo socat openssl cron >/dev/null 2>&1 || true
+      green "检查 80 端口..."
+      check_port_80_free || {
+        red "80 端口被占用，acme standalone 模式会失败或长时间卡住"
+        yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
+        exit 1
+      }
 
-      curl https://get.acme.sh | sh -s email=$(date +%s%N | md5sum | cut -c 1-16)@gmail.com || { red "安装 acme.sh 失败"; exit 1; }
+      green "安装申请证书所需依赖..."
+      pkg_update >/dev/null 2>&1 || true
+      pkg_install curl wget sudo socat openssl cron >/dev/null 2>&1 || true
+
+      green "安装 acme.sh ..."
+      curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
+        red "安装 acme.sh 失败"
+        exit 1
+      }
+
       source ~/.bashrc >/dev/null 2>&1 || true
       bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
       bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
 
+      green "开始签发证书，这一步可能需要几十秒..."
       if [[ -n $(echo "$ip" | grep ":") ]]; then
-        bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure || { red "签发失败"; exit 1; }
+        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure || {
+          red "签发失败"
+          exit 1
+        }
       else
-        bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure || { red "签发失败"; exit 1; }
+        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure || {
+          red "签发失败"
+          exit 1
+        }
       fi
 
       bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
@@ -187,7 +283,7 @@ inst_cert(){
 
       if [[ -s "$cert_path" && -s "$key_path" ]]; then
         echo "$domain" > /etc/hysteria/ca.log
-        sed -i '/--cron/d' /etc/crontab >/dev/null 2>&1 || true
+        sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
         echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
 
         green "证书申请成功! 已保存到 /etc/hysteria/"
@@ -214,7 +310,10 @@ inst_cert(){
     key_path="/etc/hysteria/private.key"
 
     openssl ecparam -genkey -name prime256v1 -out "$key_path" || { red "生成私钥失败"; exit 1; }
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com" || { red "生成证书失败"; exit 1; }
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com" || {
+      red "生成证书失败"
+      exit 1
+    }
 
     hy_domain="www.bing.com"
     domain="www.bing.com"
@@ -224,7 +323,7 @@ inst_cert(){
 # -----------------------------
 # Port + hopping
 # -----------------------------
-inst_jump(){
+inst_jump() {
   green "Hysteria 2 端口使用模式如下："
   echo ""
   echo -e " ${GREEN}1.${PLAIN} 单端口 ${YELLOW}（默认）${PLAIN}"
@@ -244,7 +343,7 @@ inst_jump(){
 
     iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
     ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
-    netfilter-persistent save >/dev/null 2>&1 || true
+    save_firewall_rules
 
     green "已启用端口跳跃：$firstport-$endport -> $port"
   else
@@ -254,7 +353,7 @@ inst_jump(){
   fi
 }
 
-inst_port(){
+inst_port() {
   iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
   read -rp "设置 Hysteria 2 端口 [1-65535]（回车则随机分配端口）: " port
   [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
@@ -269,13 +368,13 @@ inst_port(){
   inst_jump
 }
 
-inst_pwd(){
+inst_pwd() {
   read -rp "设置 Hysteria 2 密码（回车随机）: " auth_pwd
   [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
   yellow "密码：$auth_pwd"
 }
 
-inst_site(){
+inst_site() {
   read -rp "请输入伪装网站地址（去除https://） [回车:video.unext.jp]: " proxysite
   [[ -z $proxysite ]] && proxysite="video.unext.jp"
   yellow "伪装站点：$proxysite"
@@ -284,35 +383,52 @@ inst_site(){
 # -----------------------------
 # Install Hysteria2
 # -----------------------------
-insthysteria(){
-  realip
+insthysteria() {
+  green "开始安装 Hysteria 2"
+  realip || return 1
 
-  if [[ "$SYSTEM" != "CentOS" ]]; then
-    wait_for_apt_lock || true
+  green "步骤 1/6：更新软件源"
+  pkg_update || { red "软件源更新失败"; return 1; }
+
+  green "步骤 2/6：安装依赖"
+  pkg_install curl wget sudo qrencode procps iptables openssl socat cron || {
+    red "依赖安装失败"
+    return 1
+  }
+
+  if command -v apt-get >/dev/null 2>&1; then
+    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+    pkg_install iptables-persistent netfilter-persistent >/dev/null 2>&1 || yellow "iptables-persistent/netfilter-persistent 安装失败，继续执行"
+  else
+    pkg_install iptables-services >/dev/null 2>&1 || true
   fi
-  ${PACKAGE_UPDATE[int]} || true
-  if [[ "$SYSTEM" != "CentOS" ]]; then
-    wait_for_apt_lock || true
-  fi
 
-  # Base deps (best-effort across distros)
-  ${PACKAGE_INSTALL[int]} curl wget sudo qrencode procps iptables >/dev/null 2>&1 || true
-  ${PACKAGE_INSTALL[int]} iptables-persistent netfilter-persistent >/dev/null 2>&1 || true
-
+  green "步骤 3/6：下载核心安装脚本"
   local url="https://raw.githubusercontent.com/byilrq/vps/main/install_h.sh"
-  wget -qO /tmp/install_h.sh "$url" || { red "下载 install_h.sh 失败"; exit 1; }
-  [[ -s /tmp/install_h.sh ]] || { red "install_h.sh 文件为空"; exit 1; }
-  bash /tmp/install_h.sh
+  download_with_retry "$url" /tmp/install_h.sh || {
+    red "下载 install_h.sh 失败"
+    return 1
+  }
+  [[ -s /tmp/install_h.sh ]] || { red "install_h.sh 文件为空"; return 1; }
+
+  green "步骤 4/6：执行安装脚本"
+  bash /tmp/install_h.sh | tee /tmp/install_h.log
   rm -f /tmp/install_h.sh
 
-  [[ -f "/usr/local/bin/hysteria" ]] || { red "Hysteria 2 安装失败！"; exit 1; }
+  [[ -f "/usr/local/bin/hysteria" ]] || {
+    red "Hysteria 2 安装失败！请查看 /tmp/install_h.log"
+    return 1
+  }
   green "Hysteria 2 安装成功！"
 
+  green "步骤 5/6：配置证书、端口、密码"
   inst_cert
   inst_port
   inst_pwd
   inst_site
 
+  green "步骤 6/6：写入配置并启动服务"
   mkdir -p /etc/hysteria /root/hy /var/lib/hysteria >/dev/null 2>&1 || true
 
   cat > /etc/hysteria/config.yaml <<EOF
@@ -344,14 +460,12 @@ masquerade:
     rewriteHost: true
 EOF
 
-  # IP for display + link
   if [[ -n $(echo "$ip" | grep ":") ]]; then
     last_ip="[$ip]"
   else
     last_ip="$ip"
   fi
 
-  # Client config: server uses the real listening port
   cat > /root/hy/hy-client.yaml <<EOF
 server: $last_ip:$port
 
@@ -380,7 +494,6 @@ transport:
     hopInterval: 15s
 EOF
 
-  # mport param: single or range
   if [[ -n "$firstport" && -n "$endport" ]]; then
     port_range="$firstport-$endport"
   else
@@ -390,7 +503,6 @@ EOF
   ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
   echo "$ur1" > /root/hy/ur1.txt
 
-  # IMPORTANT: ensure permissions for service user/group
   fix_hysteria_file_perms
 
   systemctl daemon-reload
@@ -420,21 +532,23 @@ EOF
 # -----------------------------
 # Uninstall / start / stop
 # -----------------------------
-unsthysteria(){
+unsthysteria() {
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   systemctl disable hysteria-server.service >/dev/null 2>&1 || true
   rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
-  rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh >/dev/null 2>&1 || true
+  rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
+  rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh /var/lib/hysteria >/dev/null 2>&1 || true
   iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
-  netfilter-persistent save >/dev/null 2>&1 || true
+  save_firewall_rules
+  systemctl daemon-reload >/dev/null 2>&1 || true
   green "Hysteria 2 已彻底卸载完成！"
   read -rp "回车返回菜单..." _
 }
 
-starthysteria(){ systemctl enable --now hysteria-server >/dev/null 2>&1 || systemctl start hysteria-server; }
-stophysteria(){ systemctl disable --now hysteria-server >/dev/null 2>&1 || systemctl stop hysteria-server; }
+starthysteria() { systemctl enable --now hysteria-server >/dev/null 2>&1 || systemctl start hysteria-server; }
+stophysteria() { systemctl disable --now hysteria-server >/dev/null 2>&1 || systemctl stop hysteria-server; }
 
-hysteriaswitch(){
+hysteriaswitch() {
   yellow "请选择你需要的操作："
   echo ""
   echo -e " ${GREEN}1.${PLAIN} 启动 Hysteria 2"
@@ -454,12 +568,12 @@ hysteriaswitch(){
 # -----------------------------
 # Show status / config
 # -----------------------------
-showstatus(){
+showstatus() {
   systemctl status hysteria-server.service --no-pager -l
   read -rp "回车返回菜单..." _
 }
 
-showconf(){
+showconf() {
   yellow "服务端配置 /etc/hysteria/config.yaml："
   green "$(cat /etc/hysteria/config.yaml 2>/dev/null)"
   yellow "客户端配置 /root/hy/hy-client.yaml："
@@ -474,7 +588,7 @@ showconf(){
 # -----------------------------
 # Hysteria config changes
 # -----------------------------
-changeport(){
+changeport() {
   local oldport
   oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
 
@@ -489,7 +603,13 @@ changeport(){
 
   sed -i "1s/:$oldport/:$port/g" /etc/hysteria/config.yaml 2>/dev/null || true
   sed -i "s/:$oldport/:$port/g" /root/hy/hy-client.yaml 2>/dev/null || true
-  [[ -f /root/hy/ur1.txt ]] && sed -i "s/:$oldport\/?/:$port\/?/g" /root/hy/ur1.txt 2>/dev/null || true
+
+  if [[ -f /root/hy/ur1.txt ]]; then
+    local current_link
+    current_link=$(cat /root/hy/ur1.txt 2>/dev/null)
+    current_link=$(echo "$current_link" | sed -E "s#(@[^:]+:)[0-9]+/#\1${port}/#")
+    echo "$current_link" > /root/hy/ur1.txt
+  fi
 
   fix_hysteria_file_perms
   systemctl restart hysteria-server.service >/dev/null 2>&1 || true
@@ -551,7 +671,7 @@ changepasswd() {
   showconf
 }
 
-change_cert(){
+change_cert() {
   local old_cert old_key old_hydomain
   old_cert=$(grep -E '^\s*cert:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_key=$(grep -E '^\s*key:'  /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
@@ -560,7 +680,7 @@ change_cert(){
   inst_cert
 
   [[ -n "$old_cert" ]] && sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
-  [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g"   /etc/hysteria/config.yaml
+  [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
   [[ -n "$old_hydomain" ]] && sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/hy-client.yaml
 
   fix_hysteria_file_perms
@@ -570,7 +690,7 @@ change_cert(){
   showconf
 }
 
-changeproxysite(){
+changeproxysite() {
   local oldproxysite
   oldproxysite=$(grep -E '^\s*url:\s*https://' /etc/hysteria/config.yaml 2>/dev/null | awk -F'https://' '{print $2}')
 
@@ -589,7 +709,7 @@ changeproxysite(){
   showconf
 }
 
-menu_hy_conf(){
+menu_hy_conf() {
   while true; do
     clear
     green "Hysteria 2 配置变更选择如下:"
@@ -615,7 +735,7 @@ menu_hy_conf(){
 # -----------------------------
 # Core updates / tools
 # -----------------------------
-update_core1(){
+update_core1() {
   green "官方更新方式必须先脚本安装后使用，否则会失败。"
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   rm -f /usr/local/bin/hysteria
@@ -626,10 +746,13 @@ update_core1(){
   read -rp "回车返回菜单..." _
 }
 
-update_core2(){
+update_core2() {
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   rm -f /usr/local/bin/hysteria
-  wget -qO /tmp/install_server.sh https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh || { red "下载失败"; return 1; }
+  download_with_retry "https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh" /tmp/install_server.sh || {
+    red "下载失败"
+    return 1
+  }
   [[ -s /tmp/install_server.sh ]] || { red "文件为空"; return 1; }
   bash /tmp/install_server.sh
   rm -f /tmp/install_server.sh
@@ -638,8 +761,8 @@ update_core2(){
   read -rp "回车返回菜单..." _
 }
 
-besttrace(){ wget -qO- git.io/besttrace | bash; read -rp "回车返回菜单..." _; }
-ipquality(){ curl -sL https://Check.Place | bash -s - -I; read -rp "回车返回菜单..." _; }
+besttrace() { wget -qO- git.io/besttrace | bash; read -rp "回车返回菜单..." _; }
+ipquality() { curl -sL https://Check.Place | bash -s - -I; read -rp "回车返回菜单..." _; }
 
 # -----------------------------
 # Full system info (NO simplification)
@@ -796,9 +919,9 @@ linux_ps() {
 linux_update() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
-    DEBIAN_FRONTEND=noninteractive apt-get update -y
+    DEBIAN_FRONTEND=noninteractive apt-get update -y -o Dpkg::Use-Pty=0
     wait_for_apt_lock || true
-    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y
+    DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Use-Pty=0
   elif command -v dnf >/dev/null 2>&1; then
     dnf -y update
   elif command -v yum >/dev/null 2>&1; then
@@ -817,7 +940,7 @@ linux_update() {
 run_sys_conf() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_conf.sh"
   local tmp="/tmp/sys_conf.sh"
-  wget -qO "$tmp" "$url" || { red "下载 sys_conf.sh 失败"; read -rp "回车返回..." _; return 1; }
+  download_with_retry "$url" "$tmp" || { red "下载 sys_conf.sh 失败"; read -rp "回车返回..." _; return 1; }
   [[ -s "$tmp" ]] || { red "sys_conf.sh 文件为空"; read -rp "回车返回..." _; return 1; }
   bash "$tmp"
 }
@@ -874,3 +997,4 @@ need_root
 detect_os
 ensure_curl
 menu
+```
