@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
-# h.sh - Hysteria 2 installer + management script (optimized)
-# Main menu:
-# 1 Install, 2 Uninstall, 3 Start/Stop/Restart, 4 Modify Hysteria config,
-# 5 System config (calls sys_conf.sh), etc.
+# h.sh - Hysteria 2 installer + management script (fixed)
 
-export LANG=en_US.UTF-8
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive
 
 RED="\033[31m"
@@ -59,6 +57,7 @@ CMD=(
 )
 
 detect_os() {
+  local i
   for i in "${CMD[@]}"; do
     SYS="$i" && [[ -n $SYS ]] && break
   done
@@ -133,7 +132,13 @@ download_with_retry() {
 realip() {
   ip=$(curl -4fsS --max-time 8 ip.sb 2>/dev/null)
   [[ -z "$ip" ]] && ip=$(curl -6fsS --max-time 8 ip.sb 2>/dev/null)
-  [[ -z "$ip" ]] && { red "获取本机公网 IP 失败"; return 1; }
+
+  if [[ -z "$ip" ]]; then
+    red "获取本机公网 IP 失败"
+    return 1
+  fi
+
+  return 0
 }
 
 # -----------------------------
@@ -146,6 +151,7 @@ check_port_80_free() {
 check_domain_ready() {
   local domain="$1"
   local resolved_ip4 resolved_ip6
+
   realip || return 1
 
   resolved_ip4=$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1; exit}')
@@ -161,8 +167,8 @@ check_domain_ready() {
 save_firewall_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     netfilter-persistent save >/dev/null 2>&1 || true
-  elif command -v service >/dev/null 2>&1 && service iptables save >/dev/null 2>&1; then
-    true
+  elif command -v service >/dev/null 2>&1; then
+    service iptables save >/dev/null 2>&1 || true
   fi
 }
 
@@ -249,7 +255,7 @@ inst_cert() {
 
       green "安装申请证书所需依赖..."
       pkg_update >/dev/null 2>&1 || true
-      pkg_install curl wget sudo socat openssl cron >/dev/null 2>&1 || true
+      pkg_install curl wget sudo socat openssl >/dev/null 2>&1 || true
 
       green "安装 acme.sh ..."
       curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
@@ -282,8 +288,10 @@ inst_cert() {
 
       if [[ -s "$cert_path" && -s "$key_path" ]]; then
         echo "$domain" > /etc/hysteria/ca.log
-        sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
-        echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
+        if [[ -f /etc/crontab ]]; then
+          sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
+          echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
+        fi
 
         green "证书申请成功! 已保存到 /etc/hysteria/"
         yellow "证书路径: $cert_path"
@@ -384,20 +392,23 @@ inst_site() {
 # -----------------------------
 insthysteria() {
   green "开始安装 Hysteria 2"
+
   realip || return 1
 
   green "步骤 1/6：更新软件源"
   pkg_update || { red "软件源更新失败"; return 1; }
 
   green "步骤 2/6：安装依赖"
-  pkg_install curl wget sudo qrencode procps iptables openssl socat cron || {
+  pkg_install curl wget sudo qrencode procps iptables openssl socat || {
     red "依赖安装失败"
     return 1
   }
 
   if command -v apt-get >/dev/null 2>&1; then
-    echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
-    echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+    command -v debconf-set-selections >/dev/null 2>&1 && {
+      echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
+      echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
+    }
     pkg_install iptables-persistent netfilter-persistent >/dev/null 2>&1 || yellow "iptables-persistent/netfilter-persistent 安装失败，继续执行"
   else
     pkg_install iptables-services >/dev/null 2>&1 || true
@@ -764,7 +775,7 @@ besttrace() { wget -qO- git.io/besttrace | bash; read -rp "回车返回菜单...
 ipquality() { curl -sL https://Check.Place | bash -s - -I; read -rp "回车返回菜单..." _; }
 
 # -----------------------------
-# Full system info (NO simplification)
+# Full system info
 # -----------------------------
 linux_ps() {
   clear
