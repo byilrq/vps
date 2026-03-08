@@ -5,3 +5,4 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main
 
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/r.sh && bash r.sh
 
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/s.sh && bash s.sh
