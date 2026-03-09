@@ -18,9 +18,12 @@ bold='\033[1m'
 dim='\033[2m'
 gray='\033[90m'
 
-CONFIG="/usr/local/etc/xray/config.json"
-SERVICE="xray"
-INFO_FILE="$HOME/_vless_reality_url_"
+CONFIG="/etc/sing-box/config.json"
+SERVICE="sing-box"
+INFO_FILE="$HOME/_singbox_vless_reality_url_"
+CACHE_FILE="/etc/sing-box/.config_cache"
+REALITY_PUB_FILE="/etc/sing-box/.reality_pub"
+PROTOCOL_FILE="/etc/sing-box/.protocols"
 SOURCES_LIST="/etc/apt/sources.list"
 SOURCES_BAK="/etc/apt/sources.list.bak.xray_reality"
 # 与你原来打印保持一致（可自行改）
@@ -67,62 +70,131 @@ read_tty() {
 }
 
 # ============================================================
-#  Xray 安装版本选择（必须在 install_xray 前定义）
+#  Sing-box / 系统检测 / 版本检测
 # ============================================================
-get_latest_xray_version() {
-  # 需要 curl + jq
-  local tag=""
-  tag="$(curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-    | jq -r '.tag_name // empty' 2>/dev/null || true)"
-  if [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$tag"
-    return 0
+detect_os() {
+  if [[ -f /etc/os-release ]]; then
+    . /etc/os-release
+    OS_ID="${ID:-}"
+    OS_ID_LIKE="${ID_LIKE:-}"
+  else
+    OS_ID=""
+    OS_ID_LIKE=""
+  fi
+
+  if echo "$OS_ID $OS_ID_LIKE" | grep -qi "alpine"; then
+    OS="alpine"
+  elif echo "$OS_ID $OS_ID_LIKE" | grep -Eqi "debian|ubuntu"; then
+    OS="debian"
+  elif echo "$OS_ID $OS_ID_LIKE" | grep -Eqi "centos|rhel|fedora"; then
+    OS="redhat"
+  else
+    OS="unknown"
+  fi
+}
+
+detect_os
+
+get_current_singbox_version() {
+  local cur_raw="" cur_ver=""
+  if command -v sing-box >/dev/null 2>&1; then
+    cur_raw="$(sing-box version 2>/dev/null | head -n1 || true)"
+    cur_ver="$(echo "$cur_raw" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+    [[ -n "$cur_ver" && "$cur_ver" != v* ]] && cur_ver="v${cur_ver}"
+    [[ -n "$cur_ver" ]] && { echo "$cur_ver"; return 0; }
   fi
   return 1
 }
 
-choose_xray_version() {
-  local default_ver="${1:-v25.10.15}"
-  local chosen="" latest=""
+get_latest_singbox_version() {
+  local tag=""
+  tag="$(curl -fsSL "https://api.github.com/repos/SagerNet/sing-box/releases/latest" 2>/dev/null | jq -r '.tag_name // empty' 2>/dev/null || true)"
+  [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  echo "$tag"
+}
 
-  # 非交互（比如被管道/后台跑），直接默认
-  if [[ ! -r /dev/tty || ! -w /dev/tty ]]; then
-    echo "$default_ver"
-    return 0
-  fi
+show_singbox_version_hint() {
+  local cur="未安装" latest="获取失败"
+  cur="$(get_current_singbox_version 2>/dev/null || echo '未安装')"
+  latest="$(get_latest_singbox_version 2>/dev/null || echo '获取失败')"
+  echo -e "${yellow}当前版本：${cyan}${cur}${none}"
+  echo -e "${yellow}GitHub 最新：${cyan}${latest}${none}"
+}
 
-  latest="$(get_latest_xray_version 2>/dev/null || true)"
-  if [[ -n "$latest" ]]; then
-    echo -e "${yellow}检测到最新 Release：${cyan}${latest}${none}" > /dev/tty
-  else
-    echo -e "${yellow}未能获取最新 Release（将使用默认/手动输入）${none}" > /dev/tty
-  fi
+install_base_deps() {
+  case "$OS" in
+    alpine)
+      apk update || { warn "apk update 失败"; return 1; }
+      apk add --no-cache bash curl ca-certificates openssl openrc jq wget sudo qrencode net-tools lsof xxd || return 1
+      ;;
+    debian)
+      if declare -F apt_update_safe >/dev/null 2>&1; then
+        apt_update_safe || return 1
+        apt_install_safe curl wget sudo jq net-tools lsof qrencode openssl xxd ca-certificates || return 1
+      else
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y || return 1
+        apt-get install -y curl wget sudo jq net-tools lsof qrencode openssl xxd ca-certificates || return 1
+      fi
+      ;;
+    redhat)
+      yum install -y curl wget sudo jq net-tools lsof qrencode openssl which xxd ca-certificates || return 1
+      ;;
+    *)
+      warn "未识别系统，尝试继续。"
+      ;;
+  esac
+}
 
-  read_tty "安装版本（回车默认 ${default_ver} / 输入 latest 安装最新 / 或输入如 v25.10.15）: " chosen
-  chosen="$(echo -n "$chosen" | tr -d '\n\r[:space:]')"
+service_start() {
+  case "$OS" in
+    alpine) rc-service "$SERVICE" start ;;
+    *) systemctl start "$SERVICE" ;;
+  esac
+}
+service_stop() {
+  case "$OS" in
+    alpine) rc-service "$SERVICE" stop ;;
+    *) systemctl stop "$SERVICE" ;;
+  esac
+}
+service_restart() {
+  case "$OS" in
+    alpine) rc-service "$SERVICE" restart ;;
+    *) systemctl daemon-reload >/dev/null 2>&1 || true; systemctl restart "$SERVICE" ;;
+  esac
+}
+service_status() {
+  case "$OS" in
+    alpine) rc-service "$SERVICE" status ;;
+    *) systemctl status "$SERVICE" --no-pager -l ;;
+  esac
+}
 
-  if [[ -z "$chosen" ]]; then
-    echo "$default_ver"
-    return 0
-  fi
+install_or_update_singbox_backend() {
+  local mode="${1:-install}"
+  detect_os
+  install_base_deps || return 1
 
-  if [[ "$chosen" == "latest" ]]; then
-    if [[ -n "$latest" ]]; then
-      echo "$latest"
-      return 0
-    fi
-    warn "获取最新版本失败，回退到默认 ${default_ver}"
-    echo "$default_ver"
-    return 0
-  fi
+  case "$OS" in
+    alpine)
+      if [[ "$mode" == "update" ]]; then
+        apk update && apk upgrade sing-box || apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || return 1
+      else
+        apk update || return 1
+        apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || return 1
+      fi
+      ;;
+    debian|redhat)
+      bash <(curl -fsSL https://sing-box.app/install.sh) || return 1
+      ;;
+    *)
+      warn "未支持的系统，无法安装 sing-box"
+      return 1
+      ;;
+  esac
 
-  if [[ "$chosen" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-    echo "$chosen"
-    return 0
-  fi
-
-  warn "版本格式不合法：${chosen}（应为 latest 或 vX.Y.Z），回退默认 ${default_ver}"
-  echo "$default_ver"
+  command -v sing-box >/dev/null 2>&1 || { warn "安装后未找到 sing-box 可执行文件"; return 1; }
 }
 
 # -----------------------------
@@ -238,43 +310,15 @@ apt_install_safe() { wait_apt_lock; DEBIAN_FRONTEND=noninteractive apt-get -y in
 #  更新内核
 # -----------------------------
 update_xray_reality() {
-  echo -e "${yellow}开始更新 Xray Reality...${none}"
-
-  if ! apt_update_safe; then
-    warn "APT update 失败：请先修复 sources.list 再运行脚本。"
+  echo -e "${yellow}开始更新 sing-box VLESS Reality...${none}"
+  show_singbox_version_hint
+  if ! install_or_update_singbox_backend update; then
+    warn "sing-box 更新失败。"
     return 1
   fi
-
-  # 更新需要的基础命令
-  apt_install_safe curl wget sudo jq >/dev/null 2>&1 || true
-
-  local XRAY_VER
-  XRAY_VER="$(choose_xray_version "v25.10.15")"
-
-  echo -e "${yellow}将更新到版本：${cyan}${XRAY_VER}${none}"
-  echo -e "${yellow}（更新不会修改你的配置文件：${cyan}${CONFIG}${none}）${none}"
-
-  # 更新 core
-  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "${XRAY_VER}"
-
-  # 更新 geodata
-  bash -c "$(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata
-
-  # 重启服务
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE" >/dev/null 2>&1 || service "$SERVICE" restart || true
-
-  echo ""
-  ok "更新完成。当前版本："
-  if command -v xray >/dev/null 2>&1; then
-    xray version 2>/dev/null || xray --version 2>/dev/null || true
-  else
-    warn "未找到 xray 命令（可能安装路径异常）"
-  fi
-
-  echo ""
-  echo -e "${yellow}服务状态：${none}"
-  systemctl status "$SERVICE" --no-pager -l 2>/dev/null || service "$SERVICE" status || true
+  echo
+  show_singbox_version_hint
+  ok "sing-box 更新完成。"
 }
 
 # -----------------------------
@@ -293,23 +337,26 @@ get_public_ips() {
 
 
 # -----------------------------
-#  读取配置（只读 inbounds）
+#  读取配置（sing-box VLESS Reality）
 # -----------------------------
 read_current_config() {
-  port=""; uuid=""; private_key=""; shortid=""; domain=""
+  port=""; uuid=""; private_key=""; public_key=""; shortid=""; domain=""; custom_ip=""; node_suffix=""
   [[ -f "$CONFIG" ]] || return 1
-  local block
-  block="$(awk '
-    BEGIN{p=0}
-    /"inbounds"[[:space:]]*:/ {p=1}
-    p==1 {print}
-    /"outbounds"[[:space:]]*:/ {exit}
-  ' "$CONFIG")"
-  port="$(echo "$block" | grep -oP '"port"\s*:\s*\K[0-9]+' | head -n1 || true)"
-  uuid="$(echo "$block" | grep -oP '"id"\s*:\s*"\K[^"]+' | head -n1 || true)"
-  private_key="$(echo "$block" | grep -oP '"privateKey"\s*:\s*"\K[^"]+' | head -n1 || true)"
-  shortid="$(echo "$block" | grep -oP '"shortIds"\s*:\s*\[\s*"\K[^"]+' | head -n1 || true)"
-  domain="$(echo "$block" | grep -oP '"serverNames"\s*:\s*\[\s*"\K[^"]+' | head -n1 || true)"
+  need_cmd jq >/dev/null 2>&1 || return 1
+
+  port="$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .listen_port // empty' "$CONFIG" | head -n1)"
+  uuid="$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .users[0].uuid // empty' "$CONFIG" | head -n1)"
+  private_key="$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .tls.reality.private_key // empty' "$CONFIG" | head -n1)"
+  shortid="$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .tls.reality.short_id[0] // empty' "$CONFIG" | head -n1)"
+  domain="$(jq -r '.inbounds[] | select(.type=="vless" and .tls.reality.enabled==true) | .tls.server_name // empty' "$CONFIG" | head -n1)"
+  if [[ -f "$REALITY_PUB_FILE" ]]; then
+    public_key="$(tr -d $'\r\n[:space:]' < "$REALITY_PUB_FILE" 2>/dev/null || true)"
+  fi
+  if [[ -f "$CACHE_FILE" ]]; then
+    custom_ip="$(grep -E '^CUSTOM_IP=' "$CACHE_FILE" | tail -n1 | cut -d= -f2- || true)"
+    node_suffix="$(grep -E '^NODE_SUFFIX=' "$CACHE_FILE" | tail -n1 | cut -d= -f2- || true)"
+    [[ -z "$public_key" ]] && public_key="$(grep -E '^REALITY_PUB=' "$CACHE_FILE" | tail -n1 | cut -d= -f2- || true)"
+  fi
   [[ -n "$port" && -n "$uuid" && -n "$private_key" && -n "$shortid" && -n "$domain" ]]
 }
 
@@ -403,82 +450,133 @@ generate_keys() {
   echo "${priv_b64url}|${pub_b64url}"
 }
 
+generate_reality_keypair() {
+  if command -v sing-box >/dev/null 2>&1; then
+    local out priv pub
+    out="$(sing-box generate reality-keypair 2>/dev/null || true)"
+    priv="$(echo "$out" | awk '/PrivateKey/ {print $NF; exit}')"
+    pub="$(echo "$out" | awk '/PublicKey/ {print $NF; exit}')"
+    if [[ -n "$priv" && -n "$pub" ]]; then
+      echo "${priv}|${pub}"
+      return 0
+    fi
+  fi
+  generate_keys
+}
+
 # -----------------------------
-#  写入配置并重启（合法 JSON）
+#  写入配置并重启（sing-box VLESS Reality）
 # -----------------------------
 write_config_and_restart() {
   local port="$1" uuid="$2" private_key="$3" shortid="$4" domain="$5"
-
-  private_key="$(echo -n "$private_key" | tr -d '\n\r[:space:]' | sed 's/\x1b\[[0-9;]*m//g')"
-  if ! is_b64url_key "$private_key"; then
-    warn "privateKey 格式不合法（必须是 Base64URL 43/44 字符）。"
-    return 1
-  fi
+  local public_key="${6:-}"
+  local custom_ip_in="${7:-${custom_ip:-}}"
+  local node_suffix_in="${8:-${node_suffix:-}}"
 
   mkdir -p "$(dirname "$CONFIG")"
-  cat > "$CONFIG" <<-EOF
+  mkdir -p /etc/sing-box
+
+  cat > "$CONFIG" <<EOF
 {
   "log": {
-    "access": "/var/log/xray/access.log",
-    "error": "/var/log/xray/error.log",
-    "loglevel": "warning"
+    "level": "warn",
+    "timestamp": true
   },
   "inbounds": [
     {
-      "listen": "0.0.0.0",
-      "port": ${port},
-      "protocol": "vless",
-      "settings": {
-        "clients": [
-          { "id": "${uuid}", "flow": "${FLOW}" }
-        ],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "${NETWORK}",
-        "security": "reality",
-        "realitySettings": {
-          "show": false,
-          "dest": "${domain}:443",
-          "xver": 0,
-          "serverNames": ["${domain}"],
-          "privateKey": "${private_key}",
-          "shortIds": ["${shortid}"]
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": ${port},
+      "users": [
+        {
+          "uuid": "${uuid}",
+          "flow": "${FLOW}"
         }
-      },
-      "sniffing": { "enabled": true, "destOverride": ["http", "tls", "quic"] }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${domain}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${domain}",
+            "server_port": 443
+          },
+          "private_key": "${private_key}",
+          "short_id": ["${shortid}"]
+        }
+      }
     }
   ],
   "outbounds": [
-    { "protocol": "freedom", "tag": "direct" },
-    { "protocol": "freedom", "settings": { "domainStrategy": "UseIPv4" }, "tag": "force-ipv4" },
-    { "protocol": "freedom", "settings": { "domainStrategy": "UseIPv6" }, "tag": "force-ipv6" },
     {
-      "protocol": "socks",
-      "settings": { "servers": [ { "address": "127.0.0.1", "port": 40000 } ] },
-      "tag": "socks5-warp"
-    },
-    { "protocol": "blackhole", "tag": "block" }
-  ],
-  "dns": {
-    "servers": [
-      "8.8.8.8",
-      "1.1.1.1",
-      "2001:4860:4860::8888",
-      "2606:4700:4700::1111",
-      "localhost"
-    ]
-  },
-  "routing": {
-    "domainStrategy": "IPIfNonMatch",
-    "rules": [
-      { "type": "field", "ip": ["geoip:private"], "outboundTag": "block" }
-    ]
-  }
+      "type": "direct",
+      "tag": "direct-out"
+    }
+  ]
 }
 EOF
-  systemctl daemon-reload >/dev/null 2>&1 || true
-  systemctl restart "$SERVICE" >/dev/null 2>&1 || service "$SERVICE" restart
+
+  echo -n "$public_key" > "$REALITY_PUB_FILE"
+  cat > "$CACHE_FILE" <<EOF
+ENABLE_REALITY=true
+REALITY_PORT=${port}
+REALITY_UUID=${uuid}
+REALITY_PK=${private_key}
+REALITY_PUB=${public_key}
+REALITY_SID=${shortid}
+REALITY_SNI=${domain}
+CUSTOM_IP=${custom_ip_in}
+NODE_SUFFIX=${node_suffix_in}
+EOF
+  echo 'ENABLE_REALITY=true' > "$PROTOCOL_FILE"
+
+  if [[ "$OS" == "alpine" ]]; then
+    cat > /etc/init.d/sing-box <<'OPENRC'
+#!/sbin/openrc-run
+name="sing-box"
+command="/usr/bin/sing-box"
+command_args="run -c /etc/sing-box/config.json"
+command_background="yes"
+pidfile="/run/sing-box.pid"
+supervisor=supervise-daemon
+supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
+
+depend() { need net; }
+OPENRC
+    chmod +x /etc/init.d/sing-box
+    rc-update add sing-box default >/dev/null 2>&1 || true
+  else
+    cat > /etc/systemd/system/sing-box.service <<'SYSTEMD'
+[Unit]
+Description=Sing-box Proxy Server
+Documentation=https://sing-box.sagernet.org
+After=network.target nss-lookup.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/etc/sing-box
+ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=10s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+SYSTEMD
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl enable sing-box >/dev/null 2>&1 || true
+  fi
+
+  if command -v sing-box >/dev/null 2>&1; then
+    sing-box check -c "$CONFIG" >/dev/null 2>&1 || warn "配置校验失败，但仍尝试重启服务。"
+  fi
+
+  service_restart >/dev/null 2>&1 || service_restart || true
 }
 
 # -----------------------------
@@ -555,7 +653,7 @@ input_shortid() {
 
 input_domain() {
   local out=""
-  local def="https://roadtrippers.com/"
+  local def="www.japan.travel"
   while :; do
     read_tty "SNI（回车默认 ${def}）: " out
     if [[ -z "${out}" ]]; then
@@ -572,10 +670,131 @@ input_domain() {
       return 0
     fi
     error
-    echo -e "${yellow}域名示例：https://roadtrippers.com/${none}"
+    echo -e "${yellow}域名示例：www.japan.travel${none}"
   done
 }
+# -----------------------------
+#  域名合理性检测
+# -----------------------------
+detect_reality_target() {
+  local domain=""
+  local out=""
+  local proto=""
+  local alpn=""
+  local http_code=""
+  local server_hdr=""
+  local via_hdr=""
+  local location_hdr=""
+  local connect_t=""
+  local tls_t=""
+  local ttfb_t=""
+  local total_t=""
+  local ok_tls13="no"
+  local ok_h2="no"
+  local score=0
 
+  echo
+  read_tty "请输入要检测的目标域名（如 www.yahoo.co.jp）: " domain
+  domain="$(echo -n "$domain" | tr -d '\r\n[:space:]')"
+
+  if [[ -z "$domain" ]]; then
+    warn "域名不能为空。"
+    return 1
+  fi
+
+  if ! is_domain_like "$domain"; then
+    warn "域名格式不合法：${domain}"
+    return 1
+  fi
+
+  if ! need_cmd curl || ! need_cmd openssl; then
+    warn "缺少 curl 或 openssl，无法检测。"
+    return 1
+  fi
+
+  echo
+  echo -e "${cyan}${bold}══════════════════════════════════════════${none}"
+  echo -e "${cyan}${bold}   REALITY 目标站检测: ${domain}${none}"
+  echo -e "${cyan}${bold}══════════════════════════════════════════${none}"
+
+  echo
+  echo -e "${yellow}[1/4] TLS 1.3 + ALPN(h2) 握手检测...${none}"
+  out="$(openssl s_client -connect "${domain}:443" -servername "${domain}" -tls1_3 -alpn h2 </dev/null 2>/dev/null || true)"
+
+  proto="$(printf '%s\n' "$out" | awk -F': ' '/Protocol/ {print $2; exit}')"
+  alpn="$(printf '%s\n' "$out" | awk -F': ' '/ALPN protocol/ {print $2; exit}')"
+
+  if [[ -n "$out" ]]; then
+    if printf '%s\n' "$out" | grep -q 'TLSv1.3'; then
+      ok_tls13="yes"
+      score=$((score + 1))
+    fi
+    if [[ "$alpn" == "h2" ]]; then
+      ok_h2="yes"
+      score=$((score + 1))
+    fi
+  fi
+
+  echo -e "  TLS 1.3: ${cyan}${ok_tls13}${none}"
+  echo -e "  ALPN(h2): ${cyan}${ok_h2}${none}"
+  [[ -n "$proto" ]] && echo -e "  Protocol: ${cyan}${proto}${none}"
+  [[ -n "$alpn"  ]] && echo -e "  ALPN: ${cyan}${alpn}${none}"
+
+  echo
+  echo -e "${yellow}[2/4] HTTP/2 响应头检测...${none}"
+  out="$(curl -I --http2 --tlsv1.3 -sS "https://${domain}/" 2>/dev/null || true)"
+  http_code="$(printf '%s\n' "$out" | awk 'toupper($1) ~ /^HTTP\/2$/ {print $2; exit}')"
+  server_hdr="$(printf '%s\n' "$out" | awk 'BEGIN{IGNORECASE=1} /^server:/ {sub(/\r$/,""); print substr($0,9); exit}')"
+  via_hdr="$(printf '%s\n' "$out" | awk 'BEGIN{IGNORECASE=1} /^via:/ {sub(/\r$/,""); print substr($0,6); exit}')"
+  location_hdr="$(printf '%s\n' "$out" | awk 'BEGIN{IGNORECASE=1} /^location:/ {sub(/\r$/,""); print substr($0,11); exit}')"
+
+  [[ -n "$http_code" ]] && echo -e "  HTTP 状态: ${cyan}${http_code}${none}" || echo -e "  HTTP 状态: ${red}获取失败${none}"
+  [[ -n "$server_hdr" ]] && echo -e "  Server: ${cyan}${server_hdr}${none}"
+  [[ -n "$via_hdr" ]] && echo -e "  Via/CDN: ${cyan}${via_hdr}${none}"
+  [[ -n "$location_hdr" ]] && echo -e "  Location: ${cyan}${location_hdr}${none}"
+
+  echo
+  echo -e "${yellow}[3/4] 单次时延检测...${none}"
+  out="$(curl -o /dev/null -s --http2 --tlsv1.3 \
+    -w 'connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}' \
+    "https://${domain}/" 2>/dev/null || true)"
+  echo -e "  ${cyan}${out}${none}"
+
+  connect_t="$(printf '%s\n' "$out" | sed -n 's/.*connect=\([0-9.]*\).*/\1/p')"
+  tls_t="$(printf '%s\n' "$out" | sed -n 's/.*tls=\([0-9.]*\).*/\1/p')"
+  ttfb_t="$(printf '%s\n' "$out" | sed -n 's/.*ttfb=\([0-9.]*\).*/\1/p')"
+  total_t="$(printf '%s\n' "$out" | sed -n 's/.*total=\([0-9.]*\).*/\1/p')"
+
+  echo
+  echo -e "${yellow}[4/4] 连续 3 次稳定性测试...${none}"
+  local i
+  for i in 1 2 3; do
+    out="$(curl -o /dev/null -s --http2 --tlsv1.3 \
+      -w "第${i}次: connect=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total}" \
+      "https://${domain}/" 2>/dev/null || true)"
+    echo -e "  ${cyan}${out}${none}"
+  done
+
+  echo
+  echo -e "${yellow}结论：${none}"
+  if [[ "$ok_tls13" == "yes" && "$ok_h2" == "yes" ]]; then
+    score=$((score + 1))
+    if awk "BEGIN{exit !(${total_t:-9} < 0.20)}"; then
+      echo -e "  ${green}适合做 REALITY 候选目标站${none}"
+      echo -e "  ${green}理由：TLS 1.3 正常、h2 正常、总耗时较低。${none}"
+    elif awk "BEGIN{exit !(${total_t:-9} < 0.50)}"; then
+      echo -e "  ${yellow}可以作为 REALITY 候选，但不算特别优秀${none}"
+      echo -e "  ${yellow}理由：TLS 1.3 / h2 正常，但时延表现一般。${none}"
+    else
+      echo -e "  ${yellow}协议层合格，但延迟偏高，建议再对比其他站点${none}"
+    fi
+  else
+    echo -e "  ${red}不推荐作为 REALITY 目标站${none}"
+    echo -e "  ${red}原因：TLS 1.3 或 h2 不满足。${none}"
+  fi
+
+  echo
+}
 # -----------------------------
 #  全量打印 + vless URL + QR
 # -----------------------------
@@ -585,36 +804,26 @@ print_full_info_and_qr() {
     return 1
   fi
   if ! command -v qrencode >/dev/null 2>&1; then
-    if ! apt_update_safe; then
-      warn "APT update 失败，无法安装 qrencode"
-      return 1
-    fi
-    apt_install_safe qrencode
-  fi
-
-  private_key="$(echo -n "$private_key" | tr -d '\n\r[:space:]' | sed 's/\x1b\[[0-9;]*m//g')"
-
-  local public_key
-  public_key="$(calc_public_from_private "${private_key}" 2>/dev/null || true)"
-  if [[ -z "${public_key}" ]]; then
-    warn "私钥无法计算出公钥（私钥可能被污染/长度不对）。请重新生成密钥对。"
-    return 1
+    install_base_deps >/dev/null 2>&1 || true
   fi
 
   get_public_ips
-  local ip netstack show_ip
-  if [[ -n "${IPv4}" ]]; then netstack=4; ip="${IPv4}"
-  elif [[ -n "${IPv6}" ]]; then netstack=6; ip="${IPv6}"
-  else netstack=4; ip="YOUR_SERVER_IP"
+  local ip show_ip
+  ip="${custom_ip:-}"
+  if [[ -z "$ip" ]]; then
+    if [[ -n "${IPv4}" ]]; then ip="${IPv4}"
+    elif [[ -n "${IPv6}" ]]; then ip="${IPv6}"
+    else ip="YOUR_SERVER_IP"
+    fi
   fi
-  show_ip="${ip}"
-  [[ "${netstack}" == "6" ]] && show_ip="[${ip}]"
+  show_ip="$ip"
+  [[ "$ip" == *:* && "$ip" != \[*\] ]] && show_ip="[$ip]"
 
-  local vless
-  vless="vless://${uuid}@${show_ip}:${port}?flow=${FLOW}&encryption=${ENCRYPTION}&type=${NETWORK}&security=reality&sni=${domain}&fp=${FINGERPRINT}&pbk=${public_key}&sid=${shortid}&spx=${SPIDERX}#R_${show_ip}"
+  local tag="#reality${node_suffix:-}"
+  local vless="vless://${uuid}@${show_ip}:${port}?encryption=${ENCRYPTION}&flow=${FLOW}&security=reality&sni=${domain}&fp=${FINGERPRINT}&pbk=${public_key}&sid=${shortid}${tag}"
 
   echo
-  echo "---------- Xray 配置信息 -------------"
+  echo "---------- Sing-box 配置信息 -------------"
   echo -e "${green} ---提示..这是 VLESS Reality 服务器配置--- ${none}"
   echo -e "${yellow} 地址 (Address) = ${cyan}${ip}${none}"
   echo -e "${yellow} 端口 (Port) = ${cyan}${port}${none}"
@@ -622,22 +831,22 @@ print_full_info_and_qr() {
   echo -e "${yellow} 流控 (Flow) = ${cyan}${FLOW}${none}"
   echo -e "${yellow} 加密 (Encryption) = ${cyan}${ENCRYPTION}${none}"
   echo -e "${yellow} 传输协议 (Network) = ${cyan}${NETWORK}${none}"
-  echo -e "${yellow} 伪装类型 (header type) = ${cyan}${HEADER_TYPE}${none}"
   echo -e "${yellow} 底层传输安全 (TLS) = ${cyan}${TLS_MODE}${none}"
   echo -e "${yellow} SNI = ${cyan}${domain}${none}"
   echo -e "${yellow} 指纹 (Fingerprint) = ${cyan}${FINGERPRINT}${none}"
   echo -e "${yellow} 公钥 (PublicKey) = ${cyan}${public_key}${none}"
   echo -e "${yellow} ShortId = ${cyan}${shortid}${none}"
-  echo -e "${yellow} SpiderX = ${cyan}${SPIDERX}${none}"
   echo
   echo "---------- VLESS Reality URL ----------"
   echo -e "${cyan}${vless}${none}"
   echo
-  echo "二维码（UTF8）"
-  qrencode -t UTF8 "${vless}"
+  if command -v qrencode >/dev/null 2>&1; then
+    echo "二维码（UTF8）"
+    qrencode -t UTF8 "${vless}"
+  fi
 
   {
-    echo "---------- Xray 配置信息 -------------"
+    echo "---------- Sing-box 配置信息 -------------"
     echo " ---提示..这是 VLESS Reality 服务器配置--- "
     echo " 地址 (Address) = ${ip}"
     echo " 端口 (Port) = ${port}"
@@ -645,19 +854,19 @@ print_full_info_and_qr() {
     echo " 流控 (Flow) = ${FLOW}"
     echo " 加密 (Encryption) = ${ENCRYPTION}"
     echo " 传输协议 (Network) = ${NETWORK}"
-    echo " 伪装类型 (header type) = ${HEADER_TYPE}"
     echo " 底层传输安全 (TLS) = ${TLS_MODE}"
     echo " SNI = ${domain}"
     echo " 指纹 (Fingerprint) = ${FINGERPRINT}"
     echo " 公钥 (PublicKey) = ${public_key}"
     echo " ShortId = ${shortid}"
-    echo " SpiderX = ${SPIDERX}"
     echo
     echo "---------- VLESS Reality URL ----------"
     echo "${vless}"
-    echo
-    echo "二维码（UTF8）"
-    qrencode -t UTF8 "${vless}"
+    if command -v qrencode >/dev/null 2>&1; then
+      echo
+      echo "二维码（UTF8）"
+      qrencode -t UTF8 "${vless}"
+    fi
   } > "${INFO_FILE}"
 
   ok "已保存到：${INFO_FILE}"
@@ -670,47 +879,50 @@ showconf() { print_full_info_and_qr; }
 #  安装/重装
 # -----------------------------
 install_xray() {
+  echo -e "${yellow}开始安装/重装 sing-box VLESS Reality...${none}"
+  show_singbox_version_hint
 
-
-  echo -e "${yellow}开始安装/重装 Xray Reality...${none}"
-  if ! apt_update_safe; then
-    warn "APT update 失败：请先修复 sources.list 再运行脚本。"
-    return 1
+  if command -v sing-box >/dev/null 2>&1; then
+    local ans=""
+    read_tty "检测到已安装 sing-box，是否继续重装? [y/N]: " ans
+    if [[ ! "$ans" =~ ^[Yy]$ ]]; then
+      warn "已取消安装/重装。"
+      return 0
+    fi
   fi
 
-  apt_install_safe curl wget sudo jq net-tools lsof qrencode openssl xxd
-
-  local XRAY_VER
-  XRAY_VER="$(choose_xray_version "v25.10.15")"
-
-  echo -e "${yellow}安装 Xray ${XRAY_VER}${none}"
-  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "${XRAY_VER}"
-  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata
+  if ! install_or_update_singbox_backend install; then
+    warn "sing-box 安装失败。"
+    return 1
+  fi
 
   echo
   echo -e "${yellow}初始化配置（回车随机化/输入需合法格式）${none}"
   echo "----------------------------------------------------------------"
 
-  local p u sid d
+  local suffix_input="" custom_input="" p u sid d key_pair pk pub
+  read_tty "节点名称后缀（留空则不追加）: " suffix_input
+  [[ -n "$suffix_input" ]] && suffix_input="-${suffix_input}"
+  read_tty "节点连接 IP 或 DDNS 域名（留空默认自动探测）: " custom_input
+  custom_input="$(echo -n "$custom_input" | tr -d $'\r\n[:space:]')"
+
   p="$(input_port)"
   u="$(input_uuid)"
   sid="$(input_shortid)"
   d="$(input_domain)"
 
-  echo -e "${yellow}正在生成私钥和公钥...${none}"
-  local pk_pair pk pub
-  pk_pair="$(generate_keys || true)"
-  pk="${pk_pair%%|*}"
-  pub="${pk_pair##*|}"
-
+  echo -e "${yellow}正在生成 Reality 私钥和公钥...${none}"
+  key_pair="$(generate_reality_keypair || true)"
+  pk="${key_pair%%|*}"
+  pub="${key_pair##*|}"
   if [[ -z "$pk" || -z "$pub" ]]; then
-    warn "生成私钥/公钥失败（openssl/xxd/base64 环境异常）。"
+    warn "生成 Reality 私钥/公钥失败。"
     return 1
   fi
 
   echo
   echo -e "${green}========== 本次最终配置（即将写入服务器） ==========${none}"
-  echo -e "${yellow} Address(自动探测) = ${cyan}(安装后打印时显示)${none}"
+  echo -e "${yellow} Address(节点地址) = ${cyan}${custom_input:-自动探测}${none}"
   echo -e "${yellow} 端口 (Port) = ${cyan}${p}${none}"
   echo -e "${yellow} 用户ID (UUID) = ${cyan}${u}${none}"
   echo -e "${yellow} SNI = ${cyan}${d}${none}"
@@ -719,10 +931,8 @@ install_xray() {
   echo -e "${yellow} 公钥 (PublicKey/客户端) = ${cyan}${pub}${none}"
   echo "----------------------------------------------------------------"
 
-  write_config_and_restart "$p" "$u" "$pk" "$sid" "$d"
-  ok "安装/配置完成，已重启 Xray。"
-  echo -e "${yellow}客户端请使用 PublicKey：${cyan}${pub}${none}"
-
+  write_config_and_restart "$p" "$u" "$pk" "$sid" "$d" "$pub" "$custom_input" "$suffix_input"
+  ok "安装/配置完成，已重启 sing-box。"
   print_full_info_and_qr
 }
 
@@ -730,13 +940,23 @@ install_xray() {
 #  卸载
 # -----------------------------
 uninstall_xray() {
-  warn "即将卸载 Xray（停止服务、移除配置、移除程序）。"
+  warn "即将卸载 sing-box（停止服务、移除配置、移除程序）。"
   pause
-  systemctl stop "$SERVICE" >/dev/null 2>&1 || service "$SERVICE" stop || true
-  rm -f "$CONFIG" "$INFO_FILE" >/dev/null 2>&1 || true
-  if command -v xray >/dev/null 2>&1; then
-    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ remove || true
-  fi
+  service_stop >/dev/null 2>&1 || true
+  rm -f "$CONFIG" "$INFO_FILE" "$CACHE_FILE" "$REALITY_PUB_FILE" "$PROTOCOL_FILE" >/dev/null 2>&1 || true
+  rm -rf /etc/sing-box/certs >/dev/null 2>&1 || true
+  case "$OS" in
+    alpine)
+      apk del sing-box >/dev/null 2>&1 || true
+      rc-update del sing-box default >/dev/null 2>&1 || true
+      rm -f /etc/init.d/sing-box
+      ;;
+    debian|redhat)
+      bash <(curl -fsSL https://sing-box.app/install.sh) uninstall >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/sing-box.service
+      systemctl daemon-reload >/dev/null 2>&1 || true
+      ;;
+  esac
   ok "已卸载完成。"
 }
 
@@ -751,8 +971,8 @@ change_port_only() {
   echo -e "${yellow}当前端口 (Port) = ${cyan}${port}${none}"
   local new_port
   new_port="$(input_port)"
-  write_config_and_restart "$new_port" "$uuid" "$private_key" "$shortid" "$domain"
-  ok "已更新端口并重启 Xray（其它参数保持不变）。"
+  write_config_and_restart "$new_port" "$uuid" "$private_key" "$shortid" "$domain" "$public_key" "$custom_ip" "$node_suffix"
+  ok "已更新端口并重启 sing-box（其它参数保持不变）。"
   print_full_info_and_qr
 }
 
@@ -769,8 +989,8 @@ change_uuid_shortid_only() {
   local new_uuid new_sid
   new_uuid="$(input_uuid)"
   new_sid="$(input_shortid)"
-  write_config_and_restart "$port" "$new_uuid" "$private_key" "$new_sid" "$domain"
-  ok "已更新 UUID + ShortID 并重启 Xray（其它参数保持不变）。"
+  write_config_and_restart "$port" "$new_uuid" "$private_key" "$new_sid" "$domain" "$public_key" "$custom_ip" "$node_suffix"
+  ok "已更新 UUID + ShortID 并重启 sing-box（其它参数保持不变）。"
   print_full_info_and_qr
 }
 
@@ -788,17 +1008,17 @@ reset_keypair() {
 
   echo -e "${yellow}正在生成新的私钥和公钥...${none}"
   local pk_pair pk pub
-  pk_pair="$(generate_keys || true)"
+  pk_pair="$(generate_reality_keypair || true)"
   pk="${pk_pair%%|*}"
   pub="${pk_pair##*|}"
 
   if [[ -z "$pk" || -z "$pub" ]]; then
-    warn "生成私钥/公钥失败（openssl/xxd/base64 环境异常）。"
+    warn "生成 Reality 私钥/公钥失败。"
     return 1
   fi
 
-  write_config_and_restart "$port" "$uuid" "$pk" "$shortid" "$domain" || return 1
-  ok "已重置私钥/公钥并重启 Xray。"
+  write_config_and_restart "$port" "$uuid" "$pk" "$shortid" "$domain" "$pub" "$custom_ip" "$node_suffix" || return 1
+  ok "已重置私钥/公钥并重启 sing-box。"
   echo -e "${yellow}新的 PublicKey（客户端用）= ${cyan}${pub}${none}"
 
   print_full_info_and_qr
@@ -809,35 +1029,10 @@ reset_keypair() {
 # -----------------------------
 status_xray() {
   echo
-  echo -e "${yellow}Xray 服务状态：${none}"
-  systemctl status "$SERVICE" --no-pager -l 2>/dev/null || service "$SERVICE" status || true
+  echo -e "${yellow}sing-box 服务状态：${none}"
+  service_status 2>/dev/null || true
   echo
-
-  # 当前版本：从 xray version 输出中提取 vX.Y.Z
-  local cur_raw="" cur_ver="unknown"
-  if command -v xray >/dev/null 2>&1; then
-    cur_raw="$(xray version 2>/dev/null | head -n1 || true)"
-    [[ -z "$cur_raw" ]] && cur_raw="$(xray --version 2>/dev/null | head -n1 || true)"
-    cur_ver="$(echo "$cur_raw" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
-    [[ -n "$cur_ver" && "$cur_ver" != v* ]] && cur_ver="v${cur_ver}"
-    [[ -z "$cur_ver" ]] && cur_ver="unknown"
-  fi
-
-  # 最新版本：复用你已有的 get_latest_xray_version（若没定义则内置兜底）
-  local latest_ver="unknown"
-  if declare -F get_latest_xray_version >/dev/null 2>&1; then
-    latest_ver="$(get_latest_xray_version 2>/dev/null || true)"
-  else
-    # 兜底：与 get_latest_xray_version 相同逻辑
-    latest_ver="$(
-      curl -fsSL "https://api.github.com/repos/XTLS/Xray-core/releases/latest" 2>/dev/null \
-      | jq -r '.tag_name // empty' 2>/dev/null || true
-    )"
-    [[ "$latest_ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || latest_ver="unknown"
-  fi
-
-  echo -e "${yellow}当前版本：${cyan}${cur_ver}${none}"
-  echo -e "${yellow}最新版本：${cyan}${latest_ver}${none}"
+  show_singbox_version_hint
   echo
 
   if [[ -f "$CONFIG" ]]; then
@@ -847,6 +1042,7 @@ status_xray() {
       echo -e " UUID : ${cyan}${uuid}${none}"
       echo -e " SNI : ${cyan}${domain}${none}"
       echo -e " ShortID : ${cyan}${shortid}${none}"
+      echo -e " PublicKey : ${cyan}${public_key}${none}"
       echo -e " Config : ${cyan}${CONFIG}${none}"
     else
       warn "配置存在但解析失败：${CONFIG}"
@@ -1724,43 +1920,21 @@ install_with_params() {
   local domain="$3"
   local uuid="$4"
 
-  echo -e "${yellow}开始安装 Xray Reality（参数模式）...${none}"
-  if ! apt_update_safe; then
-    warn "APT update 失败"
+  echo -e "${yellow}开始安装 sing-box VLESS Reality（参数模式）...${none}"
+  if ! install_or_update_singbox_backend install; then
+    warn "sing-box 安装失败"
     return 1
   fi
 
-  apt_install_safe curl wget sudo jq net-tools lsof qrencode openssl xxd
-
-  local XRAY_VER
-  XRAY_VER="$(choose_xray_version "v25.10.15")"
-
-  echo -e "${yellow}安装 Xray ${XRAY_VER}${none}"
-  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install --version "${XRAY_VER}"
-  bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install-geodata
-
-  local private_key public_key shortid
-  local key_pair
-  key_pair="$(generate_keys || true)"
+  local key_pair private_key public_key shortid
+  key_pair="$(generate_reality_keypair || true)"
   private_key="${key_pair%%|*}"
   public_key="${key_pair##*|}"
-
-  if [[ -z "$private_key" || -z "$public_key" ]]; then
-    warn "生成私钥/公钥失败（openssl/xxd/base64 环境异常）。"
-    return 1
-  fi
+  [[ -n "$private_key" && -n "$public_key" ]] || { warn "生成私钥/公钥失败"; return 1; }
 
   shortid="$(rand_shortid)"
-
-  echo
-  echo -e "${yellow} 私钥 (PrivateKey) = ${cyan}${private_key}${none}"
-  echo -e "${yellow} 公钥 (PublicKey) = ${cyan}${public_key}${none}"
-  echo -e "${yellow} ShortId = ${cyan}${shortid}${none}"
-  echo "----------------------------------------------------------------"
-
-  write_config_and_restart "$port" "$uuid" "$private_key" "$shortid" "$domain"
-  ok "安装/配置完成，已重启 Xray。"
-
+  write_config_and_restart "$port" "$uuid" "$private_key" "$shortid" "$domain" "$public_key" "" ""
+  ok "安装/配置完成，已重启 sing-box。"
   print_full_info_and_qr
 }
 
@@ -1778,19 +1952,25 @@ menu() {
 
 # ========= 菜单 UI =========
 echo -e "${cyan}${bold}══════════════════════════════════════════${none}"
-echo -e "${cyan}${bold}   🚀  Xray Reality 管理界面"${none}
+echo -e "${cyan}${bold}   🚀  Sing-box Reality 管理界面"${none}
 echo -e "${cyan}${bold}══════════════════════════════════════════${none}"
 echo -e "${gray}──────────────────────────────────────────────────${none}"
+    local cur_ver_menu latest_ver_menu
+    cur_ver_menu="$(get_current_singbox_version 2>/dev/null || echo 未安装)"
+    latest_ver_menu="$(get_latest_singbox_version 2>/dev/null || echo 获取失败)"
+    echo -e "${gray}当前：${cyan}${cur_ver_menu}${none}  ${gray}GitHub：${cyan}${latest_ver_menu}${none}"
+    echo -e "${gray}──────────────────────────────────────────────────${none}"
 echo -e "  ${green}${bold}1)${none} ${green}安装"
 echo -e "  ${yellow}${bold}2)${none} ${yellow}更新"
 echo -e "  ${red}${bold}3)${none} ${red}卸载"
 echo -e "${gray}──────────────────────────────────────────────────${none}"
 echo -e "  ${yellow}${bold}4)${none} ${yellow}打印节点信息"
-echo -e "  ${yellow}${bold}5)${none} ${yellow}系统参数配置"
-echo -e "  ${yellow}${bold}6)${none} ${yellow}回程路由测试"
-echo -e "  ${yellow}${bold}7)${none} ${yellow}IP质量检测"
-echo -e "  ${yellow}${bold}8)${none} ${yellow}系统查询"
-echo -e "  ${yellow}${bold}9)${none} ${yellow}查看状态"
+echo -e "  ${yellow}${bold}5)${none} ${yellow}目标网站检测"
+echo -e "  ${yellow}${bold}6)${none} ${yellow}系统参数配置"
+echo -e "  ${yellow}${bold}7)${none} ${yellow}回程路由测试"
+echo -e "  ${yellow}${bold}8)${none} ${yellow}IP质量检测"
+echo -e "  ${yellow}${bold}9)${none} ${yellow}系统查询"
+echo -e "  ${yellow}${bold}10)${none} ${yellow}查看状态"
 echo -e "  ${red}${bold}0)${none} ${red}${bold}退出${none}"
 echo -e "${gray}提示：输入对应数字并回车${none}"
 echo -e "${gray}──────────────────────────────────────────────────${none}"
@@ -1804,11 +1984,12 @@ echo -ne "${green}${bold}请选择 [0-9]${none}${green}: ${none}"
       2) update_xray_reality; pause ;;
       3) uninstall_xray; pause ;;
       4) showconf; pause ;;
-      5) changeconf ;;
-      6) besttrace; pause ;;
-      7) ipquality; pause ;;
-      8) linux_ps; pause ;;
-      9) status_xray; pause ;;
+	  5)detect_reality_target ;;
+      6) changeconf ;;
+      7) besttrace; pause ;;
+      8) ipquality; pause ;;
+      9) linux_ps; pause ;;
+      10) status_xray; pause ;;
       0) exit 0 ;;
       *) error; pause ;;
     esac
@@ -1821,45 +2002,4 @@ echo -ne "${green}${bold}请选择 [0-9]${none}${green}: ${none}"
 #  主程序入口
 # -----------------------------
 need_root
-
-if [[ $# -ge 1 ]]; then
-  netstack=4
-  case "${1:-}" in
-    4) netstack=4 ;;
-    6) netstack=6 ;;
-    *) netstack=4 ;;
-  esac
-
-  get_public_ips
-
-  ip=""
-  if [[ "$netstack" == "4" && -n "${IPv4:-}" ]]; then
-    ip="${IPv4}"
-  elif [[ "$netstack" == "6" && -n "${IPv6:-}" ]]; then
-    ip="${IPv6}"
-  elif [[ -n "${IPv4:-}" ]]; then
-    ip="${IPv4}"
-    netstack=4
-  elif [[ -n "${IPv6:-}" ]]; then
-    ip="${IPv6}"
-    netstack=6
-  else
-    warn "没有获取到公共 IP"
-    exit 1
-  fi
-
-  port="${2:-$(( (RANDOM % 50001) + 10000 ))}"
-  domain="${3:-www.cloudflare.com}"
-  uuid="${4:-$(rand_uuid)}"
-
-  echo -e "${yellow} netstack = ${cyan}${netstack}${none}"
-  echo -e "${yellow} 本机IP = ${cyan}${ip}${none}"
-  echo -e "${yellow} 端口 (Port) = ${cyan}${port}${none}"
-  echo -e "${yellow} 用户ID (User ID / UUID) = ${cyan}${uuid}${none}"
-  echo -e "${yellow} SNI = ${cyan}${domain}${none}"
-  echo "----------------------------------------------------------------"
-
-  install_with_params "$netstack" "$port" "$domain" "$uuid"
-else
-  menu
-fi
+menu
