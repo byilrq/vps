@@ -501,8 +501,8 @@ inst_pwd() {
 
 inst_site() {
   while true; do
-    read -rp "请输入伪装网站地址（去除https://） [回车:video.unext.jp]: " proxysite
-    [[ -z $proxysite ]] && proxysite="video.unext.jp"
+    read -rp "请输入伪装网站地址（去除https://） [回车:video.unext.jp/roadtrippers.com(美)]: " proxysite
+    [[ -z $proxysite ]] && proxysite="roadtrippers.com"
     proxysite="$(normalize_host_input "$proxysite")"
     if is_valid_domain "$proxysite"; then
       yellow "伪装站点：$proxysite"
@@ -528,30 +528,45 @@ insthysteria() {
   green "步骤 1/6：更新软件源"
   pkg_update || { red "软件源更新失败"; return 1; }
 
-  green "步骤 2/6：安装依赖"
+  green "步骤 2/6：安装核心依赖"
   pkg_install curl wget sudo procps iptables openssl socat || {
     red "核心依赖安装失败"
     return 1
   }
 
-  # qrencode only used for terminal QR rendering; do not block main flow
-  if ! pkg_install qrencode >/dev/null 2>&1; then
-    yellow "qrencode 安装失败，将跳过终端二维码显示，但不影响 Hysteria 主流程"
+  green "步骤 2.1/6：安装可选组件 qrencode"
+  if command -v apt-get >/dev/null 2>&1; then
+    wait_for_apt_lock || true
+    fix_dpkg_if_needed || true
+    DEBIAN_FRONTEND=noninteractive timeout 180 apt-get install -y -o Dpkg::Use-Pty=0 qrencode || \
+      yellow "qrencode 安装失败或超时，跳过二维码功能"
+  else
+    pkg_install qrencode >/dev/null 2>&1 || \
+      yellow "qrencode 安装失败，跳过二维码功能"
   fi
 
+  green "步骤 2.2/6：安装防火墙持久化组件"
   if command -v apt-get >/dev/null 2>&1; then
     command -v debconf-set-selections >/dev/null 2>&1 && {
       echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
       echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
     }
-    DEBIAN_FRONTEND=noninteractive pkg_install iptables-persistent netfilter-persistent >/dev/null 2>&1 || \
-      yellow "iptables-persistent/netfilter-persistent 安装失败，继续执行"
+
+    wait_for_apt_lock || true
+    fix_dpkg_if_needed || true
+
+    DEBIAN_FRONTEND=noninteractive timeout 180 apt-get install -y \
+      -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confnew" \
+      iptables-persistent netfilter-persistent || \
+      yellow "iptables-persistent/netfilter-persistent 安装失败或超时，继续执行"
   else
     pkg_install iptables-services >/dev/null 2>&1 || true
   fi
 
   green "步骤 3/6：下载核心安装脚本"
   local url="https://raw.githubusercontent.com/byilrq/vps/main/install_h.sh"
+  rm -f /tmp/install_h.sh /tmp/install_h.log >/dev/null 2>&1 || true
   download_with_retry "$url" /tmp/install_h.sh || {
     red "下载 install_h.sh 失败"
     return 1
@@ -606,12 +621,6 @@ masquerade:
     rewriteHost: true
 EOF
 
-  if [[ -n $(echo "$ip" | grep ":") ]]; then
-    last_ip="[$ip]"
-  else
-    last_ip="$ip"
-  fi
-
   cat > /root/hy/hy-client.yaml <<EOF
 server: $hy_domain:$port
 
@@ -646,7 +655,7 @@ EOF
     port_range="$port"
   fi
 
-  ur1="hysteria2://$auth_pwd@$hy_domain:$port/?sni=$hy_domain&peer=$hy_domain&mport=$port_range#H"
+  ur1="hysteria2://${auth_pwd}@${hy_domain}:${port}/?sni=${hy_domain}&peer=${hy_domain}&mport=${port_range}#H"
   echo "$ur1" > /root/hy/ur1.txt
 
   fix_hysteria_file_perms
@@ -658,7 +667,9 @@ EOF
   if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
     green "Hysteria 2 服务启动成功"
   else
-    red "Hysteria 2 服务启动失败，请运行 systemctl status hysteria-server 查看状态"
+    red "Hysteria 2 服务启动失败，请检查以下日志："
+    systemctl status hysteria-server --no-pager -l || true
+    journalctl -u hysteria-server --no-pager -n 30 || true
     exit 1
   fi
 
@@ -676,9 +687,9 @@ EOF
   else
     yellow "未安装 qrencode，跳过终端二维码显示"
   fi
+
   read -rp "回车返回菜单..." _
 }
-
 # -----------------------------
 # Uninstall / start / stop
 # -----------------------------
