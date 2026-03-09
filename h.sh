@@ -141,6 +141,51 @@ realip() {
   return 0
 }
 
+is_valid_domain() {
+  local d="$1"
+  [[ -n "$d" ]] || return 1
+  [[ "$d" =~ ^([A-Za-z0-9][-A-Za-z0-9]{0,62}\.)+[A-Za-z]{2,63}$ ]]
+}
+
+normalize_host_input() {
+  local v="$1"
+  v="${v#http://}"
+  v="${v#https://}"
+  v="${v%%/*}"
+  printf '%s' "$v"
+}
+
+ensure_hy2_jump_chain() {
+  iptables -t nat -N HY2_JUMP >/dev/null 2>&1 || true
+  iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+  iptables -t nat -C PREROUTING -j HY2_JUMP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -j HY2_JUMP >/dev/null 2>&1 || true
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t nat -N HY2_JUMP >/dev/null 2>&1 || true
+    ip6tables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+    ip6tables -t nat -C PREROUTING -j HY2_JUMP >/dev/null 2>&1 || ip6tables -t nat -A PREROUTING -j HY2_JUMP >/dev/null 2>&1 || true
+  fi
+}
+
+clear_hy2_jump_rules() {
+  iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+  fi
+}
+
+remove_hy2_jump_chain() {
+  iptables -t nat -D PREROUTING -j HY2_JUMP >/dev/null 2>&1 || true
+  iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+  iptables -t nat -X HY2_JUMP >/dev/null 2>&1 || true
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -t nat -D PREROUTING -j HY2_JUMP >/dev/null 2>&1 || true
+    ip6tables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+    ip6tables -t nat -X HY2_JUMP >/dev/null 2>&1 || true
+  fi
+}
+
 # -----------------------------
 # Checkers
 # -----------------------------
@@ -180,6 +225,8 @@ fix_hysteria_file_perms() {
   local cfg="$dir/config.yaml"
   local crt="$dir/cert.crt"
   local key="$dir/private.key"
+  local ca_log="$dir/ca.log"
+  local hy_dir="/root/hy"
 
   local svc="/etc/systemd/system/hysteria-server.service"
   local u="hysteria" g="hysteria"
@@ -209,6 +256,17 @@ fix_hysteria_file_perms() {
     chown root:root "$crt" 2>/dev/null || true
     chmod 644 "$crt" 2>/dev/null || true
   fi
+
+  if [[ -f "$ca_log" ]]; then
+    chown root:root "$ca_log" 2>/dev/null || true
+    chmod 600 "$ca_log" 2>/dev/null || true
+  fi
+
+  if [[ -d "$hy_dir" ]]; then
+    chown -R root:root "$hy_dir" 2>/dev/null || true
+    chmod 700 "$hy_dir" 2>/dev/null || true
+    find "$hy_dir" -type f -exec chmod 600 {} \; 2>/dev/null || true
+  fi
 }
 
 # -----------------------------
@@ -236,7 +294,9 @@ inst_cert() {
     else
       realip || exit 1
       read -rp "请输入需要申请证书的域名: " domain
+      domain="$(normalize_host_input "$domain")"
       [[ -z $domain ]] && red "未输入域名，无法执行操作！" && exit 1
+      is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
 
       green "已输入的域名：$domain"
       green "检查域名解析..."
@@ -269,12 +329,12 @@ inst_cert() {
 
       green "开始签发证书，这一步可能需要几十秒..."
       if [[ -n $(echo "$ip" | grep ":") ]]; then
-        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 --insecure || {
+        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
           red "签发失败"
           exit 1
         }
       else
-        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --insecure || {
+        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
           red "签发失败"
           exit 1
         }
@@ -307,7 +367,9 @@ inst_cert() {
     read -rp "请输入公钥文件 crt 的路径: " cert_path
     read -rp "请输入密钥文件 key 的路径: " key_path
     read -rp "请输入证书的域名: " domain
+    domain="$(normalize_host_input "$domain")"
     [[ -z "$cert_path" || -z "$key_path" || -z "$domain" ]] && red "参数不完整" && exit 1
+    is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
     [[ ! -s "$cert_path" || ! -s "$key_path" ]] && red "证书/私钥文件不存在或为空" && exit 1
     hy_domain="$domain"
 
@@ -337,6 +399,7 @@ inst_jump() {
   echo -e " ${GREEN}2.${PLAIN} 端口跳跃${YELLOW}（默认）${PLAIN}"
   echo ""
   read -rp "请输入选项 [1-2]: " jumpInput
+  [[ -z "$jumpInput" ]] && jumpInput=2
 
   if [[ $jumpInput == 2 ]]; then
     read -rp "设置范围端口的起始端口 (建议10000-65535之间): " firstport
@@ -348,8 +411,11 @@ inst_jump() {
       read -rp "末尾端口: " endport
     done
 
-    iptables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
-    ip6tables -t nat -A PREROUTING -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
+    ensure_hy2_jump_chain
+    iptables -t nat -A HY2_JUMP -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -t nat -A HY2_JUMP -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
+    fi
     save_firewall_rules
 
     green "已启用端口跳跃：$firstport-$endport -> $port"
@@ -357,13 +423,15 @@ inst_jump() {
     yellow "将继续使用单端口模式"
     firstport=""
     endport=""
+    clear_hy2_jump_rules
+    save_firewall_rules
   fi
 }
 # -----------------------------
 # 监听Port 
 # -----------------------------
 inst_port() {
-  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  clear_hy2_jump_rules
 
   while true; do
     read -rp "设置 Hysteria 2 端口 [1-65535]（回车默认 443）: " port
@@ -391,9 +459,16 @@ inst_pwd() {
 }
 
 inst_site() {
-  read -rp "请输入伪装网站地址（去除https://） [回车:video.unext.jp]: " proxysite
-  [[ -z $proxysite ]] && proxysite="video.unext.jp"
-  yellow "伪装站点：$proxysite"
+  while true; do
+    read -rp "请输入伪装网站地址（去除https://） [回车:video.unext.jp]: " proxysite
+    [[ -z $proxysite ]] && proxysite="video.unext.jp"
+    proxysite="$(normalize_host_input "$proxysite")"
+    if is_valid_domain "$proxysite"; then
+      yellow "伪装站点：$proxysite"
+      return 0
+    fi
+    red "伪装网站域名格式无效：$proxysite"
+  done
 }
 
 # -----------------------------
@@ -557,7 +632,7 @@ unsthysteria() {
   rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh /var/lib/hysteria >/dev/null 2>&1 || true
-  iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
+  remove_hy2_jump_chain >/dev/null 2>&1 || true
   save_firewall_rules
   systemctl daemon-reload >/dev/null 2>&1 || true
   green "Hysteria 2 已彻底卸载完成！"
@@ -611,13 +686,21 @@ changeport() {
   local oldport
   oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
 
-  read -rp "设置 Hysteria 2 端口[1-65535]（回车随机）: " port
-  [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
+  clear_hy2_jump_rules
 
-  until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]; do
-    red "端口 $port 已被占用，请更换"
-    read -rp "设置 Hysteria 2 端口[1-65535]（回车随机）: " port
-    [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
+  while true; do
+    read -rp "设置 Hysteria 2 端口[1-65535]（回车默认 443）: " port
+    [[ -z $port ]] && port=443
+
+    [[ "$port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
+    (( port >= 1 && port <= 65535 )) || { red "端口必须在 1-65535 之间"; continue; }
+
+    if ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
+      red "UDP 端口 $port 已被占用，请更换"
+      continue
+    fi
+
+    break
   done
 
   sed -i "1s/:$oldport/:$port/g" /etc/hysteria/config.yaml 2>/dev/null || true
@@ -628,6 +711,10 @@ changeport() {
     current_link=$(cat /root/hy/ur1.txt 2>/dev/null)
     current_link=$(echo "$current_link" | sed -E "s#(@[^:]+:)[0-9]+/#\1${port}/#")
     echo "$current_link" > /root/hy/ur1.txt
+  fi
+
+  if grep -q '^ *hopInterval:' /root/hy/hy-client.yaml 2>/dev/null; then
+    inst_jump
   fi
 
   fix_hysteria_file_perms
@@ -701,6 +788,11 @@ change_cert() {
   [[ -n "$old_cert" ]] && sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
   [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
   [[ -n "$old_hydomain" ]] && sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/hy-client.yaml
+  grep -q '^server: ' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^server: .*#server: $hy_domain:${port:-443}#" /root/hy/hy-client.yaml
+
+  if [[ -f /root/hy/ur1.txt && -n "$old_hydomain" ]]; then
+    sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/ur1.txt
+  fi
 
   fix_hysteria_file_perms
   systemctl restart hysteria-server.service >/dev/null 2>&1 || true
