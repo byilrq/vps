@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# h.sh - Hysteria 2 installer + management script (fixed)
+# h.sh - Hysteria 2 installer + management script (optimized)
 
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export DEBIAN_FRONTEND=noninteractive
+export APT_LISTCHANGES_FRONTEND=none
+export NEEDRESTART_MODE=a
 
 RED="\033[31m"
 GREEN="\033[32m"
@@ -26,15 +28,19 @@ need_root() {
 # Wait apt locks (Debian/Ubuntu)
 # -----------------------------
 wait_for_apt_lock() {
-  local max_attempts=120
+  local max_attempts=180
   local attempt=0
-  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+  while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || \
+        fuser /var/lib/dpkg/lock >/dev/null 2>&1 || \
+        fuser /var/lib/apt/lists/lock >/dev/null 2>&1 || \
+        fuser /var/cache/apt/archives/lock >/dev/null 2>&1; do
     if [ $attempt -ge $max_attempts ]; then
-      red "apt 锁等待超时，请手动检查进程并释放锁（例如 kill <PID>），然后重试。"
+      red "apt/dpkg 锁等待超时，请手动检查相关进程后重试。"
+      ps -ef | grep -E 'apt|dpkg' | grep -v grep || true
       exit 1
     fi
-    yellow "apt 锁被占用（可能有其他更新进程），等待中... ($attempt/$max_attempts)"
-    sleep 1
+    yellow "apt/dpkg 锁被占用，等待中... ($attempt/$max_attempts)"
+    sleep 2
     attempt=$((attempt + 1))
   done
 }
@@ -48,35 +54,66 @@ PACKAGE_UPDATE=("apt-get update -y" "apt-get update -y" "yum -y update" "yum -y 
 PACKAGE_INSTALL=("apt-get install -y" "apt-get install -y" "yum -y install" "yum -y install" "yum -y install")
 
 CMD=(
-  "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d \" -f2)"
+  "$(grep -i pretty_name /etc/os-release 2>/dev/null | cut -d '"' -f2)"
   "$(hostnamectl 2>/dev/null | grep -i system | cut -d : -f2)"
   "$(lsb_release -sd 2>/dev/null)"
-  "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d \" -f2)"
+  "$(grep -i description /etc/lsb-release 2>/dev/null | cut -d '"' -f2)"
   "$(grep . /etc/redhat-release 2>/dev/null)"
   "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')"
 )
 
+SYSTEM=""
+SYS=""
+OS_INDEX=""
+
 detect_os() {
   local i
   for i in "${CMD[@]}"; do
-    SYS="$i" && [[ -n $SYS ]] && break
+    SYS="$i"
+    [[ -n $SYS ]] && break
   done
-  for ((int = 0; int < ${#REGEX[@]}; int++)); do
-    if [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[int]} ]]; then
-      SYSTEM="${RELEASE[int]}"
-      [[ -n $SYSTEM ]] && break
+
+  for ((i=0; i<${#REGEX[@]}; i++)); do
+    if [[ $(echo "$SYS" | tr '[:upper:]' '[:lower:]') =~ ${REGEX[i]} ]]; then
+      SYSTEM="${RELEASE[i]}"
+      OS_INDEX="$i"
+      break
     fi
   done
+
   [[ -z $SYSTEM ]] && red "目前暂不支持你的VPS的操作系统！" && exit 1
+}
+
+# -----------------------------
+# Debian/Ubuntu auto-fix
+# -----------------------------
+fix_dpkg_if_needed() {
+  command -v dpkg >/dev/null 2>&1 || return 0
+
+  wait_for_apt_lock || true
+
+  if dpkg --audit 2>/dev/null | grep -q .; then
+    yellow "检测到 dpkg 状态异常，正在自动修复..."
+    timeout 600 dpkg --configure -a || return 1
+  fi
+
+  if [[ -f /var/lib/dpkg/updates/0000 ]] || ls /var/lib/dpkg/updates/* >/dev/null 2>&1; then
+    yellow "检测到 dpkg 更新残留，正在尝试修复..."
+    timeout 600 dpkg --configure -a || return 1
+  fi
+
+  timeout 600 apt-get install -f -y -o Dpkg::Use-Pty=0 >/dev/null 2>&1 || true
+  return 0
 }
 
 ensure_curl() {
   if [[ -z $(type -P curl) ]]; then
-    if [[ "$SYSTEM" != "CentOS" ]]; then
+    if [[ "$SYSTEM" == "Debian" || "$SYSTEM" == "Ubuntu" ]]; then
       wait_for_apt_lock || true
+      fix_dpkg_if_needed || { red "dpkg 修复失败"; exit 1; }
     fi
-    ${PACKAGE_UPDATE[int]} || true
-    ${PACKAGE_INSTALL[int]} curl || { red "curl 安装失败"; exit 1; }
+    eval "${PACKAGE_UPDATE[$OS_INDEX]}" || true
+    eval "${PACKAGE_INSTALL[$OS_INDEX]} curl" || { red "curl 安装失败"; exit 1; }
   fi
 }
 
@@ -86,7 +123,8 @@ ensure_curl() {
 pkg_update() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
-    timeout 300 apt-get update -y -o Dpkg::Use-Pty=0
+    fix_dpkg_if_needed || { red "dpkg 修复失败，请手动执行: dpkg --configure -a"; return 1; }
+    DEBIAN_FRONTEND=noninteractive timeout 300 apt-get update -y -o Dpkg::Use-Pty=0
   elif command -v dnf >/dev/null 2>&1; then
     timeout 300 dnf -y makecache
   elif command -v yum >/dev/null 2>&1; then
@@ -99,7 +137,8 @@ pkg_update() {
 pkg_install() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
-    timeout 600 apt-get install -y \
+    fix_dpkg_if_needed || { red "dpkg 修复失败，请手动执行: dpkg --configure -a"; return 1; }
+    DEBIAN_FRONTEND=noninteractive timeout 600 apt-get install -y \
       -o Dpkg::Use-Pty=0 \
       -o Dpkg::Options::="--force-confnew" \
       "$@"
@@ -280,6 +319,7 @@ inst_cert() {
   echo -e " ${GREEN}3.${PLAIN} 自定义证书路径"
   echo ""
   read -rp "请输入选项 [1-3]: " certInput
+  [[ -z "$certInput" ]] && certInput=1
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
@@ -427,8 +467,9 @@ inst_jump() {
     save_firewall_rules
   fi
 }
+
 # -----------------------------
-# 监听Port 
+# 监听Port
 # -----------------------------
 inst_port() {
   clear_hy2_jump_rules
@@ -477,23 +518,34 @@ inst_site() {
 insthysteria() {
   green "开始安装 Hysteria 2"
 
+  if command -v apt-get >/dev/null 2>&1; then
+    wait_for_apt_lock || true
+    fix_dpkg_if_needed || { red "系统包状态修复失败"; return 1; }
+  fi
+
   realip || return 1
 
   green "步骤 1/6：更新软件源"
   pkg_update || { red "软件源更新失败"; return 1; }
 
   green "步骤 2/6：安装依赖"
-  pkg_install curl wget sudo qrencode procps iptables openssl socat || {
-    red "依赖安装失败"
+  pkg_install curl wget sudo procps iptables openssl socat || {
+    red "核心依赖安装失败"
     return 1
   }
+
+  # qrencode only used for terminal QR rendering; do not block main flow
+  if ! pkg_install qrencode >/dev/null 2>&1; then
+    yellow "qrencode 安装失败，将跳过终端二维码显示，但不影响 Hysteria 主流程"
+  fi
 
   if command -v apt-get >/dev/null 2>&1; then
     command -v debconf-set-selections >/dev/null 2>&1 && {
       echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
       echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
     }
-    pkg_install iptables-persistent netfilter-persistent >/dev/null 2>&1 || yellow "iptables-persistent/netfilter-persistent 安装失败，继续执行"
+    DEBIAN_FRONTEND=noninteractive pkg_install iptables-persistent netfilter-persistent >/dev/null 2>&1 || \
+      yellow "iptables-persistent/netfilter-persistent 安装失败，继续执行"
   else
     pkg_install iptables-services >/dev/null 2>&1 || true
   fi
@@ -619,7 +671,11 @@ EOF
   yellow "分享链接 /root/hy/ur1.txt："
   green "$(cat /root/hy/ur1.txt)"
   yellow "二维码："
-  qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+  if command -v qrencode >/dev/null 2>&1; then
+    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+  else
+    yellow "未安装 qrencode，跳过终端二维码显示"
+  fi
   read -rp "回车返回菜单..." _
 }
 
@@ -675,7 +731,11 @@ showconf() {
   yellow "分享链接 /root/hy/ur1.txt："
   green "$(cat /root/hy/ur1.txt 2>/dev/null)"
   yellow "二维码："
-  [[ -f /root/hy/ur1.txt ]] && qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+  if [[ -f /root/hy/ur1.txt ]] && command -v qrencode >/dev/null 2>&1; then
+    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+  else
+    yellow "未安装 qrencode 或分享链接不存在，跳过二维码显示"
+  fi
   read -rp "回车返回菜单..." _
 }
 
@@ -736,8 +796,12 @@ update_hysteria_link() {
   new_link=$(echo "$link" | sed "s#\(hysteria2://\)[^@]*@#\1${newpasswd}@#")
   echo "$new_link" > "$link_file"
   skyblue "$new_link"
-  skyblue "Hysteria 2 二维码如下"
-  qrencode -o - -t ANSIUTF8 "$new_link" || true
+  if command -v qrencode >/dev/null 2>&1; then
+    skyblue "Hysteria 2 二维码如下"
+    qrencode -o - -t ANSIUTF8 "$new_link" || true
+  else
+    yellow "未安装 qrencode，跳过二维码显示"
+  fi
 }
 
 changepasswd() {
@@ -778,17 +842,19 @@ changepasswd() {
 }
 
 change_cert() {
-  local old_cert old_key old_hydomain
+  local old_cert old_key old_hydomain current_port
   old_cert=$(grep -E '^\s*cert:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_key=$(grep -E '^\s*key:'  /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_hydomain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
+  current_port=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
+  [[ -z "$current_port" ]] && current_port=443
 
   inst_cert
 
   [[ -n "$old_cert" ]] && sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
   [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
   [[ -n "$old_hydomain" ]] && sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/hy-client.yaml
-  grep -q '^server: ' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^server: .*#server: $hy_domain:${port:-443}#" /root/hy/hy-client.yaml
+  grep -q '^server: ' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^server: .*#server: $hy_domain:${current_port}#" /root/hy/hy-client.yaml
 
   if [[ -f /root/hy/ur1.txt && -n "$old_hydomain" ]]; then
     sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/ur1.txt
@@ -1030,6 +1096,7 @@ linux_ps() {
 linux_update() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
+    fix_dpkg_if_needed || { red "dpkg 修复失败"; return 1; }
     DEBIAN_FRONTEND=noninteractive apt-get update -y -o Dpkg::Use-Pty=0
     wait_for_apt_lock || true
     DEBIAN_FRONTEND=noninteractive apt-get full-upgrade -y -o Dpkg::Use-Pty=0
