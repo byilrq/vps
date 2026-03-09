@@ -217,15 +217,15 @@ fix_hysteria_file_perms() {
 inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
-  echo -e " ${GREEN}1.${PLAIN} 必应自签证书 ${YELLOW}（默认）${PLAIN}"
-  echo -e " ${GREEN}2.${PLAIN} Acme 脚本自动申请（保存到 /etc/hysteria）"
+  echo -e " ${GREEN}1.${PLAIN} Acme 脚本自动申请${YELLOW}（默认）${PLAIN}"
+  echo -e " ${GREEN}2.${PLAIN} 必应自签证书 "
   echo -e " ${GREEN}3.${PLAIN} 自定义证书路径"
   echo ""
   read -rp "请输入选项 [1-3]: " certInput
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
-  if [[ $certInput == 2 ]]; then
+  if [[ $certInput == 1 ]]; then
     cert_path="/etc/hysteria/cert.crt"
     key_path="/etc/hysteria/private.key"
 
@@ -333,8 +333,8 @@ inst_cert() {
 inst_jump() {
   green "Hysteria 2 端口使用模式如下："
   echo ""
-  echo -e " ${GREEN}1.${PLAIN} 单端口 ${YELLOW}（默认）${PLAIN}"
-  echo -e " ${GREEN}2.${PLAIN} 端口跳跃"
+  echo -e " ${GREEN}1.${PLAIN} 单端口 "
+  echo -e " ${GREEN}2.${PLAIN} 端口跳跃${YELLOW}（默认）${PLAIN}"
   echo ""
   read -rp "请输入选项 [1-2]: " jumpInput
 
@@ -359,16 +359,25 @@ inst_jump() {
     endport=""
   fi
 }
-
+# -----------------------------
+# 监听Port 
+# -----------------------------
 inst_port() {
   iptables -t nat -F PREROUTING >/dev/null 2>&1 || true
-  read -rp "设置 Hysteria 2 端口 [1-65535]（回车则随机分配端口）: " port
-  [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
 
-  until [[ -z $(ss -tunlp | grep -w udp | awk '{print $5}' | sed 's/.*://g' | grep -w "$port") ]]; do
-    red "端口 $port 已被占用，请更换"
-    read -rp "设置 Hysteria 2 端口 [1-65535]（回车则随机分配端口）: " port
-    [[ -z $port ]] && port=$(shuf -i 2000-65535 -n 1)
+  while true; do
+    read -rp "设置 Hysteria 2 端口 [1-65535]（回车默认 443）: " port
+    [[ -z $port ]] && port=443
+
+    [[ "$port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
+    (( port >= 1 && port <= 65535 )) || { red "端口必须在 1-65535 之间"; continue; }
+
+    if ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
+      red "UDP 端口 $port 已被占用，请更换"
+      continue
+    fi
+
+    break
   done
 
   yellow "Hysteria 2 使用端口：$port"
@@ -477,13 +486,13 @@ EOF
   fi
 
   cat > /root/hy/hy-client.yaml <<EOF
-server: $last_ip:$port
+server: $hy_domain:$port
 
 auth: $auth_pwd
 
 tls:
   sni: $hy_domain
-  insecure: true
+  insecure: false
 
 quic:
   initStreamReceiveWindow: 8388608
@@ -510,7 +519,7 @@ EOF
     port_range="$port"
   fi
 
-  ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
+  ur1="hysteria2://$auth_pwd@$hy_domain:$port/?sni=$hy_domain&peer=$hy_domain&mport=$port_range#H"
   echo "$ur1" > /root/hy/ur1.txt
 
   fix_hysteria_file_perms
