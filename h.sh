@@ -312,13 +312,17 @@ fix_hysteria_file_perms() {
 inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
-  echo -e " ${GREEN}1.${PLAIN} Acme 脚本自动申请${YELLOW}（默认）${PLAIN}"
-  echo -e " ${GREEN}2.${PLAIN} 必应自签证书"
-  echo -e " ${GREEN}3.${PLAIN} 自定义证书路径"
+  echo -e " ${GREEN}1.${PLAIN} Acme 脚本自动申请${YELLOW}（默认，强制校验证书）${PLAIN}"
+  echo -e " ${GREEN}2.${PLAIN} 必应自签证书${YELLOW}（客户端将跳过证书校验）${PLAIN}"
+  echo -e " ${GREEN}3.${PLAIN} 自定义证书路径${YELLOW}（默认强制校验）${PLAIN}"
   echo ""
   read -rp "请输入选项 [1-3]: " certInput
+  [[ -z "$certInput" ]] && certInput=1
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
+
+  # 默认：强制校验证书
+  tls_insecure="false"
 
   if [[ $certInput == 1 ]]; then
     cert_path="/etc/hysteria/cert.crt"
@@ -328,6 +332,7 @@ inst_cert() {
       domain=$(cat /etc/hysteria/ca.log 2>/dev/null)
       [[ -n "$domain" ]] && green "检测到原有域名：$domain 的证书，正在复用"
       hy_domain="$domain"
+      tls_insecure="false"
     else
       realip || exit 1
       read -rp "请输入需要申请证书的域名: " domain
@@ -396,6 +401,7 @@ inst_cert() {
         yellow "证书路径：$cert_path"
         yellow "私钥路径：$key_path"
         hy_domain="$domain"
+        tls_insecure="false"
       else
         red "证书文件生成异常，请检查 acme.sh 输出"
         exit 1
@@ -411,14 +417,20 @@ inst_cert() {
     [[ -z "$cert_path" || -z "$key_path" || -z "$domain" ]] && red "参数不完整" && exit 1
     is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
     [[ ! -s "$cert_path" || ! -s "$key_path" ]] && red "证书/私钥文件不存在或为空" && exit 1
+
     hy_domain="$domain"
+    tls_insecure="false"
 
   else
     green "将使用必应自签证书作为 Hysteria 2 的节点证书"
     cert_path="/etc/hysteria/cert.crt"
     key_path="/etc/hysteria/private.key"
 
-    openssl ecparam -genkey -name prime256v1 -out "$key_path" || { red "生成私钥失败"; exit 1; }
+    openssl ecparam -genkey -name prime256v1 -out "$key_path" || {
+      red "生成私钥失败"
+      exit 1
+    }
+
     openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com" || {
       red "生成证书失败"
       exit 1
@@ -426,9 +438,11 @@ inst_cert() {
 
     hy_domain="www.bing.com"
     domain="www.bing.com"
+    tls_insecure="true"
+
+    yellow "当前为自签证书模式，客户端将跳过证书校验"
   fi
 }
-
 # -----------------------------
 # 端口与跳跃端口设置
 # -----------------------------
@@ -845,10 +859,10 @@ insthysteria() {
   fi
 
   green "步骤 3/4：配置证书、端口、密码、伪装站点"
-  inst_cert
-  inst_port
-  inst_pwd
-  inst_site
+  inst_cert || return 1
+  inst_port || return 1
+  inst_pwd || return 1
+  inst_site || return 1
 
   mkdir -p /etc/hysteria /root/hy /var/lib/hysteria >/dev/null 2>&1 || true
 
@@ -905,7 +919,15 @@ auth: $auth_pwd
 
 tls:
   sni: $hy_domain
+EOF
+
+  if [[ "$tls_insecure" == "true" ]]; then
+    cat >> /root/hy/hy-client.yaml <<EOF
   insecure: true
+EOF
+  fi
+
+  cat >> /root/hy/hy-client.yaml <<EOF
 
 quic:
   initStreamReceiveWindow: 8388608
@@ -927,7 +949,12 @@ transport:
     hopInterval: 15s
 EOF
 
-  ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&insecure=1&mport=$port_range#H"
+  if [[ "$tls_insecure" == "true" ]]; then
+    ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&insecure=1&mport=$port_range#H"
+  else
+    ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&mport=$port_range#H"
+  fi
+
   echo "$ur1" > /root/hy/ur1.txt
 
   fix_hysteria_file_perms
@@ -967,10 +994,15 @@ EOF
   yellow "二维码："
   qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
 
+  if [[ "$tls_insecure" == "true" ]]; then
+    yellow "当前证书模式：自签证书，客户端已启用跳过证书校验"
+  else
+    yellow "当前证书模式：强制校验证书"
+  fi
+
   yellow "伪装站验证："
   green "1) 普通浏览器访问: https://$hy_domain"
-  green "2) curl 测试: curl -I --http3-only https://$hy_domain"
-  green "3) 查看日志: journalctl -u $hy_service -f"
+  green "2) 查看日志: journalctl -u $hy_service -f"
 
   read -rp "回车返回菜单..." _
 }
