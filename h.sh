@@ -837,7 +837,7 @@ insthysteria() {
 
   rm -f /tmp/install_h.sh
 
-  if [[ -f "/usr/local/bin/hysteria" ]]; then
+  if [[ -x "/usr/local/bin/hysteria" || -x "/usr/bin/hysteria" ]]; then
     green "Hysteria 2 安装成功！"
   else
     red "Hysteria 2 安装失败！"
@@ -850,8 +850,21 @@ insthysteria() {
   inst_pwd
   inst_site
 
-  green "步骤 4/4：写入配置并启动服务"
   mkdir -p /etc/hysteria /root/hy /var/lib/hysteria >/dev/null 2>&1 || true
+
+  if [[ -n $(echo "$ip" | grep ":") ]]; then
+    last_ip="[$ip]"
+  else
+    last_ip="$ip"
+  fi
+
+  if [[ -n "$firstport" && -n "$endport" ]]; then
+    port_range="$firstport-$endport"
+  else
+    port_range="$port"
+  fi
+
+  green "步骤 4/4：写入配置并启动服务"
 
   cat > /etc/hysteria/config.yaml <<EOF
 listen: :$port
@@ -880,13 +893,10 @@ masquerade:
   proxy:
     url: https://$proxysite
     rewriteHost: true
+  listenHTTP: :80
+  listenHTTPS: :443
+  forceHTTPS: true
 EOF
-
-  if [[ -n $(echo "$ip" | grep ":") ]]; then
-    last_ip="[$ip]"
-  else
-    last_ip="$ip"
-  fi
 
   cat > /root/hy/hy-client.yaml <<EOF
 server: $last_ip:$port
@@ -912,31 +922,35 @@ socks5:
   listen: 127.0.0.1:5080
 
 transport:
+  type: udp
   udp:
     hopInterval: 15s
 EOF
 
-  if [[ -n "$firstport" && -n "$endport" ]]; then
-    port_range="$firstport-$endport"
-  else
-    port_range="$port"
-  fi
-
-  ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
+  ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&insecure=1&mport=$port_range#H"
   echo "$ur1" > /root/hy/ur1.txt
 
   fix_hysteria_file_perms
 
   systemctl daemon-reload
-  systemctl enable hysteria-server >/dev/null 2>&1 || true
-  systemctl restart hysteria-server
 
-  if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
+  if systemctl list-unit-files | grep -q '^hysteria-server\.service'; then
+    hy_service="hysteria-server"
+  elif systemctl list-unit-files | grep -q '^hysteria\.service'; then
+    hy_service="hysteria"
+  else
+    hy_service="hysteria-server"
+  fi
+
+  systemctl enable "$hy_service" >/dev/null 2>&1 || true
+  systemctl restart "$hy_service"
+
+  if systemctl is-active --quiet "$hy_service" && [[ -f '/etc/hysteria/config.yaml' ]]; then
     green "Hysteria 2 服务启动成功"
   else
     red "Hysteria 2 服务启动失败，请检查以下信息："
-    systemctl status hysteria-server --no-pager -l || true
-    journalctl -u hysteria-server --no-pager -n 30 || true
+    systemctl status "$hy_service" --no-pager -l || true
+    journalctl -u "$hy_service" --no-pager -n 30 || true
     return 1
   fi
 
@@ -952,6 +966,11 @@ EOF
   green "$(cat /root/hy/ur1.txt)"
   yellow "二维码："
   qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+
+  yellow "伪装站验证："
+  green "1) 普通浏览器访问: https://$hy_domain"
+  green "2) curl 测试: curl -I --http3-only https://$hy_domain"
+  green "3) 查看日志: journalctl -u $hy_service -f"
 
   read -rp "回车返回菜单..." _
 }
