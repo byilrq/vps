@@ -585,45 +585,192 @@ install_firewall_persistent() {
 install_hy_environment() {
   green "开始安装环境依赖"
 
-  if ! pkg_install curl wget sudo procps iptables ca-certificates; then
-    yellow "基础依赖安装失败，尝试刷新软件源后重试..."
+  green "安装基础依赖"
+  fix_dpkg_interrupt
+
+  if ! env DEBIAN_FRONTEND=noninteractive \
+    DEBCONF_NONINTERACTIVE_SEEN=true \
+    DEBIAN_PRIORITY=critical \
+    NEEDRESTART_MODE=a \
+    APT_LISTCHANGES_FRONTEND=none \
+    timeout 300 apt-get install -y --no-install-recommends \
+    -o Dpkg::Use-Pty=0 \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confnew" \
+    -o DPkg::Pre-Install-Pkgs::= \
+    curl wget sudo procps iptables ca-certificates </dev/null; then
+
+    yellow "基础依赖安装失败，尝试刷新软件源并自动修复后重试..."
+    fix_dpkg_interrupt
     pkg_update || {
       red "软件源更新失败"
       return 1
     }
-    pkg_install curl wget sudo procps iptables ca-certificates || {
-      red "基础依赖安装失败"
-      return 1
-    }
+
+    env DEBIAN_FRONTEND=noninteractive \
+      DEBCONF_NONINTERACTIVE_SEEN=true \
+      DEBIAN_PRIORITY=critical \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      timeout 300 apt-get install -y --no-install-recommends \
+      -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confnew" \
+      -o DPkg::Pre-Install-Pkgs::= \
+      curl wget sudo procps iptables ca-certificates </dev/null || {
+        red "基础依赖安装失败"
+        return 1
+      }
   fi
 
   green "安装二维码与辅助工具"
-  if ! pkg_install qrencode socat; then
-    yellow "qrencode / socat 安装失败，尝试刷新软件源后重试..."
+  fix_dpkg_interrupt
+
+  if ! env DEBIAN_FRONTEND=noninteractive \
+    DEBCONF_NONINTERACTIVE_SEEN=true \
+    DEBIAN_PRIORITY=critical \
+    NEEDRESTART_MODE=a \
+    APT_LISTCHANGES_FRONTEND=none \
+    timeout 300 apt-get install -y --no-install-recommends \
+    -o Dpkg::Use-Pty=0 \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confnew" \
+    -o DPkg::Pre-Install-Pkgs::= \
+    qrencode socat </dev/null; then
+
+    yellow "qrencode / socat 安装失败，尝试刷新软件源并自动修复后重试..."
+    fix_dpkg_interrupt
     pkg_update || {
       red "软件源更新失败"
       return 1
     }
-    pkg_install qrencode socat || {
-      red "qrencode / socat 安装失败"
-      return 1
-    }
+
+    env DEBIAN_FRONTEND=noninteractive \
+      DEBCONF_NONINTERACTIVE_SEEN=true \
+      DEBIAN_PRIORITY=critical \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      timeout 300 apt-get install -y --no-install-recommends \
+      -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confnew" \
+      -o DPkg::Pre-Install-Pkgs::= \
+      qrencode socat </dev/null || {
+        red "qrencode / socat 安装失败"
+        return 1
+      }
   fi
 
   green "安装 OpenSSL 相关组件"
-  if ! pkg_install openssl libssl3; then
-    yellow "openssl / libssl3 安装失败，尝试刷新软件源后重试..."
+  fix_dpkg_interrupt
+
+  # 【核心修改：使用模拟安装来准确检测可用的 libssl 版本】
+  local ssl_pkg="libssl3"
+  if command -v apt-get >/dev/null 2>&1; then
+    if apt-get -s install libssl3 >/dev/null 2>&1; then
+      ssl_pkg="libssl3"
+    elif apt-get -s install libssl1.1 >/dev/null 2>&1; then
+      ssl_pkg="libssl1.1"
+    fi
+  fi
+
+  if ! env DEBIAN_FRONTEND=noninteractive \
+    DEBCONF_NONINTERACTIVE_SEEN=true \
+    DEBIAN_PRIORITY=critical \
+    NEEDRESTART_MODE=a \
+    APT_LISTCHANGES_FRONTEND=none \
+    timeout 300 apt-get install -y --no-install-recommends \
+    -o Dpkg::Use-Pty=0 \
+    -o Dpkg::Options::="--force-confdef" \
+    -o Dpkg::Options::="--force-confnew" \
+    -o DPkg::Pre-Install-Pkgs::= \
+    openssl "$ssl_pkg" </dev/null; then
+
+    yellow "openssl / $ssl_pkg 安装失败，尝试刷新软件源并自动修复后重试..."
+    fix_dpkg_interrupt
     pkg_update || {
       red "软件源更新失败"
       return 1
     }
-    pkg_install openssl libssl3 || {
-      red "openssl / libssl3 安装失败"
-      return 1
-    }
+
+    # 【同步修改：重试阶段同样使用模拟安装检测】
+    if command -v apt-get >/dev/null 2>&1; then
+      if apt-get -s install libssl3 >/dev/null 2>&1; then
+        ssl_pkg="libssl3"
+      elif apt-get -s install libssl1.1 >/dev/null 2>&1; then
+        ssl_pkg="libssl1.1"
+      fi
+    fi
+
+    env DEBIAN_FRONTEND=noninteractive \
+      DEBCONF_NONINTERACTIVE_SEEN=true \
+      DEBIAN_PRIORITY=critical \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      timeout 300 apt-get install -y --no-install-recommends \
+      -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confnew" \
+      -o DPkg::Pre-Install-Pkgs::= \
+      openssl "$ssl_pkg" </dev/null || {
+        red "openssl / $ssl_pkg 安装失败"
+        return 1
+      }
   fi
 
-  install_firewall_persistent || return 1
+  green "安装防火墙持久化组件"
+  fix_dpkg_interrupt
+
+  if command -v apt-get >/dev/null 2>&1; then
+    mkdir -p /etc/iptables >/dev/null 2>&1 || true
+    touch /etc/iptables/rules.v4 /etc/iptables/rules.v6 >/dev/null 2>&1 || true
+
+    command -v debconf-set-selections >/dev/null 2>&1 && {
+      echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+      echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+      echo "iptables-persistent iptables-persistent/autosave_done note" | debconf-set-selections
+    }
+
+    if ! env DEBIAN_FRONTEND=noninteractive \
+      DEBCONF_NONINTERACTIVE_SEEN=true \
+      DEBIAN_PRIORITY=critical \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      timeout 300 apt-get install -y --no-install-recommends \
+      -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confnew" \
+      -o DPkg::Pre-Install-Pkgs::= \
+      iptables-persistent netfilter-persistent </dev/null; then
+
+      yellow "首次安装防火墙持久化组件失败，尝试自动修复后重试..."
+      fix_dpkg_interrupt
+      pkg_update || true
+
+      command -v debconf-set-selections >/dev/null 2>&1 && {
+        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+        echo "iptables-persistent iptables-persistent/autosave_done note" | debconf-set-selections
+      }
+
+      env DEBIAN_FRONTEND=noninteractive \
+        DEBCONF_NONINTERACTIVE_SEEN=true \
+        DEBIAN_PRIORITY=critical \
+        NEEDRESTART_MODE=a \
+        APT_LISTCHANGES_FRONTEND=none \
+        timeout 300 apt-get install -y --no-install-recommends \
+        -o Dpkg::Use-Pty=0 \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confnew" \
+        -o DPkg::Pre-Install-Pkgs::= \
+        iptables-persistent netfilter-persistent </dev/null || {
+          red "iptables-persistent / netfilter-persistent 安装失败"
+          return 1
+        }
+    fi
+  else
+    pkg_install iptables-services >/dev/null 2>&1 || true
+  fi
 
   green "环境依赖安装完成"
   return 0
