@@ -622,31 +622,64 @@ sys_cle() {
 # -----------------------------
 #  acme证书清理
 # -----------------------------
-acme_purge_all() {
+#!/usr/bin/env bash
+
+acme_purge_keep_xui() {
   set +e
+
   local DOMAIN="${1:-}"
-  local ACME_HOME="${HOME}/.acme.sh"
+  local ACME_HOME="/root/.acme.sh"
 
   echo "=============================="
-  echo "[INFO] 开始清理 acme.sh 痕迹"
-  [ -n "$DOMAIN" ] && echo "[INFO] 指定域名: $DOMAIN" || echo "[INFO] 全局清理"
+  echo "[INFO] 开始清理 acme.sh 痕迹(保留 x-ui 依赖)"
+  [ -n "$DOMAIN" ] && echo "[INFO] 指定域名: $DOMAIN" || echo "[INFO] 未指定域名: 仅清理证书和申请记录"
   echo "=============================="
 
+  if [ "$(id -u)" != "0" ]; then
+    echo "[ERR] 请使用 root 执行"
+    return 1
+  fi
+
+  echo
+  echo "[STEP 1] 停止可能占用 80 端口的服务"
   for svc in nginx apache2 httpd caddy; do
     systemctl stop "$svc" 2>/dev/null
   done
 
-  if command -v acme.sh >/dev/null 2>&1; then
-    acme.sh --uninstall 2>/dev/null
+  echo
+  echo "[STEP 2] 确保 acme.sh 主程序存在，避免 x-ui 报错"
+  if [ ! -f /root/.acme.sh/acme.sh ]; then
+    echo "[WARN] /root/.acme.sh/acme.sh 不存在，正在重装 acme.sh"
+    curl https://get.acme.sh | sh
+    chmod +x /root/.acme.sh/acme.sh 2>/dev/null
   fi
 
-  rm -rf "$ACME_HOME"
-  rm -rf /root/.acme.sh 2>/dev/null
+  if [ ! -f /root/.acme.sh/acme.sh ]; then
+    echo "[ERR] acme.sh 主程序恢复失败"
+    return 1
+  fi
 
+  echo
+  echo "[STEP 3] 删除指定域名申请记录"
+  if [ -n "$DOMAIN" ]; then
+    /root/.acme.sh/acme.sh --remove -d "$DOMAIN" 2>/dev/null
+    rm -rf "/root/.acme.sh/${DOMAIN}"
+    rm -rf "/root/.acme.sh/${DOMAIN}_ecc"
+    find /root/.acme.sh -maxdepth 1 \( -name "*${DOMAIN}*" \) -exec rm -rf {} \; 2>/dev/null
+  fi
+
+  echo
+  echo "[STEP 4] 清理旧 cron 中的域名相关任务"
   if crontab -l >/dev/null 2>&1; then
-    crontab -l | grep -v 'acme\.sh' | crontab -
+    if [ -n "$DOMAIN" ]; then
+      crontab -l | grep -v "$DOMAIN" | crontab -
+    else
+      crontab -l | grep -v 'acme\.sh' | crontab -
+    fi
   fi
 
+  echo
+  echo "[STEP 5] 清理 systemd 中可能的 acme 定时项"
   systemctl disable --now acme.sh.timer 2>/dev/null
   systemctl disable --now acme.timer 2>/dev/null
   rm -f /etc/systemd/system/acme.sh.service \
@@ -655,6 +688,8 @@ acme_purge_all() {
         /etc/systemd/system/acme.timer 2>/dev/null
   systemctl daemon-reload 2>/dev/null
 
+  echo
+  echo "[STEP 6] 清理常见目录中的旧证书文件"
   local CERT_PATHS=(
     /etc/nginx/ssl
     /etc/nginx/certs
@@ -665,6 +700,10 @@ acme_purge_all() {
     /etc/caddy
     /etc/apache2
     /etc/httpd
+    /root/cert
+    /root/certs
+    /etc/x-ui
+    /usr/local/x-ui
     /root
   )
 
@@ -677,30 +716,36 @@ acme_purge_all() {
       done
     done
   else
-    for p in "${CERT_PATHS[@]}"; do
-      [ -d "$p" ] || continue
-      find "$p" -type f \( -name "*.key" -o -name "*.pem" -o -name "*.crt" -o -name "*.cer" \) 2>/dev/null | while read -r f; do
-        rm -f "$f"
-        echo "[DEL] $f"
-      done
+    echo "[WARN] 未指定域名，不执行全盘证书删除，避免误删其他业务证书"
+  fi
+
+  echo
+  echo "[STEP 7] 清理临时文件"
+  if [ -n "$DOMAIN" ]; then
+    find /tmp /var/tmp -maxdepth 2 \( -iname "*acme*" -o -iname "*.csr" -o -iname "*${DOMAIN}*" \) 2>/dev/null | while read -r f; do
+      rm -rf "$f"
+      echo "[DEL] $f"
+    done
+  else
+    find /tmp /var/tmp -maxdepth 2 \( -iname "*acme*" -o -iname "*.csr" \) 2>/dev/null | while read -r f; do
+      rm -rf "$f"
+      echo "[DEL] $f"
     done
   fi
 
-  for rc in /root/.bashrc /root/.profile /root/.zshrc "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
-    [ -f "$rc" ] || continue
-    sed -i '/\.acme\.sh/d' "$rc" 2>/dev/null
-  done
+  echo
+  echo "[STEP 8] 验证 x-ui 所需 acme.sh 是否还在"
+  if [ -f /root/.acme.sh/acme.sh ]; then
+    echo "[OK] acme.sh 主程序仍存在: /root/.acme.sh/acme.sh"
+  else
+    echo "[ERR] acme.sh 主程序缺失，x-ui 后续会报错"
+    return 1
+  fi
 
-  find /tmp /var/tmp -maxdepth 2 \( -iname "*acme*" -o -iname "*.csr" \) 2>/dev/null | while read -r f; do
-    rm -rf "$f"
-    echo "[DEL] $f"
-  done
-
-  echo "[DONE] acme.sh 清理完成"
-}
-
-prepare_reinstall_acme() {
-  acme_purge_all "$1"
+  echo
+  echo "=============================="
+  echo "[DONE] 清理完成(已保留 x-ui 依赖)"
+  echo "=============================="
 }
 
 # -----------------------------
