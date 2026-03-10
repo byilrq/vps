@@ -626,15 +626,19 @@ acme_purge_keep_xui() {
   set +e
 
   local DOMAIN="${1:-}"
-  local ACME_HOME="/root/.acme.sh"
 
   echo "=============================="
   echo "[INFO] 开始清理 acme.sh 痕迹(保留 x-ui 依赖)"
-  [ -n "$DOMAIN" ] && echo "[INFO] 指定域名: $DOMAIN" || echo "[INFO] 未指定域名: 仅清理证书和申请记录"
+  [ -n "$DOMAIN" ] && echo "[INFO] 指定域名: $DOMAIN" || echo "[INFO] 未指定域名"
   echo "=============================="
 
   if [ "$(id -u)" != "0" ]; then
     echo "[ERR] 请使用 root 执行"
+    return 1
+  fi
+
+  if [ -z "$DOMAIN" ]; then
+    echo "[ERR] 必须指定域名，避免误删"
     return 1
   fi
 
@@ -645,10 +649,10 @@ acme_purge_keep_xui() {
   done
 
   echo
-  echo "[STEP 2] 确保 acme.sh 主程序存在，避免 x-ui 报错"
+  echo "[STEP 2] 确保 acme.sh 主程序存在"
   if [ ! -f /root/.acme.sh/acme.sh ]; then
-    echo "[WARN] /root/.acme.sh/acme.sh 不存在，正在重装 acme.sh"
-    curl https://get.acme.sh | sh
+    echo "[WARN] /root/.acme.sh/acme.sh 不存在，尝试重装"
+    curl -fsSL https://get.acme.sh | sh
     chmod +x /root/.acme.sh/acme.sh 2>/dev/null
   fi
 
@@ -658,43 +662,23 @@ acme_purge_keep_xui() {
   fi
 
   echo
-  echo "[STEP 3] 删除指定域名申请记录"
-  if [ -n "$DOMAIN" ]; then
-    /root/.acme.sh/acme.sh --remove -d "$DOMAIN" 2>/dev/null
-    rm -rf "/root/.acme.sh/${DOMAIN}"
-    rm -rf "/root/.acme.sh/${DOMAIN}_ecc"
-    find /root/.acme.sh -maxdepth 1 \( -name "*${DOMAIN}*" \) -exec rm -rf {} \; 2>/dev/null
-  fi
+  echo "[STEP 3] 删除域名申请记录"
+  /root/.acme.sh/acme.sh --remove -d "$DOMAIN" 2>/dev/null
+  rm -rf "/root/.acme.sh/${DOMAIN}"
+  rm -rf "/root/.acme.sh/${DOMAIN}_ecc"
+  find /root/.acme.sh -maxdepth 1 -name "*${DOMAIN}*" -exec rm -rf {} \; 2>/dev/null
 
   echo
-  echo "[STEP 4] 清理旧 cron 中的域名相关任务"
+  echo "[STEP 4] 清理 cron 中与该域名相关项目"
   if crontab -l >/dev/null 2>&1; then
-    if [ -n "$DOMAIN" ]; then
-      crontab -l | grep -v "$DOMAIN" | crontab -
-    else
-      crontab -l | grep -v 'acme\.sh' | crontab -
-    fi
+    crontab -l | grep -v "$DOMAIN" | crontab -
   fi
 
   echo
-  echo "[STEP 5] 清理 systemd 中可能的 acme 定时项"
-  systemctl disable --now acme.sh.timer 2>/dev/null
-  systemctl disable --now acme.timer 2>/dev/null
-  rm -f /etc/systemd/system/acme.sh.service \
-        /etc/systemd/system/acme.sh.timer \
-        /etc/systemd/system/acme.service \
-        /etc/systemd/system/acme.timer 2>/dev/null
-  systemctl daemon-reload 2>/dev/null
-
-  echo
-  echo "[STEP 6] 清理常见目录中的旧证书文件"
+  echo "[STEP 5] 清理旧证书文件"
   local CERT_PATHS=(
     /etc/nginx/ssl
     /etc/nginx/certs
-    /etc/ssl
-    /etc/ssl/private
-    /etc/pki
-    /usr/local/etc
     /etc/caddy
     /etc/apache2
     /etc/httpd
@@ -702,52 +686,38 @@ acme_purge_keep_xui() {
     /root/certs
     /etc/x-ui
     /usr/local/x-ui
-    /root
   )
 
-  if [ -n "$DOMAIN" ]; then
-    for p in "${CERT_PATHS[@]}"; do
-      [ -d "$p" ] || continue
-      find "$p" -type f 2>/dev/null | grep "$DOMAIN" | while read -r f; do
-        rm -f "$f"
-        echo "[DEL] $f"
-      done
-    done
-  else
-    echo "[WARN] 未指定域名，不执行全盘证书删除，避免误删其他业务证书"
-  fi
-
-  echo
-  echo "[STEP 7] 清理临时文件"
-  if [ -n "$DOMAIN" ]; then
-    find /tmp /var/tmp -maxdepth 2 \( -iname "*acme*" -o -iname "*.csr" -o -iname "*${DOMAIN}*" \) 2>/dev/null | while read -r f; do
-      rm -rf "$f"
+  for p in "${CERT_PATHS[@]}"; do
+    [ -d "$p" ] || continue
+    find "$p" -type f 2>/dev/null | grep "$DOMAIN" | while read -r f; do
+      rm -f "$f"
       echo "[DEL] $f"
     done
-  else
-    find /tmp /var/tmp -maxdepth 2 \( -iname "*acme*" -o -iname "*.csr" \) 2>/dev/null | while read -r f; do
-      rm -rf "$f"
-      echo "[DEL] $f"
-    done
-  fi
+  done
 
   echo
-  echo "[STEP 8] 验证 x-ui 所需 acme.sh 是否还在"
+  echo "[STEP 6] 清理临时文件"
+  find /tmp /var/tmp -maxdepth 2 \( -iname "*acme*" -o -iname "*.csr" -o -iname "*${DOMAIN}*" \) 2>/dev/null | while read -r f; do
+    rm -rf "$f"
+    echo "[DEL] $f"
+  done
+
+  echo
+  echo "[STEP 7] 验证 x-ui 依赖"
   if [ -f /root/.acme.sh/acme.sh ]; then
-    echo "[OK] acme.sh 主程序仍存在: /root/.acme.sh/acme.sh"
+    echo "[OK] acme.sh 主程序仍存在"
   else
-    echo "[ERR] acme.sh 主程序缺失，x-ui 后续会报错"
+    echo "[ERR] acme.sh 主程序缺失"
     return 1
   fi
 
   echo
-  echo "=============================="
-  echo "[DONE] 清理完成(已保留 x-ui 依赖)"
-  echo "=============================="
+  echo "[DONE] 清理完成"
 }
 
 # -----------------------------
-# Menu (1..9)
+# Menu
 # -----------------------------
 menu_sys_conf() {
   need_root
@@ -771,7 +741,7 @@ menu_sys_conf() {
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-10]: " choice
+    read -rp "请选择 [0-11]: " choice
     case "$choice" in
       1) change_tz ;;
       2) set_dns_ui ;;
