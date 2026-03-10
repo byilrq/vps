@@ -620,6 +620,90 @@ sys_cle() {
   esac
 }
 # -----------------------------
+#  acme证书清理
+# -----------------------------
+acme_purge_all() {
+  set +e
+  local DOMAIN="${1:-}"
+  local ACME_HOME="${HOME}/.acme.sh"
+
+  echo "=============================="
+  echo "[INFO] 开始清理 acme.sh 痕迹"
+  [ -n "$DOMAIN" ] && echo "[INFO] 指定域名: $DOMAIN" || echo "[INFO] 全局清理"
+  echo "=============================="
+
+  for svc in nginx apache2 httpd caddy; do
+    systemctl stop "$svc" 2>/dev/null
+  done
+
+  if command -v acme.sh >/dev/null 2>&1; then
+    acme.sh --uninstall 2>/dev/null
+  fi
+
+  rm -rf "$ACME_HOME"
+  rm -rf /root/.acme.sh 2>/dev/null
+
+  if crontab -l >/dev/null 2>&1; then
+    crontab -l | grep -v 'acme\.sh' | crontab -
+  fi
+
+  systemctl disable --now acme.sh.timer 2>/dev/null
+  systemctl disable --now acme.timer 2>/dev/null
+  rm -f /etc/systemd/system/acme.sh.service \
+        /etc/systemd/system/acme.sh.timer \
+        /etc/systemd/system/acme.service \
+        /etc/systemd/system/acme.timer 2>/dev/null
+  systemctl daemon-reload 2>/dev/null
+
+  local CERT_PATHS=(
+    /etc/nginx/ssl
+    /etc/nginx/certs
+    /etc/ssl
+    /etc/ssl/private
+    /etc/pki
+    /usr/local/etc
+    /etc/caddy
+    /etc/apache2
+    /etc/httpd
+    /root
+  )
+
+  if [ -n "$DOMAIN" ]; then
+    for p in "${CERT_PATHS[@]}"; do
+      [ -d "$p" ] || continue
+      find "$p" -type f 2>/dev/null | grep "$DOMAIN" | while read -r f; do
+        rm -f "$f"
+        echo "[DEL] $f"
+      done
+    done
+  else
+    for p in "${CERT_PATHS[@]}"; do
+      [ -d "$p" ] || continue
+      find "$p" -type f \( -name "*.key" -o -name "*.pem" -o -name "*.crt" -o -name "*.cer" \) 2>/dev/null | while read -r f; do
+        rm -f "$f"
+        echo "[DEL] $f"
+      done
+    done
+  fi
+
+  for rc in /root/.bashrc /root/.profile /root/.zshrc "$HOME/.bashrc" "$HOME/.profile" "$HOME/.zshrc"; do
+    [ -f "$rc" ] || continue
+    sed -i '/\.acme\.sh/d' "$rc" 2>/dev/null
+  done
+
+  find /tmp /var/tmp -maxdepth 2 \( -iname "*acme*" -o -iname "*.csr" \) 2>/dev/null | while read -r f; do
+    rm -rf "$f"
+    echo "[DEL] $f"
+  done
+
+  echo "[DONE] acme.sh 清理完成"
+}
+
+prepare_reinstall_acme() {
+  acme_purge_all "$1"
+}
+
+# -----------------------------
 # Menu (1..9)
 # -----------------------------
 menu_sys_conf() {
@@ -640,6 +724,7 @@ menu_sys_conf() {
     echo -e " ${GREEN}8.${tianlan} 修改SSH端口2222"
     echo -e " ${GREEN}9.${tianlan} 设置防火墙"
     echo -e " ${GREEN}10.${tianlan} 系统清理"
+    echo -e " ${GREEN}11.${tianlan} 系统清理"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
@@ -655,6 +740,7 @@ menu_sys_conf() {
       8) ssh_port 2222 ;;
       9) firewall ;;
       10) sys_cle ;;
+      11) acme_purge_all ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
