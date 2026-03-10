@@ -783,7 +783,10 @@ menu_sys_conf() {
       8) ssh_port 2222 ;;
       9) firewall ;;
       10) sys_cle ;;
-      11) acme_purge_all ;;
+      11) 
+  read -rp "请输入要清理的域名（留空取消）: " domain
+  [[ -n "$domain" ]] && acme_purge_keep_xui "$domain"
+  ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
