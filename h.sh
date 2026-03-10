@@ -892,7 +892,7 @@ quic:
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 30s
+  maxIdleTimeout: 90s
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: false
 
@@ -946,7 +946,7 @@ socks5:
 transport:
   type: udp
   udp:
-    hopInterval: 15s
+    hopInterval: 30s
 EOF
 
   if [[ "$tls_insecure" == "true" ]]; then
