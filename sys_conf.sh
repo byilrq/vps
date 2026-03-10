@@ -622,8 +622,6 @@ sys_cle() {
 # -----------------------------
 #  acme证书清理
 # -----------------------------
-#!/usr/bin/env bash
-
 acme_purge_keep_xui() {
   set +e
 
