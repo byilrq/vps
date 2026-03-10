@@ -515,84 +515,63 @@ inst_site() {
 # -----------------------------
 # Install Hysteria2
 # -----------------------------
-insthysteria() {
-  green "开始安装 Hysteria 2"
+insthysteria(){
+    warpv6=$(curl -s6m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    warpv4=$(curl -s4m8 https://www.cloudflare.com/cdn-cgi/trace -k | grep warp | cut -d= -f2)
+    if [[ $warpv4 =~ on|plus || $warpv6 =~ on|plus ]]; then
+        wg-quick down wgcf >/dev/null 2>&1
+        systemctl stop warp-go >/dev/null 2>&1
+        realip
+        systemctl start warp-go >/dev/null 2>&1
+        wg-quick up wgcf >/dev/null 2>&1
+    else
+        realip
+    fi
 
-  if command -v apt-get >/dev/null 2>&1; then
-    wait_for_apt_lock || true
-    fix_dpkg_if_needed || { red "系统包状态修复失败"; return 1; }
-  fi
+   # -----------------------------------------
+   #  等待 apt 锁释放（wait_for_apt_lock）
+   # -----------------------------------------
+wait_for_apt_lock() {
+    local max_attempts=60  # 最大等待时间约1分钟（每秒检查一次）
+    local attempt=0
+    while fuser /var/lib/dpkg/lock-frontend >/dev/null 2>&1 || fuser /var/lib/apt/lists/lock >/dev/null 2>&1; do
+        if [ $attempt -ge $max_attempts ]; then
+            red "apt 锁等待超时，请手动检查进程并释放锁（例如 kill <PID>），然后重试。"
+            exit 1
+        fi
+        yellow "apt 锁被占用（可能有其他更新进程），等待中... ($attempt/$max_attempts)"
+        sleep 1
+        attempt=$((attempt + 1))
+    done
+    green "apt 锁已释放，继续安装。"
+}
 
-  realip || return 1
+# 在更新和安装前调用等待函数
+if [[ ! ${SYSTEM} == "CentOS" ]]; then
+    wait_for_apt_lock
+    ${PACKAGE_UPDATE}
+fi
+wait_for_apt_lock
+${PACKAGE_INSTALL} curl wget sudo qrencode procps iptables-persistent netfilter-persistent
 
-  green "步骤 1/6：更新软件源"
-  pkg_update || { red "软件源更新失败"; return 1; }
+    wget -N https://raw.githubusercontent.com/byilrq/vps/main/install_h.sh
+    bash install_h.sh
+    rm -f install_h.sh
+      
+    if [[ -f "/usr/local/bin/hysteria" ]]; then
+        green "Hysteria 2 安装成功！"
+    else
+        red "Hysteria 2 安装失败！"
+    fi
 
-  green "步骤 2/6：安装核心依赖"
-  pkg_install curl wget sudo procps iptables openssl socat || {
-    red "核心依赖安装失败"
-    return 1
-  }
+    # 询问用户 Hysteria 配置
+    inst_cert
+    inst_port
+    inst_pwd
+    inst_site
 
-  green "步骤 2.1/6：安装可选组件 qrencode"
-  if command -v apt-get >/dev/null 2>&1; then
-    wait_for_apt_lock || true
-    fix_dpkg_if_needed || true
-    DEBIAN_FRONTEND=noninteractive timeout 180 apt-get install -y -o Dpkg::Use-Pty=0 qrencode || \
-      yellow "qrencode 安装失败或超时，跳过二维码功能"
-  else
-    pkg_install qrencode >/dev/null 2>&1 || \
-      yellow "qrencode 安装失败，跳过二维码功能"
-  fi
-
-  green "步骤 2.2/6：安装防火墙持久化组件"
-  if command -v apt-get >/dev/null 2>&1; then
-    command -v debconf-set-selections >/dev/null 2>&1 && {
-      echo iptables-persistent iptables-persistent/autosave_v4 boolean true | debconf-set-selections
-      echo iptables-persistent iptables-persistent/autosave_v6 boolean true | debconf-set-selections
-    }
-
-    wait_for_apt_lock || true
-    fix_dpkg_if_needed || true
-
-    DEBIAN_FRONTEND=noninteractive timeout 180 apt-get install -y \
-      -o Dpkg::Use-Pty=0 \
-      -o Dpkg::Options::="--force-confnew" \
-      iptables-persistent netfilter-persistent || \
-      yellow "iptables-persistent/netfilter-persistent 安装失败或超时，继续执行"
-  else
-    pkg_install iptables-services >/dev/null 2>&1 || true
-  fi
-
-  green "步骤 3/6：下载核心安装脚本"
-  local url="https://raw.githubusercontent.com/byilrq/vps/main/install_h.sh"
-  rm -f /tmp/install_h.sh /tmp/install_h.log >/dev/null 2>&1 || true
-  download_with_retry "$url" /tmp/install_h.sh || {
-    red "下载 install_h.sh 失败"
-    return 1
-  }
-  [[ -s /tmp/install_h.sh ]] || { red "install_h.sh 文件为空"; return 1; }
-
-  green "步骤 4/6：执行安装脚本"
-  bash /tmp/install_h.sh | tee /tmp/install_h.log
-  rm -f /tmp/install_h.sh
-
-  [[ -f "/usr/local/bin/hysteria" ]] || {
-    red "Hysteria 2 安装失败！请查看 /tmp/install_h.log"
-    return 1
-  }
-  green "Hysteria 2 安装成功！"
-
-  green "步骤 5/6：配置证书、端口、密码"
-  inst_cert
-  inst_port
-  inst_pwd
-  inst_site
-
-  green "步骤 6/6：写入配置并启动服务"
-  mkdir -p /etc/hysteria /root/hy /var/lib/hysteria >/dev/null 2>&1 || true
-
-  cat > /etc/hysteria/config.yaml <<EOF
+    # 设置 Hysteria 配置文件
+    cat << EOF > /etc/hysteria/config.yaml
 listen: :$port
 
 tls:
@@ -604,9 +583,9 @@ quic:
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 30s
-  maxIncomingStreams: 1024
-  disablePathMTUDiscovery: false
+  maxIdleTimeout: 30s 
+  maxIncomingStreams: 1024 
+  disablePathMTUDiscovery: false 
 
 auth:
   type: password
@@ -619,26 +598,48 @@ masquerade:
   proxy:
     url: https://$proxysite
     rewriteHost: true
+
 EOF
 
-  cat > /root/hy/hy-client.yaml <<EOF
-server: $hy_domain:$port
+    # 确定最终入站端口范围--ur1
+    if [[ -n $firstport ]]; then
+        last_port="$port,$firstport-$endport"
+    else
+        last_port=$port
+    fi
+    # 确定最终入站端口范围--ur2
+    if [[ -n $firstport ]]; then
+        port_range="$firstport-$endport"
+    else
+        last_port=$port
+    fi
+    # 给 IPv6 地址加中括号
+    if [[ -n $(echo $ip | grep ":") ]]; then
+        last_ip="[$ip]"
+    else
+        last_ip=$ip
+    fi
+
+    mkdir /root/hy
+    
+    cat << EOF > /root/hy/hy-client.yaml
+server: $last_ip:$port_range
 
 auth: $auth_pwd
 
 tls:
   sni: $hy_domain
-  insecure: false
+  insecure: true
 
 quic:
-  initStreamReceiveWindow: 8388608
-  maxStreamReceiveWindow: 8388608
-  initConnReceiveWindow: 20971520
-  maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 90s
-  keepAlivePeriod: 10s
-  disablePathMTUDiscovery: false
-
+  initStreamReceiveWindow: 8388608 
+  maxStreamReceiveWindow: 8388608 
+  initConnReceiveWindow: 20971520 
+  maxConnReceiveWindow: 20971520 
+  maxIdleTimeout: 90s 
+  keepAlivePeriod: 10s 
+  disablePathMTUDiscovery: false 
+  
 fastOpen: true
 
 socks5:
@@ -646,50 +647,31 @@ socks5:
 
 transport:
   udp:
-    hopInterval: 15s
+    hopInterval: 15s 
 EOF
+  
+    ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
+    echo $ur1 > /root/hy/ur1.txt
 
-  if [[ -n "$firstport" && -n "$endport" ]]; then
-    port_range="$firstport-$endport"
-  else
-    port_range="$port"
-  fi
-
-  ur1="hysteria2://${auth_pwd}@${hy_domain}:${port}/?sni=${hy_domain}&peer=${hy_domain}&mport=${port_range}#H"
-  echo "$ur1" > /root/hy/ur1.txt
-
-  fix_hysteria_file_perms
-
-  systemctl daemon-reload
-  systemctl enable hysteria-server >/dev/null 2>&1 || true
-  systemctl restart hysteria-server
-
-  if systemctl is-active --quiet hysteria-server && [[ -f '/etc/hysteria/config.yaml' ]]; then
-    green "Hysteria 2 服务启动成功"
-  else
-    red "Hysteria 2 服务启动失败，请检查以下日志："
-    systemctl status hysteria-server --no-pager -l || true
-    journalctl -u hysteria-server --no-pager -n 30 || true
-    exit 1
-  fi
-
-  red "======================================================================================"
-  green "Hysteria 2 代理服务安装完成"
-  yellow "服务端配置 /etc/hysteria/config.yaml："
-  green "$(cat /etc/hysteria/config.yaml)"
-  yellow "客户端配置 /root/hy/hy-client.yaml："
-  green "$(cat /root/hy/hy-client.yaml)"
-  yellow "分享链接 /root/hy/ur1.txt："
-  green "$(cat /root/hy/ur1.txt)"
-  yellow "二维码："
-  if command -v qrencode >/dev/null 2>&1; then
-    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
-  else
-    yellow "未安装 qrencode，跳过终端二维码显示"
-  fi
-
-  read -rp "回车返回菜单..." _
-}
+    systemctl daemon-reload
+    systemctl enable hysteria-server
+    systemctl start hysteria-server
+    if [[ -n $(systemctl status hysteria-server 2>/dev/null | grep -w active) && -f '/etc/hysteria/config.yaml' ]]; then
+        green "Hysteria 2 服务启动成功"
+    else
+        red "Hysteria 2 服务启动失败，请运行 systemctl status hysteria-server 查看服务状态并反馈，脚本退出" && exit 1
+    fi
+    red "======================================================================================"
+    green "Hysteria 2 代理服务安装完成"
+    yellow "Hysteria 2 服务端 YAML 配置文件 hy-client.yaml 内容如下，并保存到 /etc/hysteria/config.yaml"
+    green "$(cat /etc/hysteria/config.yaml)"
+    yellow "Hysteria 2 客户端 YAML 配置文件 hy-client.yaml 内容如下，并保存到 /root/hy/hy-client.yaml"
+    green "$(cat /root/hy/hy-client.yaml)"
+    yellow "Hysteria 2 节点分享链接如下，并保存到 /root/hy/ur1.txt"
+    green "$(cat /root/hy/ur1.txt)"
+    yellow "Hysteria 2 分享二维码如下："
+    qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)"
+ }
 # -----------------------------
 # Uninstall / start / stop
 # -----------------------------
@@ -937,13 +919,13 @@ update_core1() {
 update_core2() {
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   rm -f /usr/local/bin/hysteria
-  download_with_retry "https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh" /tmp/install_server.sh || {
+  download_with_retry "https://raw.githubusercontent.com/byilrq/vps/main/install_h.sh" /tmp/install_h.sh || {
     red "下载失败"
     return 1
   }
-  [[ -s /tmp/install_server.sh ]] || { red "文件为空"; return 1; }
-  bash /tmp/install_server.sh
-  rm -f /tmp/install_server.sh
+  [[ -s /tmp/install_h.sh ]] || { red "文件为空"; return 1; }
+  bash /tmp/install_h.sh
+  rm -f /tmp/install_h.sh
   systemctl restart hysteria-server.service
   green "Hysteria 内核已更新并重启"
   read -rp "回车返回菜单..." _
