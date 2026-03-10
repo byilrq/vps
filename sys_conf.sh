@@ -724,7 +724,7 @@ menu_sys_conf() {
     echo -e " ${GREEN}8.${tianlan} 修改SSH端口2222"
     echo -e " ${GREEN}9.${tianlan} 设置防火墙"
     echo -e " ${GREEN}10.${tianlan} 系统清理"
-    echo -e " ${GREEN}11.${tianlan} 系统清理"
+    echo -e " ${GREEN}11.${tianlan} acme证书清理"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
