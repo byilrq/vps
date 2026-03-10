@@ -584,6 +584,17 @@ install_firewall_persistent() {
 # -----------------------------
 install_hy_environment() {
   green "开始安装环境依赖"
+  
+  # ==========================================
+  # 🌟 优化：提前更新软件源缓存，避免后续寻找不到包的报错
+  # ==========================================
+  green "正在刷新软件源缓存..."
+  fix_dpkg_interrupt
+  # 尝试静默更新软件源，如果不成功也不强求报错，留给后面的容错机制处理
+  if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y -q >/dev/null 2>&1 || true
+  fi
+  # ==========================================
 
   green "安装基础依赖"
   fix_dpkg_interrupt
@@ -664,7 +675,6 @@ install_hy_environment() {
   green "安装 OpenSSL 相关组件"
   fix_dpkg_interrupt
 
-  # 【核心修改：使用模拟安装来准确检测可用的 libssl 版本】
   local ssl_pkg="libssl3"
   if command -v apt-get >/dev/null 2>&1; then
     if apt-get -s install libssl3 >/dev/null 2>&1; then
@@ -693,7 +703,6 @@ install_hy_environment() {
       return 1
     }
 
-    # 【同步修改：重试阶段同样使用模拟安装检测】
     if command -v apt-get >/dev/null 2>&1; then
       if apt-get -s install libssl3 >/dev/null 2>&1; then
         ssl_pkg="libssl3"
