@@ -863,7 +863,7 @@ EOF
 	# -----------------------------
 	# Core updates / tools
 	# -----------------------------
-	update_core1() {
+	update_core() {
 	  green "官方更新方式必须先脚本安装后使用，否则会失败。"
 	  systemctl stop hysteria-server.service >/dev/null 2>&1 || true
 	  rm -f /usr/local/bin/hysteria
@@ -874,20 +874,10 @@ EOF
 	  read -rp "回车返回菜单..." _
 	}
 
-	update_core2() {
-	  systemctl stop hysteria-server.service >/dev/null 2>&1 || true
-	  rm -f /usr/local/bin/hysteria
-	  download_with_retry "https://raw.githubusercontent.com/byilrq/vps/main/install_server.sh" /tmp/install_server.sh || {
-		red "下载失败"
-		return 1
-	  }
-	  [[ -s /tmp/install_server.sh ]] || { red "文件为空"; return 1; }
-	  bash /tmp/install_server.sh
-	  rm -f /tmp/install_server.sh
-	  systemctl restart hysteria-server.service
-	  green "Hysteria 内核已更新并重启"
-	  read -rp "回车返回菜单..." _
-	}
+	# -----------------------------
+	# 回城路由+IP质量检测
+	# -----------------------------
+
 
 	besttrace() { wget -qO- git.io/besttrace | bash; read -rp "回车返回菜单..." _; }
 	ipquality() { curl -sL https://Check.Place | bash -s - -I; read -rp "回车返回菜单..." _; }
@@ -1091,12 +1081,11 @@ EOF
 		echo -e " ${GREEN}5.${tianlan} 修改 系统配置"
 		echo -e " ${GREEN}6.${tianlan} 显示 配置文件"
 		echo -e " ${GREEN}7.${tianlan} 查询 运行状态"
-		echo -e " ${GREEN}8.${tianlan} 更新内核方式1（官方）"
-		echo -e " ${GREEN}9.${tianlan} 更新内核方式2（脚本）"
-		echo -e " ${GREEN}10.${tianlan} 回程测试"
-		echo -e " ${GREEN}11.${tianlan} IP质量检测"
-		echo -e " ${GREEN}12.${tianlan} 系统查询"
-		echo -e " ${GREEN}13.${tianlan} 系统更新"
+		echo -e " ${GREEN}8.${tianlan} 更新内核"
+		echo -e " ${GREEN}9.${tianlan} 回程测试"
+		echo -e " ${GREEN}10.${tianlan} IP质量检测"
+		echo -e " ${GREEN}11.${tianlan} 系统查询"
+		echo -e " ${GREEN}12.${tianlan} 系统更新"
 		echo " ---------------------------------------------------"
 		echo -e " ${GREEN}0.${PLAIN} 退出脚本"
 		echo ""
@@ -1109,12 +1098,11 @@ EOF
 		  5 ) run_sys_conf ;;
 		  6 ) showconf ;;
 		  7 ) showstatus ;;
-		  8 ) update_core1 ;;
-		  9 ) update_core2 ;;
-		  10 ) besttrace ;;
-		  11 ) ipquality ;;
-		  12 ) linux_ps ;;
-		  13 ) linux_update ;;
+		  8 ) update_core ;;
+		  9 ) besttrace ;;
+		  10 ) ipquality ;;
+		  11 ) linux_ps ;;
+		  12 ) linux_update ;;
 		  0 ) break ;;
 		  * ) yellow "无效选项"; sleep 1 ;;
 		esac
