@@ -83,14 +83,37 @@ ensure_curl() {
     ${PACKAGE_INSTALL[int]} curl || { red "curl 安装失败"; exit 1; }
   fi
 }
+# -----------------------------
+# 自动修复被中断的 dpkg 状态
+# -----------------------------
+fix_dpkg_interrupt() {
+  if command -v dpkg >/dev/null 2>&1; then
+    env DEBIAN_FRONTEND=noninteractive \
+      DEBCONF_NONINTERACTIVE_SEEN=true \
+      DEBIAN_PRIORITY=critical \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      dpkg --configure -a >/dev/null 2>&1 || true
 
+    env DEBIAN_FRONTEND=noninteractive \
+      DEBCONF_NONINTERACTIVE_SEEN=true \
+      DEBIAN_PRIORITY=critical \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      apt-get -f install -y -o Dpkg::Use-Pty=0 >/dev/null 2>&1 || true
+  fi
+}
 # -----------------------------
 # 软件包管理辅助函数
 # -----------------------------
 pkg_update() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
-    timeout 300 apt-get update -y -o Dpkg::Use-Pty=0
+    fix_dpkg_interrupt
+    timeout 300 env DEBIAN_FRONTEND=noninteractive \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      apt-get update -y -o Dpkg::Use-Pty=0
   elif command -v dnf >/dev/null 2>&1; then
     timeout 300 dnf -y makecache
   elif command -v yum >/dev/null 2>&1; then
@@ -103,14 +126,21 @@ pkg_update() {
 pkg_install() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
-    timeout 600 apt-get install -y \
+    fix_dpkg_interrupt
+
+    env DEBIAN_FRONTEND=noninteractive \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      UCF_FORCE_CONFNEW=1 \
+      timeout 900 apt-get install -y --no-install-recommends \
       -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confdef" \
       -o Dpkg::Options::="--force-confnew" \
       "$@"
   elif command -v dnf >/dev/null 2>&1; then
-    timeout 600 dnf -y install "$@"
+    timeout 900 dnf -y install "$@"
   elif command -v yum >/dev/null 2>&1; then
-    timeout 600 yum -y install "$@"
+    timeout 900 yum -y install "$@"
   else
     return 1
   fi
@@ -487,6 +517,136 @@ inst_site() {
     red "伪装网站域名格式无效：$proxysite"
   done
 }
+# -----------------------------
+# 安装防火墙持久化组件
+# -----------------------------
+install_firewall_persistent() {
+  green "安装防火墙持久化组件"
+
+  fix_dpkg_interrupt
+
+  if command -v apt-get >/dev/null 2>&1; then
+    mkdir -p /etc/iptables >/dev/null 2>&1 || true
+    touch /etc/iptables/rules.v4 /etc/iptables/rules.v6 >/dev/null 2>&1 || true
+
+    command -v debconf-set-selections >/dev/null 2>&1 && {
+      echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+      echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+      echo "iptables-persistent iptables-persistent/autosave_done note" | debconf-set-selections
+    }
+
+    if ! env DEBIAN_FRONTEND=noninteractive \
+      DEBCONF_NONINTERACTIVE_SEEN=true \
+      DEBIAN_PRIORITY=critical \
+      NEEDRESTART_MODE=a \
+      APT_LISTCHANGES_FRONTEND=none \
+      timeout 300 apt-get install -y --no-install-recommends \
+      -o Dpkg::Use-Pty=0 \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confnew" \
+      -o DPkg::Pre-Install-Pkgs::= \
+      iptables-persistent netfilter-persistent </dev/null; then
+
+      yellow "首次安装防火墙持久化组件失败，尝试自动修复后重试..."
+      fix_dpkg_interrupt
+      pkg_update || true
+
+      command -v debconf-set-selections >/dev/null 2>&1 && {
+        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
+        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
+        echo "iptables-persistent iptables-persistent/autosave_done note" | debconf-set-selections
+      }
+
+      env DEBIAN_FRONTEND=noninteractive \
+        DEBCONF_NONINTERACTIVE_SEEN=true \
+        DEBIAN_PRIORITY=critical \
+        NEEDRESTART_MODE=a \
+        APT_LISTCHANGES_FRONTEND=none \
+        timeout 300 apt-get install -y --no-install-recommends \
+        -o Dpkg::Use-Pty=0 \
+        -o Dpkg::Options::="--force-confdef" \
+        -o Dpkg::Options::="--force-confnew" \
+        -o DPkg::Pre-Install-Pkgs::= \
+        iptables-persistent netfilter-persistent </dev/null || {
+          red "iptables-persistent / netfilter-persistent 安装失败"
+          return 1
+        }
+    fi
+  else
+    pkg_install iptables-services >/dev/null 2>&1 || true
+  fi
+
+  green "防火墙持久化组件安装完成"
+  return 0
+}
+# -----------------------------
+# 安装环境依赖
+# -----------------------------
+install_hy_environment() {
+  green "开始安装环境依赖"
+
+  if ! pkg_install curl wget sudo procps iptables ca-certificates; then
+    yellow "基础依赖安装失败，尝试刷新软件源后重试..."
+    pkg_update || {
+      red "软件源更新失败"
+      return 1
+    }
+    pkg_install curl wget sudo procps iptables ca-certificates || {
+      red "基础依赖安装失败"
+      return 1
+    }
+  fi
+
+  green "安装二维码与辅助工具"
+  if ! pkg_install qrencode socat; then
+    yellow "qrencode / socat 安装失败，尝试刷新软件源后重试..."
+    pkg_update || {
+      red "软件源更新失败"
+      return 1
+    }
+    pkg_install qrencode socat || {
+      red "qrencode / socat 安装失败"
+      return 1
+    }
+  fi
+
+  green "安装 OpenSSL 相关组件"
+  if ! pkg_install openssl libssl3; then
+    yellow "openssl / libssl3 安装失败，尝试刷新软件源后重试..."
+    pkg_update || {
+      red "软件源更新失败"
+      return 1
+    }
+    pkg_install openssl libssl3 || {
+      red "openssl / libssl3 安装失败"
+      return 1
+    }
+  fi
+
+  install_firewall_persistent || return 1
+
+  green "环境依赖安装完成"
+  return 0
+}
+# -----------------------------
+# 安装 Hysteria 内核
+# -----------------------------
+install_hy_core() {
+  green "开始安装 Hysteria 2 内核"
+
+  timeout 300 bash -c 'bash <(curl -fsSL https://get.hy2.sh/)' || {
+    red "Hysteria 2 官方安装失败或下载超时"
+    return 1
+  }
+
+  [[ -x "/usr/local/bin/hysteria" ]] || {
+    red "未检测到 /usr/local/bin/hysteria，安装可能失败"
+    return 1
+  }
+
+  green "Hysteria 2 内核安装成功"
+  return 0
+}
 
 # -----------------------------
 # 安装 Hysteria 2
@@ -496,36 +656,37 @@ insthysteria() {
 
   realip || return 1
 
-  green "步骤 1/4：安装基础依赖"
-  pkg_install curl wget sudo qrencode procps iptables openssl socat || {
-    red "依赖安装失败"
+  green "步骤 1/4：安装环境依赖"
+  install_hy_environment || return 1
+
+  green "步骤 2/4：安装 Hysteria 内核"
+  cd /tmp || return 1
+
+  wget -N https://raw.githubusercontent.com/byilrq/vps/main/install_h.sh || {
+    red "下载 install_h.sh 失败"
     return 1
   }
 
-  if command -v apt-get >/dev/null 2>&1; then
-    command -v debconf-set-selections >/dev/null 2>&1 && {
-      echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-      echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-    }
+  [[ -s /tmp/install_h.sh ]] || {
+    red "install_h.sh 文件为空"
+    rm -f /tmp/install_h.sh >/dev/null 2>&1 || true
+    return 1
+  }
 
-    pkg_install iptables-persistent netfilter-persistent >/dev/null 2>&1 || \
-      yellow "iptables-persistent/netfilter-persistent 安装失败，继续执行"
+  bash /tmp/install_h.sh || {
+    red "执行 install_h.sh 失败"
+    rm -f /tmp/install_h.sh >/dev/null 2>&1 || true
+    return 1
+  }
+
+  rm -f /tmp/install_h.sh
+
+  if [[ -f "/usr/local/bin/hysteria" ]]; then
+    green "Hysteria 2 安装成功！"
   else
-    pkg_install iptables-services >/dev/null 2>&1 || true
+    red "Hysteria 2 安装失败！"
+    return 1
   fi
-
-  green "步骤 2/4：使用 Hysteria 官方脚本安装核心"
-  bash <(curl -fsSL https://get.hy2.sh/) || {
-    red "Hysteria 2 官方安装失败"
-    return 1
-  }
-
-  [[ -x "/usr/local/bin/hysteria" ]] || {
-    red "未检测到 /usr/local/bin/hysteria，安装可能失败"
-    return 1
-  }
-
-  green "Hysteria 2 核心安装成功"
 
   green "步骤 3/4：配置证书、端口、密码、伪装站点"
   inst_cert
@@ -556,33 +717,36 @@ auth:
   type: password
   password: $auth_pwd
 
-speedTest: false
+speedTest: true
 
 masquerade:
   type: proxy
   proxy:
     url: https://$proxysite
     rewriteHost: true
-  listenHTTP: :80
-  listenHTTPS: :443
-  forceHTTPS: true
 EOF
 
+  if [[ -n $(echo "$ip" | grep ":") ]]; then
+    last_ip="[$ip]"
+  else
+    last_ip="$ip"
+  fi
+
   cat > /root/hy/hy-client.yaml <<EOF
-server: $hy_domain:$port
+server: $last_ip:$port
 
 auth: $auth_pwd
 
 tls:
   sni: $hy_domain
-  insecure: false
+  insecure: true
 
 quic:
   initStreamReceiveWindow: 8388608
   maxStreamReceiveWindow: 8388608
   initConnReceiveWindow: 20971520
   maxConnReceiveWindow: 20971520
-  maxIdleTimeout: 30s
+  maxIdleTimeout: 90s
   keepAlivePeriod: 10s
   disablePathMTUDiscovery: false
 
@@ -602,7 +766,7 @@ EOF
     port_range="$port"
   fi
 
-  ur1="hysteria2://${auth_pwd}@${hy_domain}:${port}/?sni=${hy_domain}&peer=${hy_domain}&mport=${port_range}#H"
+  ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&peer=$last_ip&insecure=1&mport=$port_range#H"
   echo "$ur1" > /root/hy/ur1.txt
 
   fix_hysteria_file_perms
@@ -620,6 +784,8 @@ EOF
     return 1
   fi
 
+  save_firewall_rules
+
   red "======================================================================================"
   green "Hysteria 2 代理服务安装完成"
   yellow "服务端配置 /etc/hysteria/config.yaml："
@@ -628,8 +794,6 @@ EOF
   green "$(cat /root/hy/hy-client.yaml)"
   yellow "分享链接 /root/hy/ur1.txt："
   green "$(cat /root/hy/ur1.txt)"
-  yellow "当前伪装站点：https://$proxysite"
-  yellow "现在可直接通过浏览器访问 https://$hy_domain 验证伪装站点是否生效"
   yellow "二维码："
   qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
 
