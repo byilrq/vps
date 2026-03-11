@@ -321,91 +321,111 @@ inst_cert() {
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
-  # 默认：强制校验证书
+  # 默认：正式证书强制校验；自签证书跳过校验
   tls_insecure="false"
+  cert_mode="official"
 
   if [[ $certInput == 1 ]]; then
     cert_path="/etc/hysteria/cert.crt"
     key_path="/etc/hysteria/private.key"
 
+    # 如果已有正式证书且记录了域名，直接复用，避免重复申请
     if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f /etc/hysteria/ca.log ]]; then
       domain=$(cat /etc/hysteria/ca.log 2>/dev/null)
-      [[ -n "$domain" ]] && green "检测到原有域名：$domain 的证书，正在复用"
-      hy_domain="$domain"
-      tls_insecure="false"
-    else
-      realip || exit 1
-      read -rp "请输入需要申请证书的域名: " domain
-      domain="$(normalize_host_input "$domain")"
-      [[ -z $domain ]] && red "未输入域名，无法执行操作。" && exit 1
-      is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
-
-      green "已输入的域名：$domain"
-      green "检查域名解析..."
-      check_domain_ready "$domain" || {
-        red "当前域名解析的 IP 与当前 VPS 真实 IP 不匹配"
-        yellow "建议：关闭 Cloudflare 小云朵（仅 DNS）、检查解析 IP 是否为真实 IP。"
-        exit 1
-      }
-
-      green "检查 80 端口..."
-      check_port_80_free || {
-        red "80 端口被占用，acme standalone 模式会失败或长时间卡住"
-        yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
-        exit 1
-      }
-
-      green "安装申请证书所需依赖..."
-      pkg_install curl wget sudo socat openssl >/dev/null 2>&1 || true
-
-      green "安装 acme.sh ..."
-      curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
-        red "安装 acme.sh 失败"
-        exit 1
-      }
-
-      source ~/.bashrc >/dev/null 2>&1 || true
-      bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
-      bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-
-      green "开始签发证书，这一步可能需要几十秒..."
-      if [[ -n $(echo "$ip" | grep ":") ]]; then
-        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
-          red "签发失败"
-          exit 1
-        }
-      else
-        timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
-          red "签发失败"
-          exit 1
-        }
-      fi
-
-      bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
-        --key-file "$key_path" \
-        --fullchain-file "$cert_path" \
-        --ecc \
-        --reloadcmd "systemctl restart hysteria-server" || {
-        red "安装证书失败"
-        exit 1
-      }
-
-      if [[ -s "$cert_path" && -s "$key_path" ]]; then
-        echo "$domain" > /etc/hysteria/ca.log
-        if [[ -f /etc/crontab ]]; then
-          sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
-          echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
-        fi
-
-        green "证书申请成功，已保存到 /etc/hysteria/"
-        yellow "证书路径：$cert_path"
-        yellow "私钥路径：$key_path"
+      if [[ -n "$domain" ]]; then
+        green "检测到已有正式证书，域名：$domain，直接复用，不重复申请"
         hy_domain="$domain"
         tls_insecure="false"
-      else
-        red "证书文件生成异常，请检查 acme.sh 输出"
-        exit 1
+        cert_mode="official"
+        return 0
       fi
+    fi
+
+    realip || exit 1
+    read -rp "请输入需要申请证书的域名: " domain
+    domain="$(normalize_host_input "$domain")"
+    [[ -z $domain ]] && red "未输入域名，无法执行操作。" && exit 1
+    is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
+
+    # 如果已有证书且域名与本次输入一致，则直接复用
+    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f /etc/hysteria/ca.log ]]; then
+      local existing_domain
+      existing_domain=$(cat /etc/hysteria/ca.log 2>/dev/null)
+      if [[ "$existing_domain" == "$domain" ]]; then
+        green "检测到域名 $domain 的正式证书已存在，直接复用，不重复申请"
+        hy_domain="$domain"
+        tls_insecure="false"
+        cert_mode="official"
+        return 0
+      fi
+    fi
+
+    green "已输入的域名：$domain"
+    green "检查域名解析..."
+    check_domain_ready "$domain" || {
+      red "当前域名解析的 IP 与当前 VPS 真实 IP 不匹配"
+      yellow "建议：关闭 Cloudflare 小云朵（仅 DNS）、检查解析 IP 是否为真实 IP。"
+      exit 1
+    }
+
+    green "检查 80 端口..."
+    check_port_80_free || {
+      red "80 端口被占用，acme standalone 模式会失败或长时间卡住"
+      yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
+      exit 1
+    }
+
+    green "安装申请证书所需依赖..."
+    pkg_install curl wget sudo socat openssl >/dev/null 2>&1 || true
+
+    green "安装 acme.sh ..."
+    curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
+      red "安装 acme.sh 失败"
+      exit 1
+    }
+
+    source ~/.bashrc >/dev/null 2>&1 || true
+    bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+    bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+    green "开始签发证书，这一步可能需要几十秒..."
+    if [[ -n $(echo "$ip" | grep ":") ]]; then
+      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
+        red "签发失败"
+        exit 1
+      }
+    else
+      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
+        red "签发失败"
+        exit 1
+      }
+    fi
+
+    bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
+      --key-file "$key_path" \
+      --fullchain-file "$cert_path" \
+      --ecc \
+      --reloadcmd "systemctl restart hysteria-server" || {
+      red "安装证书失败"
+      exit 1
+    }
+
+    if [[ -s "$cert_path" && -s "$key_path" ]]; then
+      echo "$domain" > /etc/hysteria/ca.log
+      if [[ -f /etc/crontab ]]; then
+        sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
+        echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
+      fi
+
+      green "证书申请成功，已保存到 /etc/hysteria/"
+      yellow "证书路径：$cert_path"
+      yellow "私钥路径：$key_path"
+      hy_domain="$domain"
+      tls_insecure="false"
+      cert_mode="official"
+    else
+      red "证书文件生成异常，请检查 acme.sh 输出"
+      exit 1
     fi
 
   elif [[ $certInput == 3 ]]; then
@@ -420,6 +440,7 @@ inst_cert() {
 
     hy_domain="$domain"
     tls_insecure="false"
+    cert_mode="custom"
 
   else
     green "将使用必应自签证书作为 Hysteria 2 的节点证书"
@@ -439,6 +460,7 @@ inst_cert() {
     hy_domain="www.bing.com"
     domain="www.bing.com"
     tls_insecure="true"
+    cert_mode="selfsigned"
 
     yellow "当前为自签证书模式，客户端将跳过证书校验"
   fi
@@ -919,15 +941,7 @@ auth: $auth_pwd
 
 tls:
   sni: $hy_domain
-EOF
-
-  if [[ "$tls_insecure" == "true" ]]; then
-    cat >> /root/hy/hy-client.yaml <<EOF
-  insecure: false
-EOF
-  fi
-
-  cat >> /root/hy/hy-client.yaml <<EOF
+  insecure: $tls_insecure
 
 quic:
   initStreamReceiveWindow: 8388608
@@ -995,9 +1009,9 @@ EOF
   qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
 
   if [[ "$tls_insecure" == "true" ]]; then
-    yellow "当前证书模式：自签证书，客户端已启用跳过证书校验"
+    yellow "当前证书模式：自签证书，客户端已启用跳过证书校验（insecure: true）"
   else
-    yellow "当前证书模式：强制校验证书"
+    yellow "当前证书模式：正式/自定义证书，客户端强制校验证书（insecure: false）"
   fi
 
   yellow "伪装站验证："
@@ -1011,15 +1025,37 @@ EOF
 # 卸载 / 启动 / 停止
 # -----------------------------
 unsthysteria() {
+  local keep_cert="false"
+
+  if [[ -f /etc/hysteria/ca.log && -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]]; then
+    keep_cert="true"
+  fi
+
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
+  systemctl stop hysteria.service >/dev/null 2>&1 || true
   systemctl disable hysteria-server.service >/dev/null 2>&1 || true
+  systemctl disable hysteria.service >/dev/null 2>&1 || true
+
   rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
-  rm -rf /usr/local/bin/hysteria /etc/hysteria /root/hy /root/hysteria.sh /var/lib/hysteria >/dev/null 2>&1 || true
+  rm -f /lib/systemd/system/hysteria.service /etc/systemd/system/hysteria.service >/dev/null 2>&1 || true
+
+  rm -f /usr/local/bin/hysteria /usr/bin/hysteria >/dev/null 2>&1 || true
+  rm -rf /root/hy /root/hysteria.sh /var/lib/hysteria >/dev/null 2>&1 || true
+
   remove_hy2_jump_chain >/dev/null 2>&1 || true
   save_firewall_rules
   systemctl daemon-reload >/dev/null 2>&1 || true
-  green "Hysteria 2 已彻底卸载完成"
+
+  if [[ "$keep_cert" == "true" ]]; then
+    mkdir -p /etc/hysteria >/dev/null 2>&1 || true
+    rm -f /etc/hysteria/config.yaml >/dev/null 2>&1 || true
+    green "Hysteria 2 已卸载完成，已保留正式证书与域名记录，重装时可自动复用。"
+  else
+    rm -rf /etc/hysteria >/dev/null 2>&1 || true
+    green "Hysteria 2 已彻底卸载完成。"
+  fi
+
   read -rp "回车返回菜单..." _
 }
 
@@ -1169,24 +1205,47 @@ changepasswd() {
 }
 
 change_cert() {
-  local old_cert old_key old_hydomain
+  local old_cert old_key old_hydomain old_tls_insecure old_port
   old_cert=$(grep -E '^\s*cert:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_key=$(grep -E '^\s*key:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_hydomain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
+  old_tls_insecure=$(grep -E '^\s*insecure:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
+  old_port=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk -F':' '{print $NF}')
 
   inst_cert
 
   [[ -n "$old_cert" ]] && sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
-  [[ -n "$old_key" ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
-  [[ -n "$old_hydomain" ]] && sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/hy-client.yaml
-  grep -q '^server: ' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^server: .*#server: $hy_domain:${port:-443}#" /root/hy/hy-client.yaml
+  [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
 
-  if [[ -f /root/hy/ur1.txt && -n "$old_hydomain" ]]; then
-    sed -i "s/$old_hydomain/$hy_domain/g" /root/hy/ur1.txt
+  grep -q '^server: ' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^server: .*#server: ${old_hydomain:-$hy_domain}:${old_port:-443}#" /root/hy/hy-client.yaml
+  grep -q '^ *sni:' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^ *sni: .*#  sni: $hy_domain#" /root/hy/hy-client.yaml
+
+  if grep -q '^ *insecure:' /root/hy/hy-client.yaml 2>/dev/null; then
+    sed -i "s#^ *insecure: .*#  insecure: $tls_insecure#" /root/hy/hy-client.yaml
+  else
+    sed -i "/^tls:/a\  insecure: $tls_insecure" /root/hy/hy-client.yaml
+  fi
+
+  if [[ -f /root/hy/ur1.txt ]]; then
+    local auth host port_range_val
+    auth=$(grep -E '^auth:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
+    host=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | cut -d: -f1)
+    old_port=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk -F':' '{print $NF}')
+    port_range_val="$old_port"
+
+    if [[ -n "$firstport" && -n "$endport" ]]; then
+      port_range_val="$firstport-$endport"
+    fi
+
+    if [[ "$tls_insecure" == "true" ]]; then
+      echo "hysteria2://$auth@$host:$old_port/?sni=$hy_domain&insecure=1&mport=$port_range_val#H" > /root/hy/ur1.txt
+    else
+      echo "hysteria2://$auth@$host:$old_port/?sni=$hy_domain&mport=$port_range_val#H" > /root/hy/ur1.txt
+    fi
   fi
 
   fix_hysteria_file_perms
-  systemctl restart hysteria-server.service >/dev/null 2>&1 || true
+  systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria.service >/dev/null 2>&1 || true
 
   green "证书类型/路径已修改"
   showconf
