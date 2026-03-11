@@ -923,7 +923,7 @@ EOF
 
   if [[ "$tls_insecure" == "true" ]]; then
     cat >> /root/hy/hy-client.yaml <<EOF
-  insecure: true
+  insecure: false
 EOF
   fi
 
