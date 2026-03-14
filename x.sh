@@ -1,5 +1,5 @@
 #!/bin/bash
-#################### x-ui-pro reality single-domain local-fallback #####################################
+############################# x #####################################
 
 if [[ $EUID -ne 0 ]]; then
     exec sudo bash "$0" "$@"
@@ -1417,37 +1417,53 @@ show_final_details() {
 read_xui_reality_info() {
     [[ -f "$XUIDB" ]] || return 1
     command -v sqlite3 >/dev/null 2>&1 || return 1
-    command -v jq >/dev/null 2>&1 || return 1
 
-    local row settings_json stream_json
-    row="$(sqlite3 -line "$XUIDB" \
-        "SELECT port, settings, stream_settings, remark
-         FROM inbounds
-         WHERE protocol='vless'
-           AND stream_settings LIKE '%\"security\":\"reality\"%'
-         ORDER BY id DESC
-         LIMIT 1;" 2>/dev/null || true)"
+    local row
+    row="$(sqlite3 -separator '|' "$XUIDB" "
+        SELECT
+            port,
+            json_extract(settings, '\$.clients[0].id'),
+            json_extract(settings, '\$.clients[0].flow'),
+            json_extract(stream_settings, '\$.security'),
+            json_extract(stream_settings, '\$.realitySettings.serverNames[0]'),
+            json_extract(stream_settings, '\$.realitySettings.privateKey'),
+            json_extract(stream_settings, '\$.realitySettings.settings.publicKey'),
+            json_extract(stream_settings, '\$.realitySettings.shortIds[0]'),
+            json_extract(stream_settings, '\$.realitySettings.settings.fingerprint'),
+            json_extract(stream_settings, '\$.realitySettings.settings.spiderX')
+        FROM inbounds
+        WHERE protocol='vless'
+        ORDER BY id DESC
+        LIMIT 1;
+    " 2>/dev/null || true)"
 
     [[ -n "$row" ]] || return 1
 
-    REALITY_PORT_DB="$(printf '%s\n' "$row" | awk -F'= ' '/^ *port = /{print $2; exit}' | tr -d '\r')"
-    settings_json="$(printf '%s\n' "$row" | sed -n 's/^ *settings = //p' | head -n1)"
-    stream_json="$(printf '%s\n' "$row" | sed -n 's/^ *stream_settings = //p' | head -n1)"
+    IFS='|' read -r \
+        REALITY_PORT_DB \
+        REALITY_UUID_DB \
+        REALITY_FLOW_DB \
+        REALITY_SECURITY_DB \
+        REALITY_DOMAIN_DB \
+        REALITY_PRIVATE_KEY_DB \
+        REALITY_PUBLIC_KEY_DB \
+        REALITY_SHORT_ID_DB \
+        REALITY_FP_DB \
+        REALITY_SPIDERX_DB <<< "$row"
 
-    [[ -n "$settings_json" && -n "$stream_json" ]] || return 1
+    [[ "$REALITY_SECURITY_DB" == "reality" ]] || return 1
+    [[ -n "$REALITY_PORT_DB" ]] || return 1
+    [[ -n "$REALITY_UUID_DB" ]] || return 1
+    [[ -n "$REALITY_DOMAIN_DB" ]] || return 1
+    [[ -n "$REALITY_PUBLIC_KEY_DB" ]] || return 1
+    [[ -n "$REALITY_SHORT_ID_DB" ]] || return 1
 
-    REALITY_UUID_DB="$(printf '%s' "$settings_json" | jq -r '.clients[0].id // empty' 2>/dev/null)"
-    REALITY_FLOW_DB="$(printf '%s' "$settings_json" | jq -r '.clients[0].flow // "xtls-rprx-vision"' 2>/dev/null)"
-    REALITY_DOMAIN_DB="$(printf '%s' "$stream_json" | jq -r '.realitySettings.serverNames[0] // empty' 2>/dev/null)"
-    REALITY_PRIVATE_KEY_DB="$(printf '%s' "$stream_json" | jq -r '.realitySettings.privateKey // empty' 2>/dev/null)"
-    REALITY_PUBLIC_KEY_DB="$(printf '%s' "$stream_json" | jq -r '.realitySettings.settings.publicKey // empty' 2>/dev/null)"
-    REALITY_SHORT_ID_DB="$(printf '%s' "$stream_json" | jq -r '.realitySettings.shortIds[0] // empty' 2>/dev/null)"
-    REALITY_FP_DB="$(printf '%s' "$stream_json" | jq -r '.realitySettings.settings.fingerprint // "chrome"' 2>/dev/null)"
-    REALITY_SPIDERX_DB="$(printf '%s' "$stream_json" | jq -r '.realitySettings.settings.spiderX // "/"' 2>/dev/null)"
+    [[ -z "$REALITY_FLOW_DB" || "$REALITY_FLOW_DB" == "null" ]] && REALITY_FLOW_DB="xtls-rprx-vision"
+    [[ -z "$REALITY_FP_DB" || "$REALITY_FP_DB" == "null" ]] && REALITY_FP_DB="chrome"
+    [[ -z "$REALITY_SPIDERX_DB" || "$REALITY_SPIDERX_DB" == "null" ]] && REALITY_SPIDERX_DB="/"
 
-    [[ -n "$REALITY_PORT_DB" && -n "$REALITY_UUID_DB" && -n "$REALITY_DOMAIN_DB" && -n "$REALITY_PUBLIC_KEY_DB" && -n "$REALITY_SHORT_ID_DB" ]]
+    return 0
 }
-
 # -----------------------------
 #  打印节点信息
 # -----------------------------
@@ -1455,15 +1471,15 @@ print_node_info() {
     install_tool_deps
 
     if ! read_xui_reality_info; then
-        msg_err "未能从 x-ui 数据库读取 Reality 节点信息，请确认已安装并成功写入节点。"
+        msg_err "未能从 x-ui 数据库读取 Reality 节点信息。下面输出当前 inbounds 供排查："
+        sqlite3 -line "$XUIDB" "SELECT id, protocol, port, remark FROM inbounds;" 2>/dev/null || true
         return 1
     fi
 
     local show_addr reality_uri info_file
     show_addr="${REALITY_DOMAIN_DB}"
 
-    reality_uri="vless://${REALITY_UUID_DB}@${show_addr}:${REALITY_PORT_DB}?encryption=none&flow=${REALITY_FLOW_DB}&security=reality&sni=${REALITY_DOMAIN_DB}&fp=${REALITY_FP_DB}&pbk=${REALITY_PUBLIC_KEY_DB}&sid=${REALITY_SHORT_ID_DB}&spx=%2F&type=tcp&headerType=none#R"
-
+	reality_uri="vless://${REALITY_UUID_DB}@${REALITY_DOMAIN_DB}:${REALITY_PORT_DB}?encryption=none&flow=${REALITY_FLOW_DB}&security=reality&sni=${REALITY_DOMAIN_DB}&fp=${REALITY_FP_DB}&pbk=${REALITY_PUBLIC_KEY_DB}&sid=${REALITY_SHORT_ID_DB}&spx=%2F&type=tcp&headerType=none#R"
     info_file="/root/_xui_reality_node_info.txt"
 
     echo
