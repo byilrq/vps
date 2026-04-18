@@ -894,6 +894,12 @@ insthysteria() {
     last_ip="$ip"
   fi
 
+  if [[ -n "$hy_domain" ]]; then
+    share_host="$hy_domain"
+  else
+    share_host="$last_ip"
+  fi
+
   if [[ -n "$firstport" && -n "$endport" ]]; then
     port_range="$firstport-$endport"
   else
@@ -964,9 +970,9 @@ transport:
 EOF
 
   if [[ "$tls_insecure" == "true" ]]; then
-    ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&insecure=1&mport=$port_range#H"
+    ur1="hysteria2://$auth_pwd@$share_host:$port/?sni=$hy_domain&insecure=1&mport=$port_range#H"
   else
-    ur1="hysteria2://$auth_pwd@$last_ip:$port/?sni=$hy_domain&mport=$port_range#H"
+    ur1="hysteria2://$auth_pwd@$share_host:$port/?sni=$hy_domain&mport=$port_range#H"
   fi
 
   echo "$ur1" > /root/hy/ur1.txt
@@ -1227,20 +1233,26 @@ change_cert() {
   fi
 
   if [[ -f /root/hy/ur1.txt ]]; then
-    local auth host port_range_val
+    local auth host port_range_val share_host
     auth=$(grep -E '^auth:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
     host=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | cut -d: -f1)
     old_port=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk -F':' '{print $NF}')
     port_range_val="$old_port"
+
+    if [[ -n "$hy_domain" ]]; then
+      share_host="$hy_domain"
+    else
+      share_host="$host"
+    fi
 
     if [[ -n "$firstport" && -n "$endport" ]]; then
       port_range_val="$firstport-$endport"
     fi
 
     if [[ "$tls_insecure" == "true" ]]; then
-      echo "hysteria2://$auth@$host:$old_port/?sni=$hy_domain&insecure=1&mport=$port_range_val#H" > /root/hy/ur1.txt
+      echo "hysteria2://$auth@$share_host:$old_port/?sni=$hy_domain&insecure=1&mport=$port_range_val#H" > /root/hy/ur1.txt
     else
-      echo "hysteria2://$auth@$host:$old_port/?sni=$hy_domain&mport=$port_range_val#H" > /root/hy/ur1.txt
+      echo "hysteria2://$auth@$share_host:$old_port/?sni=$hy_domain&mport=$port_range_val#H" > /root/hy/ur1.txt
     fi
   fi
 
