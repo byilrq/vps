@@ -823,17 +823,23 @@ firewall() {
           pkg_install ufw || { red "安装 ufw 失败"; read -rp "回车返回..." _; continue; }
         fi
 
-        local sshp ports
+        local sshp ports base_ports all_ports
         sshp="$(get_ssh_port)"
+        base_ports="2222 443 80"
         yellow "当前 SSH 端口：$sshp，将自动放行 tcp/udp 防止失联。"
-        read -rp "请输入需要额外放行的端口（例如：2222 51000-52000，可留空）: " ports
+        yellow "默认额外放行端口：2222、443、80"
+        read -rp "请输入需要额外放行的端口（例如：51000-52000，可留空）: " ports
 
         ufw --force enable
         ufw allow "${sshp}/tcp"
         ufw allow "${sshp}/udp"
+        ufw allow "2222/tcp"
+        ufw allow "443/tcp"
+        ufw allow "80/tcp"
 
         ports="${ports//,/ }"
         ports="${ports//，/ }"
+        all_ports="$(printf '%s\n' $base_ports $ports | awk 'NF && !seen[$1]++ {print $1}')"
 
         for p in $ports; do
           if [[ "$p" =~ ^[0-9]+-[0-9]+$ ]]; then
@@ -855,7 +861,7 @@ firewall() {
         ufw status numbered
         echo ""
         yellow "监听检查（用于判断“端口不通”是否其实是服务没起来）："
-        _check_listen_ports "$ports"
+        _check_listen_ports "$all_ports"
         read -rp "回车返回菜单..." _
         ;;
       2)
