@@ -1630,8 +1630,169 @@ menu_hy_conf() {
 # -----------------------------
 # 核心更新 / 工具功能
 # -----------------------------
+get_hysteria_current_version() {
+  local bin=""
+  if [[ -x /usr/local/bin/hysteria ]]; then
+    bin="/usr/local/bin/hysteria"
+  elif [[ -x /usr/bin/hysteria ]]; then
+    bin="/usr/bin/hysteria"
+  else
+    return 1
+  fi
+
+  "$bin" version 2>/dev/null | head -n1 | sed -E 's/.*[Vv]ersion[: ]*v?([0-9][^ ]*).*/\1/' | tr -d '\r'
+}
+
+get_hysteria_latest_version() {
+  curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
+    | grep '"tag_name"' | head -n1 | sed -E 's/.*"v?([^"]+)".*/\1/' | tr -d '\r'
+}
+
+install_hysteria_auto_update() {
+  local updater="/usr/local/bin/hysteria-core-auto-update"
+  local cron_file="/etc/cron.weekly/hysteria-core-auto-update"
+
+  cat > "$updater" <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+LOG="/var/log/hysteria-core-update.log"
+BIN="/usr/local/bin/hysteria"
+[[ -x "$BIN" ]] || BIN="/usr/bin/hysteria"
+
+mkdir -p /var/log >/dev/null 2>&1 || true
+
+log() {
+  echo "$(date '+%F %T') $*" >> "$LOG"
+}
+
+get_current_ver() {
+  [[ -x "$BIN" ]] || return 1
+  "$BIN" version 2>/dev/null | head -n1 | sed -E 's/.*[Vv]ersion[: ]*v?([0-9][^ ]*).*/\1/' | tr -d '\r'
+}
+
+get_latest_ver() {
+  curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
+    | grep '"tag_name"' | head -n1 | sed -E 's/.*"v?([^"]+)".*/\1/' | tr -d '\r'
+}
+
+current_ver="$(get_current_ver 2>/dev/null)"
+latest_ver="$(get_latest_ver 2>/dev/null)"
+
+log "current=${current_ver:-unknown} latest=${latest_ver:-unknown}"
+
+if [[ -z "$latest_ver" ]]; then
+  log "failed to fetch latest version"
+  exit 0
+fi
+
+if [[ -z "$current_ver" || "$current_ver" != "$latest_ver" ]]; then
+  backup="${BIN}.bak.$(date +%F-%H%M%S)"
+  [[ -x "$BIN" ]] && cp -f "$BIN" "$backup" >/dev/null 2>&1 || true
+
+  systemctl stop hysteria-server.service >/dev/null 2>&1 || systemctl stop hysteria-server >/dev/null 2>&1 || true
+
+  if bash <(curl -fsSL https://get.hy2.sh/); then
+    if systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria-server >/dev/null 2>&1; then
+      log "updated successfully to ${latest_ver}"
+      exit 0
+    fi
+
+    log "restart failed after update, trying rollback"
+    if [[ -f "$backup" ]]; then
+      cp -f "$backup" "$BIN" >/dev/null 2>&1 || true
+      chmod +x "$BIN" >/dev/null 2>&1 || true
+      systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria-server >/dev/null 2>&1 || true
+      log "rollback finished"
+    fi
+    exit 1
+  else
+    log "update command failed"
+    if [[ -f "$backup" ]]; then
+      cp -f "$backup" "$BIN" >/dev/null 2>&1 || true
+      chmod +x "$BIN" >/dev/null 2>&1 || true
+      systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria-server >/dev/null 2>&1 || true
+      log "rollback finished after failed update"
+    fi
+    exit 1
+  fi
+else
+  log "already latest"
+fi
+EOF
+
+  chmod 755 "$updater" >/dev/null 2>&1 || true
+
+  cat > "$cron_file" <<EOF
+#!/usr/bin/env bash
+bash /usr/local/bin/hysteria-core-auto-update >/dev/null 2>&1
+EOF
+  chmod 755 "$cron_file" >/dev/null 2>&1 || true
+
+  green "已开启 Hysteria 核心自动更新（每周检测一次）"
+  yellow "更新脚本：$updater"
+  yellow "定时任务：$cron_file"
+}
+
+disable_hysteria_auto_update() {
+  rm -f /etc/cron.weekly/hysteria-core-auto-update >/dev/null 2>&1 || true
+  green "已关闭 Hysteria 核心自动更新"
+}
+
+show_hysteria_update_log() {
+  local log_file="/var/log/hysteria-core-update.log"
+  if [[ -f "$log_file" ]]; then
+    yellow "最近 50 行更新日志："
+    tail -n 50 "$log_file"
+  else
+    yellow "暂无更新日志：$log_file"
+  fi
+  read -rp "回车返回菜单..." _
+}
+
+menu_update_core() {
+  while true; do
+    clear
+    green "Hysteria 内核更新设置："
+    echo ""
+    echo -e " ${GREEN}1.${tianlan} 手动更新内核"
+    echo -e " ${GREEN}2.${tianlan} 开启自动更新"
+    echo -e " ${GREEN}3.${tianlan} 关闭自动更新"
+    echo -e " ${GREEN}4.${tianlan} 查看更新日志"
+    echo " ---------------------------------------------------"
+    echo -e " ${GREEN}0.${PLAIN} 返回"
+    echo ""
+
+    local cur_ver latest_ver auto_status
+    cur_ver="$(get_hysteria_current_version 2>/dev/null)"
+    latest_ver="$(get_hysteria_latest_version 2>/dev/null)"
+    [[ -z "$cur_ver" ]] && cur_ver="未知"
+    [[ -z "$latest_ver" ]] && latest_ver="获取失败"
+    if [[ -x /etc/cron.weekly/hysteria-core-auto-update ]]; then
+      auto_status="已开启"
+    else
+      auto_status="已关闭"
+    fi
+    yellow "当前版本：$cur_ver"
+    yellow "最新版本：$latest_ver"
+    yellow "自动更新：$auto_status"
+    echo ""
+
+    read -rp "请输入选项 [0-4]: " updateInput
+
+    case $updateInput in
+      1) update_core ;;
+      2) install_hysteria_auto_update; read -rp "回车返回菜单..." _ ;;
+      3) disable_hysteria_auto_update; read -rp "回车返回菜单..." _ ;;
+      4) show_hysteria_update_log ;;
+      0) break ;;
+      *) yellow "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
 update_core() {
-  green "官方更新方式必须先通过脚本安装后再使用，否则可能失败。"
+  green "手动更新：将调用官方安装脚本更新 Hysteria 核心。"
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   rm -f /usr/local/bin/hysteria
   bash <(curl -fsSL https://get.hy2.sh/) || { red "更新失败"; return 1; }
@@ -1854,7 +2015,7 @@ menu() {
     echo -e " ${GREEN}5.${tianlan} 修改系统配置"
     echo -e " ${GREEN}6.${tianlan} 显示配置文件"
     echo -e " ${GREEN}7.${tianlan} 查询运行状态"
-    echo -e " ${GREEN}8.${tianlan} 更新内核"
+    echo -e " ${GREEN}8.${tianlan} 内核更新设置"
     echo -e " ${GREEN}9.${tianlan} 回程测试"
     echo -e " ${GREEN}10.${tianlan} IP 质量检测"
     echo -e " ${GREEN}11.${tianlan} 系统查询"
@@ -1872,7 +2033,7 @@ menu() {
       5) run_sys_conf ;;
       6) showconf ;;
       7) showstatus ;;
-      8) update_core ;;
+      8) menu_update_core ;;
       9) besttrace ;;
       10) ipquality ;;
       11) linux_ps ;;
