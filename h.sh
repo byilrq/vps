@@ -191,6 +191,328 @@ normalize_host_input() {
   printf '%s' "$v"
 }
 
+
+ACME_DOMAIN_LOG="/etc/hysteria/ca.log"
+HY2_STATE_FILE="/etc/hysteria/state.env"
+HY2_CERT_RENEW_BIN="/usr/local/bin/hysteria-cert-renew"
+HY2_CERT_WEEKLY_CRON="/etc/cron.weekly/hysteria-cert-renew"
+HY2_FIREWALL_RESTORE_BIN="/usr/local/bin/hysteria-firewall-restore"
+HY2_BOOT_FIX_SERVICE="/etc/systemd/system/hysteria-boot-fix.service"
+
+get_hysteria_service_name() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
+    echo "hysteria-server"
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^hysteria\.service'; then
+    echo "hysteria"
+  else
+    echo "hysteria-server"
+  fi
+}
+
+get_cert_primary_domain() {
+  local cert_file="$1"
+  [[ -s "$cert_file" ]] || return 1
+
+  openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | \
+    tr ',' '\n' | sed -n 's/.*DNS:\([^[:space:]]*\).*/\1/p' | head -n1
+}
+
+cert_matches_domain() {
+  local cert_file="$1"
+  local domain="$2"
+
+  [[ -s "$cert_file" && -n "$domain" ]] || return 1
+
+  openssl x509 -in "$cert_file" -noout -ext subjectAltName 2>/dev/null | \
+    tr ',' '\n' | sed -n 's/.*DNS:\([^[:space:]]*\).*/\1/p' | grep -Fxq "$domain" && return 0
+
+  openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p' | grep -Fxq "$domain"
+}
+
+cert_not_expiring_soon() {
+  local cert_file="$1"
+  local days="${2:-14}"
+  local seconds
+
+  [[ -s "$cert_file" ]] || return 1
+  seconds=$((days * 24 * 3600))
+  openssl x509 -checkend "$seconds" -noout -in "$cert_file" >/dev/null 2>&1
+}
+
+existing_official_cert_usable() {
+  local expect_domain="$1"
+  local cert_file="/etc/hysteria/cert.crt"
+  local key_file="/etc/hysteria/private.key"
+  local stored_domain=""
+
+  [[ -s "$cert_file" && -s "$key_file" ]] || return 1
+
+  if [[ -f "$ACME_DOMAIN_LOG" ]]; then
+    stored_domain=$(tr -d '\r\n' < "$ACME_DOMAIN_LOG" 2>/dev/null)
+  fi
+  [[ -z "$stored_domain" ]] && stored_domain=$(get_cert_primary_domain "$cert_file" 2>/dev/null || true)
+
+  [[ -n "$stored_domain" ]] || return 1
+
+  if [[ -n "$expect_domain" && "$stored_domain" != "$expect_domain" ]]; then
+    cert_matches_domain "$cert_file" "$expect_domain" || return 1
+    stored_domain="$expect_domain"
+  fi
+
+  cert_matches_domain "$cert_file" "$stored_domain" || return 1
+  cert_not_expiring_soon "$cert_file" 14 || return 1
+
+  echo "$stored_domain"
+  return 0
+}
+
+ensure_hy2_input_chain() {
+  iptables -N HY2_INPUT >/dev/null 2>&1 || true
+  iptables -F HY2_INPUT >/dev/null 2>&1 || true
+  iptables -C INPUT -j HY2_INPUT >/dev/null 2>&1 || iptables -I INPUT 1 -j HY2_INPUT >/dev/null 2>&1 || true
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -N HY2_INPUT >/dev/null 2>&1 || true
+    ip6tables -F HY2_INPUT >/dev/null 2>&1 || true
+    ip6tables -C INPUT -j HY2_INPUT >/dev/null 2>&1 || ip6tables -I INPUT 1 -j HY2_INPUT >/dev/null 2>&1 || true
+  fi
+}
+
+clear_hy2_input_rules() {
+  iptables -F HY2_INPUT >/dev/null 2>&1 || true
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -F HY2_INPUT >/dev/null 2>&1 || true
+  fi
+}
+
+remove_hy2_input_chain() {
+  iptables -D INPUT -j HY2_INPUT >/dev/null 2>&1 || true
+  iptables -F HY2_INPUT >/dev/null 2>&1 || true
+  iptables -X HY2_INPUT >/dev/null 2>&1 || true
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -D INPUT -j HY2_INPUT >/dev/null 2>&1 || true
+    ip6tables -F HY2_INPUT >/dev/null 2>&1 || true
+    ip6tables -X HY2_INPUT >/dev/null 2>&1 || true
+  fi
+}
+
+apply_hy2_firewall_rules() {
+  local listen_port="$1"
+  local range_start="$2"
+  local range_end="$3"
+
+  [[ -n "$listen_port" ]] || return 1
+
+  ensure_hy2_input_chain
+  clear_hy2_input_rules
+  clear_hy2_jump_rules
+
+  iptables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
+  iptables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+  iptables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
+    ip6tables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+    ip6tables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "$range_start" && -n "$range_end" ]]; then
+    ensure_hy2_jump_chain
+    iptables -A HY2_INPUT -p udp --dport "$range_start:$range_end" -j ACCEPT >/dev/null 2>&1 || true
+    iptables -t nat -A HY2_JUMP -p udp --dport "$range_start:$range_end" -j DNAT --to-destination ":$listen_port" >/dev/null 2>&1 || true
+
+    if command -v ip6tables >/dev/null 2>&1; then
+      ip6tables -A HY2_INPUT -p udp --dport "$range_start:$range_end" -j ACCEPT >/dev/null 2>&1 || true
+      ip6tables -t nat -A HY2_JUMP -p udp --dport "$range_start:$range_end" -j DNAT --to-destination ":$listen_port" >/dev/null 2>&1 || true
+    fi
+  fi
+}
+
+load_hy2_state() {
+  [[ -f "$HY2_STATE_FILE" ]] || return 1
+  # shellcheck disable=SC1090
+  source "$HY2_STATE_FILE"
+  return 0
+}
+
+save_hy2_state() {
+  local state_port="$1"
+  local state_range_start="$2"
+  local state_range_end="$3"
+  local state_domain="${4:-}"
+  local state_cert_mode="${5:-}"
+  local state_service
+  local state_masquerade
+
+  [[ -n "$state_port" ]] || state_port=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
+  [[ -n "$state_domain" ]] || state_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  [[ -n "$state_cert_mode" ]] || state_cert_mode="unknown"
+  state_service=$(get_hysteria_service_name)
+  state_masquerade=$(grep -E '^\s*url:\s*https://' /etc/hysteria/config.yaml 2>/dev/null | awk -F'https://' '{print $2}' | tr -d '\r')
+
+  mkdir -p /etc/hysteria >/dev/null 2>&1 || true
+
+  cat > "$HY2_STATE_FILE" <<EOF
+HY2_PORT=${state_port:-}
+HY2_FIRST_PORT=${state_range_start:-}
+HY2_END_PORT=${state_range_end:-}
+HY2_DOMAIN=${state_domain:-}
+HY2_CERT_MODE=${state_cert_mode:-}
+HY2_SERVICE=${state_service:-}
+HY2_MASQUERADE=${state_masquerade:-}
+EOF
+
+  chmod 600 "$HY2_STATE_FILE" >/dev/null 2>&1 || true
+}
+
+install_hy2_cert_renew_job() {
+  local cert_file="/etc/hysteria/cert.crt"
+  local key_file="/etc/hysteria/private.key"
+
+  cat > "$HY2_CERT_RENEW_BIN" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+CERT_FILE="$cert_file"
+KEY_FILE="$key_file"
+DOMAIN_LOG="$ACME_DOMAIN_LOG"
+ACME_BIN="/root/.acme.sh/acme.sh"
+
+[[ -x "\$ACME_BIN" ]] || exit 0
+[[ -s "\$CERT_FILE" && -s "\$KEY_FILE" && -f "\$DOMAIN_LOG" ]] || exit 0
+
+domain=\$(tr -d '\r\n' < "\$DOMAIN_LOG" 2>/dev/null || true)
+[[ -n "\$domain" ]] || exit 0
+
+if openssl x509 -checkend \$((7 * 24 * 3600)) -noout -in "\$CERT_FILE" >/dev/null 2>&1; then
+  exit 0
+fi
+
+service_name="hysteria-server"
+if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
+  service_name="hysteria-server"
+elif systemctl list-unit-files 2>/dev/null | grep -q '^hysteria\.service'; then
+  service_name="hysteria"
+fi
+
+"\$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+"\$ACME_BIN" --renew -d "\$domain" --ecc --force >/dev/null 2>&1
+"\$ACME_BIN" --install-cert -d "\$domain" \
+  --key-file "\$KEY_FILE" \
+  --fullchain-file "\$CERT_FILE" \
+  --ecc \
+  --reloadcmd "systemctl restart \$service_name" >/dev/null 2>&1
+EOF
+
+  chmod 700 "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
+
+  cat > "$HY2_CERT_WEEKLY_CRON" <<EOF
+#!/usr/bin/env bash
+"$HY2_CERT_RENEW_BIN"
+EOF
+  chmod 755 "$HY2_CERT_WEEKLY_CRON" >/dev/null 2>&1 || true
+
+  if [[ -f /etc/crontab ]]; then
+    sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
+    sed -i '/hysteria-cert-renew/d' /etc/crontab >/dev/null 2>&1 || true
+  fi
+
+  crontab -l 2>/dev/null | grep -v 'acme\.sh' | grep -v 'hysteria-cert-renew' | crontab - >/dev/null 2>&1 || true
+  systemctl disable --now acme.timer >/dev/null 2>&1 || true
+  systemctl disable --now acme-sh.timer >/dev/null 2>&1 || true
+}
+
+install_hy2_boot_fix_service() {
+  cat > "$HY2_FIREWALL_RESTORE_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_FILE="/etc/hysteria/state.env"
+CONFIG_FILE="/etc/hysteria/config.yaml"
+
+[[ -f "$STATE_FILE" ]] || exit 0
+# shellcheck disable=SC1090
+source "$STATE_FILE"
+
+listen_port="${HY2_PORT:-}"
+range_start="${HY2_FIRST_PORT:-}"
+range_end="${HY2_END_PORT:-}"
+service_name="${HY2_SERVICE:-hysteria-server}"
+
+if [[ -z "$listen_port" && -f "$CONFIG_FILE" ]]; then
+  listen_port=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' "$CONFIG_FILE" 2>/dev/null | tr -d '\r')
+fi
+[[ -n "$listen_port" ]] || exit 0
+
+iptables -N HY2_INPUT >/dev/null 2>&1 || true
+iptables -F HY2_INPUT >/dev/null 2>&1 || true
+iptables -C INPUT -j HY2_INPUT >/dev/null 2>&1 || iptables -I INPUT 1 -j HY2_INPUT >/dev/null 2>&1 || true
+iptables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
+iptables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+iptables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
+
+if command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -N HY2_INPUT >/dev/null 2>&1 || true
+  ip6tables -F HY2_INPUT >/dev/null 2>&1 || true
+  ip6tables -C INPUT -j HY2_INPUT >/dev/null 2>&1 || ip6tables -I INPUT 1 -j HY2_INPUT >/dev/null 2>&1 || true
+  ip6tables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
+  ip6tables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+  ip6tables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
+fi
+
+iptables -t nat -N HY2_JUMP >/dev/null 2>&1 || true
+iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+iptables -t nat -C PREROUTING -j HY2_JUMP >/dev/null 2>&1 || iptables -t nat -A PREROUTING -j HY2_JUMP >/dev/null 2>&1 || true
+
+if command -v ip6tables >/dev/null 2>&1; then
+  ip6tables -t nat -N HY2_JUMP >/dev/null 2>&1 || true
+  ip6tables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
+  ip6tables -t nat -C PREROUTING -j HY2_JUMP >/dev/null 2>&1 || ip6tables -t nat -A PREROUTING -j HY2_JUMP >/dev/null 2>&1 || true
+fi
+
+if [[ -n "$range_start" && -n "$range_end" ]]; then
+  iptables -A HY2_INPUT -p udp --dport "$range_start:$range_end" -j ACCEPT >/dev/null 2>&1 || true
+  iptables -t nat -A HY2_JUMP -p udp --dport "$range_start:$range_end" -j DNAT --to-destination ":$listen_port" >/dev/null 2>&1 || true
+
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -A HY2_INPUT -p udp --dport "$range_start:$range_end" -j ACCEPT >/dev/null 2>&1 || true
+    ip6tables -t nat -A HY2_JUMP -p udp --dport "$range_start:$range_end" -j DNAT --to-destination ":$listen_port" >/dev/null 2>&1 || true
+  fi
+fi
+
+if command -v netfilter-persistent >/dev/null 2>&1; then
+  systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+  netfilter-persistent save >/dev/null 2>&1 || true
+elif command -v service >/dev/null 2>&1; then
+  service iptables save >/dev/null 2>&1 || true
+fi
+
+systemctl restart "$service_name" >/dev/null 2>&1 || true
+EOF
+
+  chmod 700 "$HY2_FIREWALL_RESTORE_BIN" >/dev/null 2>&1 || true
+
+  cat > "$HY2_BOOT_FIX_SERVICE" <<EOF
+[Unit]
+Description=Restore Hysteria firewall rules and restart service after network is online
+After=network-online.target netfilter-persistent.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=$HY2_FIREWALL_RESTORE_BIN
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable hysteria-boot-fix.service >/dev/null 2>&1 || true
+}
+
 ensure_hy2_jump_chain() {
   iptables -t nat -N HY2_JUMP >/dev/null 2>&1 || true
   iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
@@ -245,13 +567,20 @@ check_domain_ready() {
   fi
 }
 
+
 save_firewall_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
     netfilter-persistent save >/dev/null 2>&1 || true
   elif command -v service >/dev/null 2>&1; then
     service iptables save >/dev/null 2>&1 || true
   fi
+
+  if systemctl list-unit-files 2>/dev/null | grep -q '^netfilter-persistent\.service'; then
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+  fi
 }
+
 
 # -----------------------------
 # 修复配置文件与证书权限
@@ -309,6 +638,7 @@ fix_hysteria_file_perms() {
 # -----------------------------
 # 证书安装与配置
 # -----------------------------
+
 inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
@@ -321,7 +651,6 @@ inst_cert() {
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
-  # 默认：正式证书强制校验；自签证书跳过校验
   tls_insecure="false"
   cert_mode="official"
 
@@ -329,35 +658,22 @@ inst_cert() {
     cert_path="/etc/hysteria/cert.crt"
     key_path="/etc/hysteria/private.key"
 
-    # 如果已有正式证书且记录了域名，直接复用，避免重复申请
-    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f /etc/hysteria/ca.log ]]; then
-      domain=$(cat /etc/hysteria/ca.log 2>/dev/null)
-      if [[ -n "$domain" ]]; then
-        green "检测到已有正式证书，域名：$domain，直接复用，不重复申请"
-        hy_domain="$domain"
-        tls_insecure="false"
-        cert_mode="official"
-        return 0
-      fi
-    fi
-
     realip || exit 1
-    read -rp "请输入需要申请证书的域名: " domain
+    read -rp "请输入需要申请或复用证书的域名: " domain
     domain="$(normalize_host_input "$domain")"
     [[ -z $domain ]] && red "未输入域名，无法执行操作。" && exit 1
     is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
 
-    # 如果已有证书且域名与本次输入一致，则直接复用
-    if [[ -f "$cert_path" && -f "$key_path" && -s "$cert_path" && -s "$key_path" && -f /etc/hysteria/ca.log ]]; then
-      local existing_domain
-      existing_domain=$(cat /etc/hysteria/ca.log 2>/dev/null)
-      if [[ "$existing_domain" == "$domain" ]]; then
-        green "检测到域名 $domain 的正式证书已存在，直接复用，不重复申请"
-        hy_domain="$domain"
-        tls_insecure="false"
-        cert_mode="official"
-        return 0
-      fi
+    local reusable_domain=""
+    reusable_domain=$(existing_official_cert_usable "$domain" 2>/dev/null || true)
+    if [[ -n "$reusable_domain" ]]; then
+      green "检测到域名 $reusable_domain 的本地正式证书已存在且有效，跳过重复申请"
+      echo "$reusable_domain" > "$ACME_DOMAIN_LOG"
+      hy_domain="$reusable_domain"
+      tls_insecure="false"
+      cert_mode="official"
+      install_hy2_cert_renew_job
+      return 0
     fi
 
     green "已输入的域名：$domain"
@@ -405,21 +721,18 @@ inst_cert() {
       --key-file "$key_path" \
       --fullchain-file "$cert_path" \
       --ecc \
-      --reloadcmd "systemctl restart hysteria-server" || {
+      --reloadcmd "systemctl restart $(get_hysteria_service_name)" || {
       red "安装证书失败"
       exit 1
     }
 
     if [[ -s "$cert_path" && -s "$key_path" ]]; then
-      echo "$domain" > /etc/hysteria/ca.log
-      if [[ -f /etc/crontab ]]; then
-        sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
-        echo "0 0 * * * root bash /root/.acme.sh/acme.sh --cron -f >/dev/null 2>&1" >> /etc/crontab
-      fi
-
+      echo "$domain" > "$ACME_DOMAIN_LOG"
+      install_hy2_cert_renew_job
       green "证书申请成功，已保存到 /etc/hysteria/"
       yellow "证书路径：$cert_path"
       yellow "私钥路径：$key_path"
+      yellow "已创建每周检测任务：证书若已过期或 7 天内到期，将自动续签并重启 Hysteria"
       hy_domain="$domain"
       tls_insecure="false"
       cert_mode="official"
@@ -462,12 +775,15 @@ inst_cert() {
     tls_insecure="true"
     cert_mode="selfsigned"
 
+    rm -f "$HY2_CERT_WEEKLY_CRON" "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
     yellow "当前为自签证书模式，客户端将跳过证书校验"
   fi
 }
+
 # -----------------------------
 # 端口与跳跃端口设置
 # -----------------------------
+
 inst_jump() {
   green "Hysteria 2 端口使用模式如下："
   echo ""
@@ -487,28 +803,26 @@ inst_jump() {
       read -rp "末尾端口: " endport
     done
 
-    ensure_hy2_jump_chain
-    iptables -t nat -A HY2_JUMP -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
-    if command -v ip6tables >/dev/null 2>&1; then
-      ip6tables -t nat -A HY2_JUMP -p udp --dport "$firstport:$endport" -j DNAT --to-destination ":$port" >/dev/null 2>&1 || true
-    fi
+    apply_hy2_firewall_rules "$port" "$firstport" "$endport"
     save_firewall_rules
-
     green "已启用端口跳跃：$firstport-$endport -> $port"
   else
     yellow "将继续使用单端口模式"
     firstport=""
     endport=""
-    clear_hy2_jump_rules
+    apply_hy2_firewall_rules "$port" "" ""
     save_firewall_rules
   fi
 }
 
+
 # -----------------------------
 # 监听端口设置
 # -----------------------------
+
 inst_port() {
   clear_hy2_jump_rules
+  clear_hy2_input_rules
 
   while true; do
     read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " port
@@ -528,6 +842,7 @@ inst_port() {
   yellow "Hysteria 2 使用端口：$port"
   inst_jump
 }
+
 
 # -----------------------------
 # 设置连接密码
@@ -556,6 +871,7 @@ inst_site() {
 # -----------------------------
 # 安装防火墙持久化组件
 # -----------------------------
+
 install_firewall_persistent() {
   green "安装防火墙持久化组件"
 
@@ -608,13 +924,21 @@ install_firewall_persistent() {
           return 1
         }
     fi
+
+    systemctl enable netfilter-persistent >/dev/null 2>&1 || true
+    systemctl restart netfilter-persistent >/dev/null 2>&1 || true
   else
     pkg_install iptables-services >/dev/null 2>&1 || true
+    systemctl enable iptables >/dev/null 2>&1 || true
+    systemctl restart iptables >/dev/null 2>&1 || true
+    systemctl enable ip6tables >/dev/null 2>&1 || true
+    systemctl restart ip6tables >/dev/null 2>&1 || true
   fi
 
   green "防火墙持久化组件安装完成"
   return 0
 }
+
 # -----------------------------
 # 安装环境依赖
 # -----------------------------
@@ -764,58 +1088,7 @@ install_hy_environment() {
   fi
 
   green "安装防火墙持久化组件"
-  fix_dpkg_interrupt
-
-  if command -v apt-get >/dev/null 2>&1; then
-    mkdir -p /etc/iptables >/dev/null 2>&1 || true
-    touch /etc/iptables/rules.v4 /etc/iptables/rules.v6 >/dev/null 2>&1 || true
-
-    command -v debconf-set-selections >/dev/null 2>&1 && {
-      echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-      echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-      echo "iptables-persistent iptables-persistent/autosave_done note" | debconf-set-selections
-    }
-
-    if ! env DEBIAN_FRONTEND=noninteractive \
-      DEBCONF_NONINTERACTIVE_SEEN=true \
-      DEBIAN_PRIORITY=critical \
-      NEEDRESTART_MODE=a \
-      APT_LISTCHANGES_FRONTEND=none \
-      timeout 300 apt-get install -y --no-install-recommends \
-      -o Dpkg::Use-Pty=0 \
-      -o Dpkg::Options::="--force-confdef" \
-      -o Dpkg::Options::="--force-confnew" \
-      -o DPkg::Pre-Install-Pkgs::= \
-      iptables-persistent netfilter-persistent </dev/null; then
-
-      yellow "首次安装防火墙持久化组件失败，尝试自动修复后重试..."
-      fix_dpkg_interrupt
-      pkg_update || true
-
-      command -v debconf-set-selections >/dev/null 2>&1 && {
-        echo "iptables-persistent iptables-persistent/autosave_v4 boolean true" | debconf-set-selections
-        echo "iptables-persistent iptables-persistent/autosave_v6 boolean true" | debconf-set-selections
-        echo "iptables-persistent iptables-persistent/autosave_done note" | debconf-set-selections
-      }
-
-      env DEBIAN_FRONTEND=noninteractive \
-        DEBCONF_NONINTERACTIVE_SEEN=true \
-        DEBIAN_PRIORITY=critical \
-        NEEDRESTART_MODE=a \
-        APT_LISTCHANGES_FRONTEND=none \
-        timeout 300 apt-get install -y --no-install-recommends \
-        -o Dpkg::Use-Pty=0 \
-        -o Dpkg::Options::="--force-confdef" \
-        -o Dpkg::Options::="--force-confnew" \
-        -o DPkg::Pre-Install-Pkgs::= \
-        iptables-persistent netfilter-persistent </dev/null || {
-          red "iptables-persistent / netfilter-persistent 安装失败"
-          return 1
-        }
-    fi
-  else
-    pkg_install iptables-services >/dev/null 2>&1 || true
-  fi
+  install_firewall_persistent || return 1
 
   green "环境依赖安装完成"
   return 0
@@ -843,6 +1116,7 @@ install_hy_core() {
 # -----------------------------
 # 安装 Hysteria 2
 # -----------------------------
+
 insthysteria() {
   green "开始安装 Hysteria 2"
 
@@ -850,6 +1124,7 @@ insthysteria() {
 
   green "步骤 1/4：安装环境依赖"
   install_hy_environment || return 1
+  install_firewall_persistent || return 1
 
   green "步骤 2/4：安装 Hysteria 内核"
   cd /tmp || return 1
@@ -977,17 +1252,13 @@ EOF
 
   echo "$ur1" > /root/hy/ur1.txt
 
+  apply_hy2_firewall_rules "$port" "$firstport" "$endport"
+  save_hy2_state "$port" "$firstport" "$endport" "$hy_domain" "$cert_mode"
+  install_hy2_boot_fix_service
   fix_hysteria_file_perms
 
   systemctl daemon-reload
-
-  if systemctl list-unit-files | grep -q '^hysteria-server\.service'; then
-    hy_service="hysteria-server"
-  elif systemctl list-unit-files | grep -q '^hysteria\.service'; then
-    hy_service="hysteria"
-  else
-    hy_service="hysteria-server"
-  fi
+  hy_service=$(get_hysteria_service_name)
 
   systemctl enable "$hy_service" >/dev/null 2>&1 || true
   systemctl restart "$hy_service"
@@ -1002,6 +1273,7 @@ EOF
   fi
 
   save_firewall_rules
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
   red "======================================================================================"
   green "Hysteria 2 代理服务安装完成"
@@ -1027,9 +1299,11 @@ EOF
   read -rp "回车返回菜单..." _
 }
 
+
 # -----------------------------
 # 卸载 / 启动 / 停止
 # -----------------------------
+
 unsthysteria() {
   local keep_cert="false"
 
@@ -1037,6 +1311,8 @@ unsthysteria() {
     keep_cert="true"
   fi
 
+  systemctl stop hysteria-boot-fix.service >/dev/null 2>&1 || true
+  systemctl disable hysteria-boot-fix.service >/dev/null 2>&1 || true
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   systemctl stop hysteria.service >/dev/null 2>&1 || true
   systemctl disable hysteria-server.service >/dev/null 2>&1 || true
@@ -1045,10 +1321,11 @@ unsthysteria() {
   rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /lib/systemd/system/hysteria.service /etc/systemd/system/hysteria.service >/dev/null 2>&1 || true
-
-  rm -f /usr/local/bin/hysteria /usr/bin/hysteria >/dev/null 2>&1 || true
+  rm -f "$HY2_BOOT_FIX_SERVICE" "$HY2_FIREWALL_RESTORE_BIN" "$HY2_STATE_FILE" "$HY2_CERT_WEEKLY_CRON" >/dev/null 2>&1 || true
+  rm -f /usr/local/bin/hysteria /usr/bin/hysteria "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
   rm -rf /root/hy /root/hysteria.sh /var/lib/hysteria >/dev/null 2>&1 || true
 
+  remove_hy2_input_chain >/dev/null 2>&1 || true
   remove_hy2_jump_chain >/dev/null 2>&1 || true
   save_firewall_rules
   systemctl daemon-reload >/dev/null 2>&1 || true
@@ -1065,13 +1342,31 @@ unsthysteria() {
   read -rp "回车返回菜单..." _
 }
 
+
+
 starthysteria() {
-  systemctl enable --now hysteria-server >/dev/null 2>&1 || systemctl start hysteria-server
+  local hy_service current_port current_first current_end
+  hy_service=$(get_hysteria_service_name)
+
+  load_hy2_state >/dev/null 2>&1 || true
+  current_port="${HY2_PORT:-$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')}"
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
+
+  apply_hy2_firewall_rules "$current_port" "$current_first" "$current_end" >/dev/null 2>&1 || true
+  save_firewall_rules
+  systemctl enable --now "$hy_service" >/dev/null 2>&1 || systemctl start "$hy_service"
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 }
 
+
+
 stophysteria() {
-  systemctl disable --now hysteria-server >/dev/null 2>&1 || systemctl stop hysteria-server
+  local hy_service
+  hy_service=$(get_hysteria_service_name)
+  systemctl disable --now "$hy_service" >/dev/null 2>&1 || systemctl stop "$hy_service"
 }
+
 
 hysteriaswitch() {
   yellow "请选择需要的操作："
@@ -1115,11 +1410,13 @@ showconf() {
 # -----------------------------
 # 修改 Hysteria 配置
 # -----------------------------
+
 changeport() {
-  local oldport
+  local oldport current_domain current_cert_mode current_first current_end mport_value current_link
   oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
 
   clear_hy2_jump_rules
+  clear_hy2_input_rules
 
   while true; do
     read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " port
@@ -1139,23 +1436,38 @@ changeport() {
   sed -i "1s/:$oldport/:$port/g" /etc/hysteria/config.yaml 2>/dev/null || true
   sed -i "s/:$oldport/:$port/g" /root/hy/hy-client.yaml 2>/dev/null || true
 
+  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
+  load_hy2_state >/dev/null 2>&1 || true
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
+
+  if [[ -n "$current_first" && -n "$current_end" ]]; then
+    mport_value="$current_first-$current_end"
+    apply_hy2_firewall_rules "$port" "$current_first" "$current_end"
+    save_hy2_state "$port" "$current_first" "$current_end" "$current_domain" "$current_cert_mode"
+  else
+    mport_value="$port"
+    apply_hy2_firewall_rules "$port" "" ""
+    save_hy2_state "$port" "" "" "$current_domain" "$current_cert_mode"
+  fi
+
   if [[ -f /root/hy/ur1.txt ]]; then
-    local current_link
     current_link=$(cat /root/hy/ur1.txt 2>/dev/null)
-    current_link=$(echo "$current_link" | sed -E "s#(@[^:]+:)[0-9]+/#\1${port}/#")
+    current_link=$(echo "$current_link" | sed -E "s#(@[^:]+:)[0-9]+/#\\1${port}/#")
+    current_link=$(echo "$current_link" | sed -E "s#mport=[0-9]+(-[0-9]+)?#mport=${mport_value}#")
     echo "$current_link" > /root/hy/ur1.txt
   fi
 
-  if grep -q '^ *hopInterval:' /root/hy/hy-client.yaml 2>/dev/null; then
-    inst_jump
-  fi
-
   fix_hysteria_file_perms
-  systemctl restart hysteria-server.service >/dev/null 2>&1 || true
+  save_firewall_rules
+  systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria.service >/dev/null 2>&1 || true
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
   green "Hysteria 2 端口已成功修改为：$port"
   showconf
 }
+
 
 update_hysteria_link() {
   local newpasswd="$1"
@@ -1204,6 +1516,7 @@ changepasswd() {
   update_hysteria_link "$passwd" "$link_file" >/dev/null 2>&1 || true
 
   fix_hysteria_file_perms
+  save_firewall_rules
   systemctl restart hysteria-server.service || { red "服务重启失败"; return 1; }
 
   green "密码已修改并生效"
@@ -1212,6 +1525,7 @@ changepasswd() {
 
 change_cert() {
   local old_cert old_key old_hydomain old_tls_insecure old_port
+  load_hy2_state >/dev/null 2>&1 || true
   old_cert=$(grep -E '^\s*cert:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_key=$(grep -E '^\s*key:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_hydomain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
@@ -1245,8 +1559,8 @@ change_cert() {
       share_host="$host"
     fi
 
-    if [[ -n "$firstport" && -n "$endport" ]]; then
-      port_range_val="$firstport-$endport"
+    if [[ -n "${HY2_FIRST_PORT:-}" && -n "${HY2_END_PORT:-}" ]]; then
+      port_range_val="${HY2_FIRST_PORT}-${HY2_END_PORT}"
     fi
 
     if [[ "$tls_insecure" == "true" ]]; then
@@ -1256,8 +1570,11 @@ change_cert() {
     fi
   fi
 
+  save_hy2_state "$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d "\r")" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$hy_domain" "$cert_mode"
   fix_hysteria_file_perms
+  save_firewall_rules
   systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria.service >/dev/null 2>&1 || true
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
   green "证书类型/路径已修改"
   showconf
@@ -1265,6 +1582,7 @@ change_cert() {
 
 changeproxysite() {
   local oldproxysite
+  load_hy2_state >/dev/null 2>&1 || true
   oldproxysite=$(grep -E '^\s*url:\s*https://' /etc/hysteria/config.yaml 2>/dev/null | awk -F'https://' '{print $2}')
 
   inst_site
@@ -1275,8 +1593,11 @@ changeproxysite() {
     sed -i "s#url: https://.*#url: https://$proxysite#g" /etc/hysteria/config.yaml 2>/dev/null || true
   fi
 
+  save_hy2_state "$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d "\r")" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')" "$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)"
   fix_hysteria_file_perms
+  save_firewall_rules
   systemctl restart hysteria-server.service >/dev/null 2>&1 || true
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
   green "伪装网站已修改为：$proxysite"
   showconf
