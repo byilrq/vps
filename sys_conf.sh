@@ -247,83 +247,367 @@ set_ip_priority() {
 # -----------------------------
 # 5) Install BBRv3 (Debian/Ubuntu preferred)
 # -----------------------------
-bbrv3() {
-  need_root
-  local cpu_arch
-  cpu_arch=$(uname -m)
+bbr() {
+  set -Eeuo pipefail
 
-  if [[ "$cpu_arch" == "aarch64" ]]; then
-    yellow "检测到 aarch64，尝试运行外部 BBRv3 ARM 脚本（jhb.ovh/jb/bbrv3arm.sh）"
-    bash <(curl -fsSL jhb.ovh/jb/bbrv3arm.sh) || red "脚本执行失败"
-    read -rp "回车返回菜单..." _
-    return 0
+  local SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
+
+  local G Y R C N
+  if [ -t 1 ]; then
+    G='\033[32m'
+    Y='\033[33m'
+    R='\033[31m'
+    C='\033[36m'
+    N='\033[0m'
+  else
+    G=''; Y=''; R=''; C=''; N=''
   fi
 
-  if [[ -r /etc/os-release ]]; then
-    . /etc/os-release
-    if [[ "$ID" != "debian" && "$ID" != "ubuntu" ]]; then
-      red "BBRv3 默认仅支持 Debian/Ubuntu（当前: $ID）"
-      read -rp "回车返回菜单..." _
+  info()  { echo -e "${C}[信息]${N} $*"; }
+  warn()  { echo -e "${Y}[警告]${N} $*"; }
+  error() { echo -e "${R}[错误]${N} $*" >&2; }
+  ok()    { echo -e "${G}[完成]${N} $*"; }
+
+  require_root() {
+    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+      error "请使用 root 运行"
       return 1
     fi
-  fi
-
-  yellow "将添加 XanMod 源并安装 BBRv3 内核（需重启生效）。"
-  read -rp "确定继续吗？(y/n): " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || { yellow "已取消"; return 0; }
-
-  pkg_update || return 1
-  pkg_install wget gnupg ca-certificates || return 1
-
-  wget -qO - https://dl.xanmod.org/archive.key | gpg --dearmor -o /usr/share/keyrings/xanmod-archive-keyring.gpg --yes || {
-    red "获取 XanMod key 失败"
-    return 1
   }
 
-  echo 'deb [signed-by=/usr/share/keyrings/xanmod-archive-keyring.gpg] http://deb.xanmod.org releases main' \
-    > /etc/apt/sources.list.d/xanmod-release.list
-
-  pkg_update || return 1
-
-  local version
-  wget -q https://dl.xanmod.org/check_x86-64_psabi.sh -O /tmp/check_x86-64_psabi.sh || {
-    red "下载 psabi 检测脚本失败"
-    return 1
+  pause() {
+    echo
+    read -r -p "按回车继续..." _
   }
-  chmod +x /tmp/check_x86-64_psabi.sh
-  version=$(/tmp/check_x86-64_psabi.sh | grep -oP 'x86-64-v\K\d+|x86-64-v\d+' | head -n1)
-  [[ -z "$version" ]] && version="3"
 
-  pkg_install "linux-xanmod-x64v${version}" || { red "安装 XanMod 内核失败"; return 1; }
+  backup_if_exists() {
+    local f="$1"
+    if [ -f "$f" ]; then
+      cp -a "$f" "${f}.bak.$(date +%Y%m%d_%H%M%S)"
+    fi
+  }
 
-  green "BBRv3 内核已安装。请重启后生效。"
-  read -rp "回车返回菜单..." _
-}
+  get_os_id() {
+    local id=""
+    if [ -r /etc/os-release ]; then
+      . /etc/os-release
+      id="${ID:-}"
+    fi
+    echo "$id"
+  }
 
-# -----------------------------
-# 6) BBR/TCP tuning (external)
-# -----------------------------
-bbrx() {
-  need_root
-  local url="https://raw.githubusercontent.com/byilrq/vps/main/tcpx.sh"
-  local tmp_file="/tmp/tcpx.sh"
+  is_debian_like() {
+    local id
+    id="$(get_os_id)"
+    [[ "$id" == "debian" || "$id" == "ubuntu" ]]
+  }
 
-  yellow "正在下载并执行 BBR/TCP 优化脚本：$url"
+  is_x86_64() {
+    [[ "$(uname -m)" == "x86_64" ]]
+  }
 
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL "$url" -o "$tmp_file" || { red "下载失败"; return 1; }
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$tmp_file" "$url" || { red "下载失败"; return 1; }
+  bbr_supported() {
+    local available
+    available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
+    echo "$available" | grep -qw bbr
+  }
+
+  show_status() {
+    local kern cc qdisc headers_status="unknown" available="unknown"
+
+    kern="$(uname -r)"
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+    available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
+
+    if command -v dpkg-query >/dev/null 2>&1; then
+      if dpkg-query -W -f='${Status}\n' "linux-headers-$(uname -r)" 2>/dev/null | grep -q '^install ok installed$'; then
+        headers_status="installed"
+      else
+        headers_status="not installed"
+      fi
+    elif command -v rpm >/dev/null 2>&1; then
+      if rpm -q "kernel-headers-$(uname -r)" >/dev/null 2>&1 || rpm -qa | grep -q '^kernel-headers'; then
+        headers_status="installed"
+      else
+        headers_status="not installed"
+      fi
+    fi
+
+    echo
+    echo "内核版本: $kern"
+    echo "当前拥塞控制算法: $cc"
+    echo "当前队列算法: $qdisc"
+    echo "可用拥塞控制算法: $available"
+    echo "headers: $headers_status"
+    echo
+  }
+
+  install_base_packages() {
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get update -y
+      apt-get install -y wget gnupg ca-certificates apt-transport-https
+    else
+      error "当前系统不支持自动安装依赖"
+      return 1
+    fi
+  }
+
+  setup_xanmod_repo() {
+    install_base_packages || return 1
+
+    mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
+    local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+    local repo_file="/etc/apt/sources.list.d/xanmod-release.list"
+    local tmp
+    tmp="$(mktemp)"
+
+    if ! wget -qO "$tmp" https://dl.xanmod.org/archive.key; then
+      rm -f "$tmp"
+      error "下载 XanMod GPG 密钥失败"
+      return 1
+    fi
+
+    if ! gpg --dearmor -o "$keyring" --yes < "$tmp"; then
+      rm -f "$tmp"
+      error "导入 XanMod GPG 密钥失败"
+      return 1
+    fi
+    rm -f "$tmp"
+
+    echo "deb [signed-by=${keyring}] https://deb.xanmod.org releases main" > "$repo_file"
+    apt-get update -y
+  }
+
+  cpu_level_to_flavor() {
+    local level="2"
+    if grep -qiE 'avx512f|avx512bw|avx512dq|avx512vl' /proc/cpuinfo 2>/dev/null; then
+      level="4"
+    elif grep -qiE 'avx2|bmi1|bmi2|fma|movbe' /proc/cpuinfo 2>/dev/null; then
+      level="3"
+    elif grep -qiE 'sse4_2|cx16|popcnt' /proc/cpuinfo 2>/dev/null; then
+      level="2"
+    else
+      level="1"
+    fi
+    echo "x64v${level}"
+  }
+
+  install_bbr_kernel_if_needed() {
+    if bbr_supported; then
+      info "当前内核已支持 bbr，跳过内核安装"
+      return 0
+    fi
+
+    warn "当前内核不支持 bbr，需要安装支持 BBR 的内核"
+
+    if ! is_debian_like; then
+      error "自动安装仅支持 Debian/Ubuntu"
+      return 1
+    fi
+
+    if ! is_x86_64; then
+      error "自动安装仅支持 x86_64"
+      return 1
+    fi
+
+    setup_xanmod_repo || return 1
+
+    local flavor pkg
+    flavor="$(cpu_level_to_flavor)"
+    pkg="linux-xanmod-${flavor}"
+
+    info "准备安装支持 BBR 的 XanMod 内核: ${pkg}"
+    if apt-get install -y "$pkg"; then
+      update-grub >/dev/null 2>&1 || true
+      ok "XanMod 内核安装完成"
+    else
+      error "XanMod 内核安装失败"
+      return 1
+    fi
+
+    if bbr_supported; then
+      info "当前会话已检测到 bbr 支持"
+      return 0
+    fi
+
+    warn "新内核已安装，但当前系统可能仍在运行旧内核"
+    warn "请先 reboot 重启系统，然后再次执行 bbr"
+    return 2
+  }
+
+  disable_conflicts() {
+    local ts f
+    ts="$(date +%Y%m%d_%H%M%S)"
+
+    for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
+      [ -f "$f" ] || continue
+      [ "$f" = "$SYSCTL_FILE" ] && continue
+
+      if grep -Eq '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "$f" 2>/dev/null ||
+         grep -Eq '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "$f" 2>/dev/null; then
+        backup_if_exists "$f"
+        sed -ri \
+          -e 's@^[[:space:]]*(net\.core\.default_qdisc[[:space:]]*=.*)$@# disabled by bbr '"$ts"': \1@' \
+          -e 's@^[[:space:]]*(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)$@# disabled by bbr '"$ts"': \1@' \
+          "$f"
+        warn "已处理可能冲突的配置: $f"
+      fi
+    done
+  }
+
+  write_bbr_config() {
+    mkdir -p /etc/sysctl.d
+    backup_if_exists "$SYSCTL_FILE"
+
+    cat > "$SYSCTL_FILE" <<'EOF'
+# Minimal stable BBR config
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+EOF
+  }
+
+  apply_bbr_config() {
+    if ! bbr_supported; then
+      error "当前内核还不支持 bbr，无法启用"
+      return 1
+    fi
+
+    disable_conflicts
+    write_bbr_config
+
+    if ! sysctl --system >/dev/null; then
+      error "sysctl 应用失败"
+      return 1
+    fi
+
+    local cc qdisc
+    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
+
+    echo
+    echo "最终结果:"
+    echo "拥塞控制算法: $cc"
+    echo "队列算法: $qdisc"
+    echo
+
+    if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
+      ok "已成功启用 bbr + fq"
+      return 0
+    else
+      error "结果不符合预期，请检查是否有其他配置覆盖"
+      return 1
+    fi
+  }
+
+  remove_bbr_config() {
+    if [ -f "$SYSCTL_FILE" ]; then
+      backup_if_exists "$SYSCTL_FILE"
+      rm -f "$SYSCTL_FILE"
+      sysctl --system >/dev/null 2>&1 || true
+      ok "已删除本脚本写入的 BBR 配置: $SYSCTL_FILE"
+    else
+      warn "未发现本脚本写入的配置文件"
+    fi
+  }
+
+  install_and_enable_bbr() {
+    install_bbr_kernel_if_needed
+    local rc=$?
+    if [ "$rc" -eq 2 ]; then
+      return 0
+    elif [ "$rc" -ne 0 ]; then
+      return "$rc"
+    fi
+
+    apply_bbr_config
+  }
+
+  menu() {
+    while true; do
+      clear
+      echo -e "${C}========== BBR 管理菜单 ========== ${N}"
+      show_status
+      echo "1. 查看当前状态"
+      echo "2. 安装支持 BBR 的内核"
+      echo "3. 启用 BBR + FQ"
+      echo "4. 安装并启用 BBR"
+      echo "5. 删除本脚本写入的 BBR 配置"
+      echo "0. 退出"
+      echo
+
+      local choice
+      read -r -p "请输入选择: " choice
+      echo
+
+      case "$choice" in
+        1)
+          show_status
+          pause
+          ;;
+        2)
+          install_bbr_kernel_if_needed || true
+          pause
+          ;;
+        3)
+          apply_bbr_config || true
+          pause
+          ;;
+        4)
+          install_and_enable_bbr || true
+          pause
+          ;;
+        5)
+          remove_bbr_config || true
+          pause
+          ;;
+        0)
+          return 0
+          ;;
+        *)
+          warn "无效选择"
+          sleep 1
+          ;;
+      esac
+    done
+  }
+
+  require_root || return 1
+
+  if [ $# -gt 0 ]; then
+    case "${1:-}" in
+      status)
+        show_status
+        ;;
+      install)
+        install_bbr_kernel_if_needed
+        ;;
+      enable)
+        apply_bbr_config
+        ;;
+      all)
+        install_and_enable_bbr
+        ;;
+      remove)
+        remove_bbr_config
+        ;;
+      menu)
+        menu
+        ;;
+      *)
+        echo "用法:"
+        echo "  bbr menu     打开菜单"
+        echo "  bbr status   查看状态"
+        echo "  bbr install  安装支持 BBR 的内核"
+        echo "  bbr enable   启用 bbr + fq"
+        echo "  bbr all      安装并启用"
+        echo "  bbr remove   删除本脚本写入的配置"
+        return 1
+        ;;
+    esac
   else
-    pkg_update || true
-    pkg_install curl wget || true
-    curl -fsSL "$url" -o "$tmp_file" || wget -qO "$tmp_file" "$url" || { red "下载失败"; return 1; }
+    menu
   fi
-
-  [[ -s "$tmp_file" ]] || { red "下载文件为空"; return 1; }
-  chmod +x "$tmp_file"
-  bash "$tmp_file"
-  read -rp "回车返回菜单..." _
 }
 
 # -----------------------------
@@ -783,32 +1067,25 @@ menu_sys_conf() {
     echo -e " ${GREEN}2.${tianlan} 修改DNS"
     echo -e " ${GREEN}3.${tianlan} 设置缓存"
     echo -e " ${GREEN}4.${tianlan} 设置IPV4/6优先级"
-    echo -e " ${GREEN}5.${tianlan} 安装BBR3"
-    echo -e " ${GREEN}6.${tianlan} BBR/TCP 优化"
-    echo -e " ${GREEN}7.${tianlan} 设置定时重启"
-    echo -e " ${GREEN}8.${tianlan} 修改SSH端口2222"
-    echo -e " ${GREEN}9.${tianlan} 设置防火墙"
-    echo -e " ${GREEN}10.${tianlan} 系统清理"
-    echo -e " ${GREEN}11.${tianlan} acme证书清理"
+    echo -e " ${GREEN}5.${tianlan} BBR优化"
+    echo -e " ${GREEN}6.${tianlan} 设置定时重启"
+    echo -e " ${GREEN}7.${tianlan} 修改SSH端口2222"
+    echo -e " ${GREEN}8.${tianlan} 设置防火墙"
+    echo -e " ${GREEN}9.${tianlan} 系统清理"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-11]: " choice
+    read -rp "请选择 [0-9]: " choice
     case "$choice" in
       1) change_tz ;;
       2) set_dns_ui ;;
       3) swap_cache ;;
       4) set_ip_priority ;;
-      5) bbrv3 ;;
-      6) bbrx ;;
-      7) cron_reboot ;;
-      8) ssh_port 2222 ;;
-      9) firewall ;;
-      10) sys_cle ;;
-      11) 
-  read -rp "请输入要清理的域名（留空取消）: " domain
-  [[ -n "$domain" ]] && acme_purge_keep_xui "$domain"
-  ;;
+      5) bbr ;;
+      6) cron_reboot ;;
+      7) ssh_port 2222 ;;
+      8) firewall ;;
+      9) sys_cle ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
