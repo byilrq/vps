@@ -1630,8 +1630,16 @@ menu_hy_conf() {
 # -----------------------------
 # 核心更新 / 工具功能
 # -----------------------------
+normalize_hysteria_version() {
+  local v="$1"
+  v="${v#app/}"
+  v="${v#v}"
+  printf '%s' "$v"
+}
+
 get_hysteria_current_version() {
   local bin=""
+  local raw_ver=""
   if [[ -x /usr/local/bin/hysteria ]]; then
     bin="/usr/local/bin/hysteria"
   elif [[ -x /usr/bin/hysteria ]]; then
@@ -1640,12 +1648,17 @@ get_hysteria_current_version() {
     return 1
   fi
 
-  "$bin" version 2>/dev/null | head -n1 | sed -E 's/.*[Vv]ersion[: ]*v?([0-9][^ ]*).*/\1/' | tr -d '\r'
+  raw_ver=$("$bin" version 2>/dev/null | grep -Eo '(app/)?v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?' | head -n1 | tr -d '\r')
+  [[ -n "$raw_ver" ]] || return 1
+  normalize_hysteria_version "$raw_ver"
 }
 
 get_hysteria_latest_version() {
-  curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
-    | grep '"tag_name"' | head -n1 | sed -E 's/.*"v?([^"]+)".*/\1/' | tr -d '\r'
+  local raw_ver=""
+  raw_ver=$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
+    | grep '"tag_name"' | head -n1 | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
+  [[ -n "$raw_ver" ]] || return 1
+  normalize_hysteria_version "$raw_ver"
 }
 
 install_hysteria_auto_update() {
@@ -1666,14 +1679,27 @@ log() {
   echo "$(date '+%F %T') $*" >> "$LOG"
 }
 
+normalize_ver() {
+  local v="$1"
+  v="${v#app/}"
+  v="${v#v}"
+  printf '%s' "$v"
+}
+
 get_current_ver() {
+  local raw_ver=""
   [[ -x "$BIN" ]] || return 1
-  "$BIN" version 2>/dev/null | head -n1 | sed -E 's/.*[Vv]ersion[: ]*v?([0-9][^ ]*).*/\1/' | tr -d '\r'
+  raw_ver=$("$BIN" version 2>/dev/null | grep -Eo '(app/)?v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?' | head -n1 | tr -d '\r')
+  [[ -n "$raw_ver" ]] || return 1
+  normalize_ver "$raw_ver"
 }
 
 get_latest_ver() {
-  curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
-    | grep '"tag_name"' | head -n1 | sed -E 's/.*"v?([^"]+)".*/\1/' | tr -d '\r'
+  local raw_ver=""
+  raw_ver=$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
+    | grep '"tag_name"' | head -n1 | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
+  [[ -n "$raw_ver" ]] || return 1
+  normalize_ver "$raw_ver"
 }
 
 current_ver="$(get_current_ver 2>/dev/null)"
@@ -1729,6 +1755,8 @@ bash /usr/local/bin/hysteria-core-auto-update >/dev/null 2>&1
 EOF
   chmod 755 "$cron_file" >/dev/null 2>&1 || true
 
+  bash "$updater" >/dev/null 2>&1 || true
+
   green "已开启 Hysteria 核心自动更新（每周检测一次）"
   yellow "更新脚本：$updater"
   yellow "定时任务：$cron_file"
@@ -1745,7 +1773,7 @@ show_hysteria_update_log() {
     yellow "最近 50 行更新日志："
     tail -n 50 "$log_file"
   else
-    yellow "暂无更新日志：$log_file"
+    yellow "暂无更新日志：$log_file（说明定时任务还没跑过，或刚开启自动更新）"
   fi
   read -rp "回车返回菜单..." _
 }
