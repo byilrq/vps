@@ -374,8 +374,60 @@ ssh_port() {
     return 1
   }
 
-  green "SSH 端口已经修改为：$new_port"
-  yellow "请确保防火墙放行该端口，避免被锁在外面。"
+  # 如果新端口是 2222，则自动打开防火墙端口
+  if [[ "$new_port" -eq 2222 ]]; then
+    local firewall_opened=false
+    # 检测 firewalld
+    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
+      if firewall-cmd --add-port=2222/tcp --permanent &>/dev/null && firewall-cmd --reload &>/dev/null; then
+        green "已通过 firewalld 放行端口 2222/tcp"
+        firewall_opened=true
+      else
+        red "firewalld 放行端口失败，请手动检查"
+      fi
+    # 检测 ufw
+    elif command -v ufw &>/dev/null; then
+      if ufw allow 2222/tcp &>/dev/null; then
+        green "已通过 ufw 放行端口 2222/tcp"
+        firewall_opened=true
+      else
+        red "ufw 放行端口失败，请手动检查"
+      fi
+    # 检测 iptables
+    elif command -v iptables &>/dev/null; then
+      if iptables -A INPUT -p tcp --dport 2222 -j ACCEPT; then
+        # 尝试持久化 iptables 规则
+        if command -v iptables-save &>/dev/null; then
+          if command -v netfilter-persistent &>/dev/null; then
+            netfilter-persistent save &>/dev/null
+          elif command -v iptables-save >/dev/null && [ -f /etc/iptables/rules.v4 ]; then
+            iptables-save > /etc/iptables/rules.v4
+          elif command -v service iptables save &>/dev/null; then
+            service iptables save &>/dev/null
+          else
+            yellow "无法自动持久化 iptables 规则，重启后可能失效"
+          fi
+        fi
+        green "已通过 iptables 放行端口 2222/tcp"
+        firewall_opened=true
+      else
+        red "iptables 放行端口失败，请手动检查"
+      fi
+    else
+      yellow "未检测到常见防火墙（firewalld/ufw/iptables），请手动放行端口 2222"
+    fi
+
+    green "SSH 端口已经修改为：2222"
+    if [[ "$firewall_opened" == true ]]; then
+      yellow "防火墙已自动放行端口 2222，请确认 SSH 服务正常运行后再断开当前连接。"
+    else
+      yellow "请确保防火墙放行该端口，避免被锁在外面。"
+    fi
+  else
+    green "SSH 端口已经修改为：$new_port"
+    yellow "请确保防火墙放行该端口，避免被锁在外面。"
+  fi
+
   read -rp "回车返回菜单..." _
 }
 
