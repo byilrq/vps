@@ -1412,20 +1412,30 @@ showconf() {
 # -----------------------------
 
 changeport() {
-  local oldport current_domain current_cert_mode current_first current_end mport_value current_link
-  oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
+  local oldport port
+  local current_domain current_cert_mode current_first current_end
+  local jumpInput firstport endport mport_value
+  local link auth share_host sni insecure_flag current_link_host
+  local hy_service
 
-  clear_hy2_jump_rules
-  clear_hy2_input_rules
+  oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
+  [[ -z "$oldport" ]] && oldport=443
+
+  load_hy2_state >/dev/null 2>&1 || true
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
+  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  current_cert_mode="${HY2_CERT_MODE:-$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)}"
 
   while true; do
-    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " port
-    [[ -z $port ]] && port=443
+    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认当前端口：$oldport）: " port
+    [[ -z "$port" ]] && port="$oldport"
 
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
     ((port >= 1 && port <= 65535)) || { red "端口必须在 1-65535 之间"; continue; }
 
-    if ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
+    # 如果输入的是当前监听端口，允许通过；否则检查是否被其它程序占用
+    if [[ "$port" != "$oldport" ]] && ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
       red "UDP 端口 $port 已被占用，请更换"
       continue
     fi
@@ -1433,38 +1443,127 @@ changeport() {
     break
   done
 
-  sed -i "1s/:$oldport/:$port/g" /etc/hysteria/config.yaml 2>/dev/null || true
-  sed -i "s/:$oldport/:$port/g" /root/hy/hy-client.yaml 2>/dev/null || true
-
-  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
-  current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
-  load_hy2_state >/dev/null 2>&1 || true
-  current_first="${HY2_FIRST_PORT:-}"
-  current_end="${HY2_END_PORT:-}"
+  echo ""
+  green "Hysteria 2 端口使用模式如下："
+  echo ""
+  echo -e " ${GREEN}1.${PLAIN} 单端口"
+  echo -e " ${GREEN}2.${PLAIN} 端口跳跃"
+  echo ""
 
   if [[ -n "$current_first" && -n "$current_end" ]]; then
-    mport_value="$current_first-$current_end"
-    apply_hy2_firewall_rules "$port" "$current_first" "$current_end"
-    save_hy2_state "$port" "$current_first" "$current_end" "$current_domain" "$current_cert_mode"
+    read -rp "请输入选项 [1-2]（回车默认继续端口跳跃：$current_first-$current_end）: " jumpInput
+    [[ -z "$jumpInput" ]] && jumpInput=2
   else
-    mport_value="$port"
-    apply_hy2_firewall_rules "$port" "" ""
-    save_hy2_state "$port" "" "" "$current_domain" "$current_cert_mode"
+    read -rp "请输入选项 [1-2]（回车默认单端口）: " jumpInput
+    [[ -z "$jumpInput" ]] && jumpInput=1
   fi
 
-  if [[ -f /root/hy/ur1.txt ]]; then
-    current_link=$(cat /root/hy/ur1.txt 2>/dev/null)
-    current_link=$(echo "$current_link" | sed -E "s#(@[^:]+:)[0-9]+/#\\1${port}/#")
-    current_link=$(echo "$current_link" | sed -E "s#mport=[0-9]+(-[0-9]+)?#mport=${mport_value}#")
-    echo "$current_link" > /root/hy/ur1.txt
+  if [[ "$jumpInput" == "2" ]]; then
+    while true; do
+      read -rp "设置跳端口起始端口 [1-65535]（回车默认：${current_first:-10000}）: " firstport
+      read -rp "设置跳端口结束端口 [1-65535]（回车默认：${current_end:-65535}）: " endport
+
+      [[ -z "$firstport" ]] && firstport="${current_first:-10000}"
+      [[ -z "$endport" ]] && endport="${current_end:-65535}"
+
+      [[ "$firstport" =~ ^[0-9]+$ && "$endport" =~ ^[0-9]+$ ]] || {
+        red "跳端口范围必须是数字"
+        continue
+      }
+
+      ((firstport >= 1 && firstport <= 65535 && endport >= 1 && endport <= 65535)) || {
+        red "跳端口必须在 1-65535 之间"
+        continue
+      }
+
+      ((firstport < endport)) || {
+        red "范围无效：起始端口必须小于结束端口"
+        continue
+      }
+
+      break
+    done
+
+    mport_value="$firstport-$endport"
+  else
+    firstport=""
+    endport=""
+    mport_value="$port"
   fi
+
+  # 更新服务端监听端口
+  if [[ -f /etc/hysteria/config.yaml ]]; then
+    sed -i "1s/listen: :.*/listen: :$port/" /etc/hysteria/config.yaml 2>/dev/null || true
+  fi
+
+  # 更新客户端 server 端口，保留原 host
+  if [[ -f /root/hy/hy-client.yaml ]]; then
+    sed -i -E "s#^server: (.+):[0-9]+#server: \1:$port#" /root/hy/hy-client.yaml 2>/dev/null || true
+  fi
+
+  # 尽量从旧链接中保留分享 host
+  if [[ -f /root/hy/ur1.txt ]]; then
+    current_link_host=$(sed -nE 's#^hysteria2://[^@]+@([^:/]+|\[[^]]+\]):[0-9]+/.*#\1#p' /root/hy/ur1.txt | head -n1)
+  fi
+
+  auth=$(grep -E '^auth:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  sni=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  insecure_flag=$(grep -E '^\s*insecure:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+
+  [[ -z "$current_domain" ]] && current_domain="$sni"
+  [[ -z "$current_cert_mode" ]] && current_cert_mode="unknown"
+
+  if [[ -n "$current_link_host" ]]; then
+    share_host="$current_link_host"
+  elif [[ -n "$sni" ]]; then
+    share_host="$sni"
+  else
+    share_host=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | sed -E 's#:[0-9]+$##' | tr -d '\r')
+  fi
+
+  # 重建分享链接，确保端口和 mport 都是最新
+  if [[ -n "$auth" && -n "$share_host" && -n "$sni" ]]; then
+    if [[ "$insecure_flag" == "true" ]]; then
+      echo "hysteria2://$auth@$share_host:$port/?sni=$sni&insecure=1&mport=$mport_value#H" > /root/hy/ur1.txt
+    else
+      echo "hysteria2://$auth@$share_host:$port/?sni=$sni&mport=$mport_value#H" > /root/hy/ur1.txt
+    fi
+  else
+    # 兜底：如果无法重建，就只替换旧链接中的端口和 mport
+    if [[ -f /root/hy/ur1.txt ]]; then
+      link=$(cat /root/hy/ur1.txt 2>/dev/null)
+      link=$(echo "$link" | sed -E "s#(@[^:]+:)[0-9]+/#\1${port}/#")
+      if echo "$link" | grep -q 'mport='; then
+        link=$(echo "$link" | sed -E "s#mport=[0-9]+(-[0-9]+)?#mport=${mport_value}#")
+      else
+        link=$(echo "$link" | sed -E "s#(#H)?$#\&mport=${mport_value}#H#")
+      fi
+      echo "$link" > /root/hy/ur1.txt
+    fi
+  fi
+
+  # 重新应用防火墙和状态
+  apply_hy2_firewall_rules "$port" "$firstport" "$endport"
+  save_hy2_state "$port" "$firstport" "$endport" "$current_domain" "$current_cert_mode"
 
   fix_hysteria_file_perms
   save_firewall_rules
-  systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria.service >/dev/null 2>&1 || true
+
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1 || {
+    red "Hysteria 2 服务重启失败，请检查日志：journalctl -u $hy_service -n 50 --no-pager"
+    return 1
+  }
+
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
-  green "Hysteria 2 端口已成功修改为：$port"
+  green "Hysteria 2 监听端口已修改为：$port"
+  if [[ -n "$firstport" && -n "$endport" ]]; then
+    green "端口跳跃范围已修改为：$firstport-$endport -> $port"
+  else
+    yellow "当前为单端口模式：$port"
+  fi
+
   showconf
 }
 
