@@ -239,33 +239,259 @@ cert_not_expiring_soon() {
   openssl x509 -checkend "$seconds" -noout -in "$cert_file" >/dev/null 2>&1
 }
 
-existing_official_cert_usable() {
-  local expect_domain="$1"
-  local cert_file="/etc/hysteria/cert.crt"
-  local key_file="/etc/hysteria/private.key"
-  local stored_domain=""
+find_cert_name_by_domain() {
+  local cert_domain="$1"
+  local d
 
-  [[ -s "$cert_file" && -s "$key_file" ]] || return 1
-
-  if [[ -f "$ACME_DOMAIN_LOG" ]]; then
-    stored_domain=$(tr -d '\r\n' < "$ACME_DOMAIN_LOG" 2>/dev/null)
-  fi
-  [[ -z "$stored_domain" ]] && stored_domain=$(get_cert_primary_domain "$cert_file" 2>/dev/null || true)
-
-  [[ -n "$stored_domain" ]] || return 1
-
-  if [[ -n "$expect_domain" && "$stored_domain" != "$expect_domain" ]]; then
-    cert_matches_domain "$cert_file" "$expect_domain" || return 1
-    stored_domain="$expect_domain"
+  if [[ -f "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" && -f "/etc/letsencrypt/live/${cert_domain}/privkey.pem" ]]; then
+    echo "${cert_domain}"
+    return 0
   fi
 
-  cert_matches_domain "$cert_file" "$stored_domain" || return 1
-  cert_not_expiring_soon "$cert_file" 14 || return 1
+  for d in /etc/letsencrypt/live/"${cert_domain}"*; do
+    [[ -d "$d" ]] || continue
+    if [[ -f "$d/fullchain.pem" && -f "$d/privkey.pem" ]]; then
+      basename "$d"
+      return 0
+    fi
+  done
 
-  echo "$stored_domain"
+  return 1
+}
+
+cert_files_exist() {
+  local cert_domain="$1"
+  local cert_name
+
+  if [[ -f "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" && -f "/etc/letsencrypt/live/${cert_domain}/privkey.pem" ]]; then
+    return 0
+  fi
+
+  cert_name=$(find_cert_name_by_domain "$cert_domain" 2>/dev/null || true)
+  [[ -n "$cert_name" ]] && [[ -f "/etc/letsencrypt/live/${cert_name}/fullchain.pem" && -f "/etc/letsencrypt/live/${cert_name}/privkey.pem" ]]
+}
+
+get_cert_paths() {
+  local cert_domain="$1"
+  local cert_name cert_file key_file
+
+  cert_name=$(find_cert_name_by_domain "$cert_domain" 2>/dev/null || true)
+  [[ -n "$cert_name" ]] || return 1
+
+  cert_file="/etc/letsencrypt/live/${cert_name}/fullchain.pem"
+  key_file="/etc/letsencrypt/live/${cert_name}/privkey.pem"
+
+  [[ -f "$cert_file" && -f "$key_file" ]] || return 1
+
+  echo "$cert_name|$cert_file|$key_file"
+}
+
+cert_is_valid() {
+  local cert_domain="$1"
+  local cert_info cert_file
+
+  cert_info=$(get_cert_paths "$cert_domain") || return 1
+  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
+
+  [[ -f "$cert_file" ]] || return 1
+  openssl x509 -checkend 0 -noout -in "$cert_file" >/dev/null 2>&1 || return 1
+
+  cert_matches_domain "$cert_file" "$cert_domain"
+}
+
+cert_key_matches() {
+  local cert_domain="$1"
+  local cert_info cert_file key_file
+
+  cert_info=$(get_cert_paths "$cert_domain") || return 1
+  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
+  key_file=$(echo "$cert_info" | cut -d'|' -f3)
+
+  [[ -f "$cert_file" && -f "$key_file" ]] || return 1
+
+  local cert_pub key_pub
+  cert_pub=$(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform pem 2>/dev/null)
+  key_pub=$(openssl pkey -in "$key_file" -pubout -outform pem 2>/dev/null)
+
+  [[ -n "$cert_pub" && -n "$key_pub" && "$cert_pub" == "$key_pub" ]]
+}
+
+print_cert_paths() {
+  local cert_domain="$1"
+  local cert_info cert_name cert_file key_file
+
+  cert_info=$(get_cert_paths "$cert_domain" 2>/dev/null || true)
+  if [[ -n "$cert_info" ]]; then
+    cert_name=$(echo "$cert_info" | cut -d'|' -f1)
+    cert_file=$(echo "$cert_info" | cut -d'|' -f2)
+    key_file=$(echo "$cert_info" | cut -d'|' -f3)
+    echo "本脚本将检查以下 Let’s Encrypt 证书路径："
+    echo "检查 ${cert_file}"
+    echo "检查 ${key_file}"
+    echo "证书目录名：${cert_name}"
+  else
+    echo "当前尚未发现 ${cert_domain} 对应的 /etc/letsencrypt/live 证书目录。"
+  fi
+}
+
+show_local_cert_info() {
+  local cert_domain="$1"
+  local cert_info cert_file
+
+  cert_info=$(get_cert_paths "$cert_domain" 2>/dev/null || true)
+  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
+
+  if [[ -f "$cert_file" ]]; then
+    echo "域名: ${cert_domain}"
+    openssl x509 -noout -subject -issuer -dates -in "$cert_file" 2>/dev/null
+  else
+    echo "域名: ${cert_domain}"
+    echo "本地未找到证书文件。"
+  fi
+}
+
+issue_cert_for_domain() {
+  local cert_domain="$1"
+
+  mkdir -p /var/www/acme
+  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
+
+  systemctl stop nginx 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
+  systemctl stop caddy 2>/dev/null || true
+  pkill -f nginx 2>/dev/null || true
+  pkill -f apache2 2>/dev/null || true
+  pkill -f caddy 2>/dev/null || true
+  sleep 2
+
+  if ss -lnt | grep -q ':80 '; then
+    red "80 端口仍被占用，无法申请证书。"
+    ss -lntp | grep ':80 ' || true
+    return 1
+  fi
+
+  cat > /etc/nginx/sites-available/acme-bootstrap.conf <<EOF_CONF
+server {
+    listen 80;
+    server_name ${cert_domain};
+
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/acme;
+        default_type "text/plain";
+    }
+
+    location / {
+        root /var/www/html;
+        index index.html;
+    }
+}
+EOF_CONF
+
+  rm -f /etc/nginx/sites-enabled/*
+  ln -sf /etc/nginx/sites-available/acme-bootstrap.conf /etc/nginx/sites-enabled/acme-bootstrap.conf
+
+  nginx -t || return 1
+  systemctl restart nginx || return 1
+
+  certbot certonly --webroot -w /var/www/acme --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain" || return 1
+
+  if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
+    return 0
+  fi
+
+  return 1
+}
+
+try_use_local_cert() {
+  local cert_domain="$1"
+
+  echo "----------------------------------------------------------------"
+  echo "检查本地已有 Let’s Encrypt 证书：${cert_domain}"
+  echo "----------------------------------------------------------------"
+  print_cert_paths "$cert_domain"
+
+  if ! cert_files_exist "$cert_domain"; then
+    red "${cert_domain} 本地证书文件不存在。"
+    return 1
+  fi
+
+  if ! cert_is_valid "$cert_domain"; then
+    red "${cert_domain} 本地证书无效：可能已过期、无法读取，或证书域名与 ${cert_domain} 不匹配。"
+    return 1
+  fi
+
+  if ! cert_key_matches "$cert_domain"; then
+    red "${cert_domain} 的 fullchain.pem 与 privkey.pem 不匹配。"
+    return 1
+  fi
+
+  green "${cert_domain} 本地 Let’s Encrypt 证书有效，且私钥匹配，继续使用。"
+  show_local_cert_info "$cert_domain"
   return 0
 }
 
+prepare_cert_for_domain() {
+  local cert_domain="$1"
+  local cert_choice=""
+
+  while true; do
+    echo "----------------------------------------------------------------"
+    echo "Let’s Encrypt 证书处理：${cert_domain}"
+    echo "----------------------------------------------------------------"
+    print_cert_paths "$cert_domain"
+    echo
+    echo "Y = 重新申请 Let’s Encrypt 证书（certbot + nginx webroot）"
+    echo "n = 使用 VPS 本地已有 /etc/letsencrypt/live 证书（若有效）"
+    echo "q = 退出脚本"
+    read -rp "请选择 [Y/n/q]: " cert_choice
+
+    case "$cert_choice" in
+      [Nn])
+        if try_use_local_cert "$cert_domain"; then
+          return 0
+        fi
+        echo
+        yellow "你可以现在手动放置正确证书后，再次选择 n 继续检测。"
+        ;;
+      [Qq])
+        red "已退出证书处理流程。"
+        return 1
+        ;;
+      *)
+        echo "开始为 ${cert_domain} 申请新 Let’s Encrypt 证书..."
+        if issue_cert_for_domain "$cert_domain"; then
+          green "${cert_domain} 证书申请成功。"
+          show_local_cert_info "$cert_domain"
+          return 0
+        else
+          red "${cert_domain} 证书申请失败！"
+          yellow "你可以修复解析/端口问题，或手动放置证书后再次选择 n。"
+        fi
+        ;;
+    esac
+  done
+}
+
+existing_official_cert_usable() {
+  local expect_domain="$1"
+  local cert_info cert_file key_file stored_domain=""
+
+  [[ -n "$expect_domain" ]] || return 1
+  cert_info=$(get_cert_paths "$expect_domain" 2>/dev/null || true)
+  [[ -n "$cert_info" ]] || return 1
+
+  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
+  key_file=$(echo "$cert_info" | cut -d'|' -f3)
+
+  [[ -s "$cert_file" && -s "$key_file" ]] || return 1
+  cert_is_valid "$expect_domain" || return 1
+  cert_key_matches "$expect_domain" || return 1
+  cert_not_expiring_soon "$cert_file" 14 || return 1
+
+  stored_domain="$expect_domain"
+  echo "$stored_domain"
+  return 0
+}
 ensure_hy2_input_chain() {
   iptables -N HY2_INPUT >/dev/null 2>&1 || true
   iptables -F HY2_INPUT >/dev/null 2>&1 || true
@@ -368,27 +594,15 @@ EOF
 }
 
 install_hy2_cert_renew_job() {
-  local cert_file="/etc/hysteria/cert.crt"
-  local key_file="/etc/hysteria/private.key"
-
-  cat > "$HY2_CERT_RENEW_BIN" <<EOF
+  cat > "$HY2_CERT_RENEW_BIN" <<EOF_RENEW
 #!/usr/bin/env bash
 set -euo pipefail
 
-CERT_FILE="$cert_file"
-KEY_FILE="$key_file"
 DOMAIN_LOG="$ACME_DOMAIN_LOG"
-ACME_BIN="/root/.acme.sh/acme.sh"
-
-[[ -x "\$ACME_BIN" ]] || exit 0
-[[ -s "\$CERT_FILE" && -s "\$KEY_FILE" && -f "\$DOMAIN_LOG" ]] || exit 0
+[[ -f "\$DOMAIN_LOG" ]] || exit 0
 
 domain=\$(tr -d '\r\n' < "\$DOMAIN_LOG" 2>/dev/null || true)
 [[ -n "\$domain" ]] || exit 0
-
-if openssl x509 -checkend \$((7 * 24 * 3600)) -noout -in "\$CERT_FILE" >/dev/null 2>&1; then
-  exit 0
-fi
 
 service_name="hysteria-server"
 if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
@@ -397,21 +611,15 @@ elif systemctl list-unit-files 2>/dev/null | grep -q '^hysteria\.service'; then
   service_name="hysteria"
 fi
 
-"\$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-"\$ACME_BIN" --renew -d "\$domain" --ecc --force >/dev/null 2>&1
-"\$ACME_BIN" --install-cert -d "\$domain" \
-  --key-file "\$KEY_FILE" \
-  --fullchain-file "\$CERT_FILE" \
-  --ecc \
-  --reloadcmd "systemctl restart \$service_name" >/dev/null 2>&1
-EOF
+certbot renew --webroot -w /var/www/acme --non-interactive --post-hook "systemctl restart \$service_name" >/dev/null 2>&1 || exit 0
+EOF_RENEW
 
   chmod 700 "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
 
-  cat > "$HY2_CERT_WEEKLY_CRON" <<EOF
+  cat > "$HY2_CERT_WEEKLY_CRON" <<EOF_CRON
 #!/usr/bin/env bash
 "$HY2_CERT_RENEW_BIN"
-EOF
+EOF_CRON
   chmod 755 "$HY2_CERT_WEEKLY_CRON" >/dev/null 2>&1 || true
 
   if [[ -f /etc/crontab ]]; then
@@ -423,7 +631,6 @@ EOF
   systemctl disable --now acme.timer >/dev/null 2>&1 || true
   systemctl disable --now acme-sh.timer >/dev/null 2>&1 || true
 }
-
 install_hy2_boot_fix_service() {
   cat > "$HY2_FIREWALL_RESTORE_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -628,6 +835,25 @@ fix_hysteria_file_perms() {
     chmod 600 "$ca_log" 2>/dev/null || true
   fi
 
+  local cfg_cert cfg_key cert_real key_real
+  if [[ -f "$cfg" ]]; then
+    cfg_cert=$(grep -E ^\s*cert: "$cfg" 2>/dev/null | awk '{print $2}' | tail -n1)
+    cfg_key=$(grep -E ^\s*key: "$cfg" 2>/dev/null | awk '{print $2}' | tail -n1)
+    if [[ "$cfg_cert" == /etc/letsencrypt/live/* || "$cfg_key" == /etc/letsencrypt/live/* ]]; then
+      cert_real=$(readlink -f "$cfg_cert" 2>/dev/null || true)
+      key_real=$(readlink -f "$cfg_key" 2>/dev/null || true)
+      chmod 755 /etc/letsencrypt /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+      [[ -n "$cfg_cert" ]] && chmod 755 "$(dirname "$cfg_cert")" 2>/dev/null || true
+      [[ -n "$cert_real" ]] && chmod 755 "0 0dirname "$cert_real")" 2>/dev/null || true
+      [[ -n "$key_real" ]] && chmod 755 "0 0dirname "$key_real")" 2>/dev/null || true
+      [[ -n "$cert_real" ]] && chmod 644 "$cert_real" 2>/dev/null || true
+      if [[ -n "$key_real" ]]; then
+        chown root:"$g" "$key_real" 2>/dev/null || true
+        chmod 640 "$key_real" 2>/dev/null || true
+      fi
+    fi
+  fi
+
   if [[ -d "$hy_dir" ]]; then
     chown -R root:root "$hy_dir" 2>/dev/null || true
     chmod 700 "$hy_dir" 2>/dev/null || true
@@ -642,7 +868,7 @@ fix_hysteria_file_perms() {
 inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
-  echo -e " ${GREEN}1.${PLAIN} Acme 脚本自动申请${YELLOW}（默认，强制校验证书）${PLAIN}"
+  echo -e " ${GREEN}1.${PLAIN} Let’s Encrypt 自动申请/复用${YELLOW}（默认，certbot + nginx webroot，强制校验证书）${PLAIN}"
   echo -e " ${GREEN}2.${PLAIN} 必应自签证书${YELLOW}（客户端将跳过证书校验）${PLAIN}"
   echo -e " ${GREEN}3.${PLAIN} 自定义证书路径${YELLOW}（默认强制校验）${PLAIN}"
   echo ""
@@ -655,26 +881,11 @@ inst_cert() {
   cert_mode="official"
 
   if [[ $certInput == 1 ]]; then
-    cert_path="/etc/hysteria/cert.crt"
-    key_path="/etc/hysteria/private.key"
-
     realip || exit 1
     read -rp "请输入需要申请或复用证书的域名: " domain
     domain="$(normalize_host_input "$domain")"
     [[ -z $domain ]] && red "未输入域名，无法执行操作。" && exit 1
     is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
-
-    local reusable_domain=""
-    reusable_domain=$(existing_official_cert_usable "$domain" 2>/dev/null || true)
-    if [[ -n "$reusable_domain" ]]; then
-      green "检测到域名 $reusable_domain 的本地正式证书已存在且有效，跳过重复申请"
-      echo "$reusable_domain" > "$ACME_DOMAIN_LOG"
-      hy_domain="$reusable_domain"
-      tls_insecure="false"
-      cert_mode="official"
-      install_hy2_cert_renew_job
-      return 0
-    fi
 
     green "已输入的域名：$domain"
     green "检查域名解析..."
@@ -684,62 +895,48 @@ inst_cert() {
       exit 1
     }
 
-    green "检查 80 端口..."
-    check_port_80_free || {
-      red "80 端口被占用，acme standalone 模式会失败或长时间卡住"
-      yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
-      exit 1
-    }
-
     green "安装申请证书所需依赖..."
-    pkg_install curl wget sudo socat openssl >/dev/null 2>&1 || true
-
-    green "安装 acme.sh ..."
-    curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
-      red "安装 acme.sh 失败"
-      exit 1
-    }
-
-    source ~/.bashrc >/dev/null 2>&1 || true
-    bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
-    bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-
-    green "开始签发证书，这一步可能需要几十秒..."
-    if [[ -n $(echo "$ip" | grep ":") ]]; then
-      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
-        red "签发失败"
-        exit 1
-      }
+    if command -v apt-get >/dev/null 2>&1; then
+      pkg_install curl wget sudo openssl iproute2 nginx-full certbot >/dev/null 2>&1 || pkg_install curl wget sudo openssl iproute2 nginx certbot >/dev/null 2>&1 || true
     else
-      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
-        red "签发失败"
-        exit 1
-      }
+      pkg_install curl wget sudo openssl iproute2 nginx certbot >/dev/null 2>&1 || true
     fi
 
-    bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
-      --key-file "$key_path" \
-      --fullchain-file "$cert_path" \
-      --ecc \
-      --reloadcmd "systemctl restart $(get_hysteria_service_name)" || {
-      red "安装证书失败"
-      exit 1
-    }
-
-    if [[ -s "$cert_path" && -s "$key_path" ]]; then
-      echo "$domain" > "$ACME_DOMAIN_LOG"
-      install_hy2_cert_renew_job
-      green "证书申请成功，已保存到 /etc/hysteria/"
-      yellow "证书路径：$cert_path"
-      yellow "私钥路径：$key_path"
-      yellow "已创建每周检测任务：证书若已过期或 7 天内到期，将自动续签并重启 Hysteria"
-      hy_domain="$domain"
-      tls_insecure="false"
-      cert_mode="official"
-    else
-      red "证书文件生成异常，请检查 acme.sh 输出"
+    if ! command -v certbot >/dev/null 2>&1; then
+      red "未检测到 certbot，无法申请 Let’s Encrypt 证书。"
       exit 1
     fi
+    if ! command -v nginx >/dev/null 2>&1; then
+      red "未检测到 nginx，无法使用 webroot 方式申请证书。"
+      exit 1
+    fi
+
+    if ! prepare_cert_for_domain "$domain"; then
+      systemctl start nginx >/dev/null 2>&1 || true
+      red "$domain 的 Let’s Encrypt 证书不可用，程序终止！"
+      exit 1
+    fi
+
+    CERT_INFO=$(get_cert_paths "$domain" 2>/dev/null || true)
+    CERT_NAME=$(echo "$CERT_INFO" | cut -d'|' -f1)
+    cert_path=$(echo "$CERT_INFO" | cut -d'|' -f2)
+    key_path=$(echo "$CERT_INFO" | cut -d'|' -f3)
+
+    if [[ -z "$CERT_NAME" || -z "$cert_path" || -z "$key_path" ]]; then
+      red "无法定位 ${domain} 的 /etc/letsencrypt/live 证书文件，程序终止。"
+      exit 1
+    fi
+
+    echo "$domain" > "$ACME_DOMAIN_LOG"
+    install_hy2_cert_renew_job
+    green "证书已就绪，实际证书保留在 /etc/letsencrypt/live/${CERT_NAME}/"
+    yellow "证书路径：$cert_path"
+    yellow "私钥路径：$key_path"
+    yellow "Hysteria 将直接引用上述 Let’s Encrypt 路径，不使用 /root/cert/<域名>/ 软链接。"
+    yellow "已创建每周检测任务：调用 certbot renew，并在续签后重启 Hysteria"
+    hy_domain="$domain"
+    tls_insecure="false"
+    cert_mode="letsencrypt"
 
   elif [[ $certInput == 3 ]]; then
     read -rp "请输入公钥文件 crt 的路径: " cert_path
@@ -779,8 +976,6 @@ inst_cert() {
     yellow "当前为自签证书模式，客户端将跳过证书校验"
   fi
 }
-
-# -----------------------------
 # 端口与跳跃端口设置
 # -----------------------------
 
@@ -1307,7 +1502,7 @@ EOF
 unsthysteria() {
   local keep_cert="false"
 
-  if [[ -f /etc/hysteria/ca.log && -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]]; then
+  if [[ -f /etc/hysteria/ca.log ]]; then
     keep_cert="true"
   fi
 
@@ -1333,7 +1528,7 @@ unsthysteria() {
   if [[ "$keep_cert" == "true" ]]; then
     mkdir -p /etc/hysteria >/dev/null 2>&1 || true
     rm -f /etc/hysteria/config.yaml >/dev/null 2>&1 || true
-    green "Hysteria 2 已卸载完成，已保留正式证书与域名记录，重装时可自动复用。"
+    green "Hysteria 2 已卸载完成，已保留 /etc/letsencrypt/live 中的 Let’s Encrypt 证书与域名记录，重装时可自动复用。"
   else
     rm -rf /etc/hysteria >/dev/null 2>&1 || true
     green "Hysteria 2 已彻底卸载完成。"
