@@ -163,6 +163,77 @@ download_with_retry() {
 }
 
 # -----------------------------
+# 兼容可编辑输入：支持 Backspace/Delete
+# -----------------------------
+read_input() {
+  local prompt="$1"
+  local __var_name="$2"
+  local __tmp=""
+
+  if [[ -t 0 ]]; then
+    stty sane 2>/dev/null || true
+    stty erase '^?' 2>/dev/null || true
+    bind 'set editing-mode emacs' 2>/dev/null || true
+    bind '"\e[3~": delete-char' 2>/dev/null || true
+    read -e -r -p "$prompt" __tmp
+  else
+    read -r -p "$prompt" __tmp
+  fi
+
+  printf -v "$__var_name" '%s' "$__tmp"
+}
+
+# -----------------------------
+# 安装 Let’s Encrypt / nginx 依赖（不静默吞错）
+# -----------------------------
+install_certbot_nginx_deps() {
+  green "安装申请证书所需依赖：curl wget sudo openssl iproute2 nginx certbot acl"
+
+  fix_dpkg_interrupt
+
+  if command -v apt-get >/dev/null 2>&1; then
+    wait_for_apt_lock || true
+    pkg_update || yellow "软件源刷新失败，将继续尝试安装依赖。"
+
+    if pkg_install curl wget sudo openssl iproute2 nginx-full certbot acl; then
+      :
+    elif pkg_install curl wget sudo openssl iproute2 nginx certbot acl; then
+      :
+    else
+      red "证书依赖安装失败。请检查 apt 源、dpkg 状态或网络。"
+      echo "可手动排查："
+      echo "  dpkg --configure -a"
+      echo "  apt-get -f install -y"
+      echo "  apt-get update"
+      echo "  apt-get install -y curl wget sudo openssl iproute2 nginx certbot"
+      return 1
+    fi
+  elif command -v dnf >/dev/null 2>&1; then
+    dnf -y makecache || true
+    dnf -y install curl wget sudo openssl iproute nginx certbot acl || return 1
+  elif command -v yum >/dev/null 2>&1; then
+    yum -y makecache || true
+    yum -y install curl wget sudo openssl iproute nginx certbot acl || return 1
+  else
+    red "未检测到受支持的包管理器，无法安装证书依赖。"
+    return 1
+  fi
+
+  if ! command -v certbot >/dev/null 2>&1; then
+    red "未检测到 certbot，无法申请 Let’s Encrypt 证书。"
+    return 1
+  fi
+
+  if ! command -v nginx >/dev/null 2>&1; then
+    red "未检测到 nginx，无法使用 webroot 方式申请证书。"
+    return 1
+  fi
+
+  green "证书依赖安装完成"
+  return 0
+}
+
+# -----------------------------
 # 获取本机公网 IP
 # -----------------------------
 realip() {
@@ -393,7 +464,13 @@ EOF_CONF
   nginx -t || return 1
   systemctl restart nginx || return 1
 
-  certbot certonly --webroot -w /var/www/acme --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain" || return 1
+  local certbot_rc=0
+  certbot certonly --webroot -w /var/www/acme --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain" || certbot_rc=$?
+
+  # 证书申请完成后立即释放 80/443，避免 Hysteria masquerade 与 nginx 抢端口。
+  release_http_ports_for_hysteria
+
+  [[ "$certbot_rc" -eq 0 ]] || return 1
 
   if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
     return 0
@@ -443,7 +520,7 @@ prepare_cert_for_domain() {
     echo "Y = 重新申请 Let’s Encrypt 证书（certbot + nginx webroot）"
     echo "n = 使用 VPS 本地已有 /etc/letsencrypt/live 证书（若有效）"
     echo "q = 退出脚本"
-    read -rp "请选择 [Y/n/q]: " cert_choice
+    read_input "请选择 [Y/n/q]: " cert_choice
 
     case "$cert_choice" in
       [Nn])
@@ -593,16 +670,72 @@ EOF
   chmod 600 "$HY2_STATE_FILE" >/dev/null 2>&1 || true
 }
 
+release_http_ports_for_hysteria() {
+  # Hysteria masquerade uses TCP 80/443; certbot's temporary nginx must not keep these ports.
+  systemctl stop nginx 2>/dev/null || true
+  systemctl disable nginx 2>/dev/null || true
+  systemctl stop apache2 2>/dev/null || true
+  systemctl disable apache2 2>/dev/null || true
+  systemctl stop caddy 2>/dev/null || true
+  systemctl disable caddy 2>/dev/null || true
+  pkill -f nginx 2>/dev/null || true
+  pkill -f apache2 2>/dev/null || true
+  pkill -f caddy 2>/dev/null || true
+}
+
+grant_letsencrypt_cert_access() {
+  local cert_file="$1"
+  local key_file="$2"
+  local svc="/etc/systemd/system/hysteria-server.service"
+  local u="hysteria" g="hysteria"
+  local cert_real key_real live_dir archive_dir
+
+  [[ -n "$cert_file" && -n "$key_file" ]] || return 0
+  [[ "$cert_file" == /etc/letsencrypt/live/* || "$key_file" == /etc/letsencrypt/live/* ]] || return 0
+
+  if [[ -f "$svc" ]]; then
+    u=$(grep -E '^\s*User=' "$svc" | tail -n1 | cut -d= -f2 | xargs)
+    g=$(grep -E '^\s*Group=' "$svc" | tail -n1 | cut -d= -f2 | xargs)
+    [[ -z "$u" ]] && u="hysteria"
+    [[ -z "$g" ]] && g="$u"
+  fi
+
+  cert_real=$(readlink -f "$cert_file" 2>/dev/null || true)
+  key_real=$(readlink -f "$key_file" 2>/dev/null || true)
+  live_dir=$(dirname "$cert_file")
+  archive_dir=$(dirname "${cert_real:-$key_real}")
+
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:${u}:--x /etc/letsencrypt 2>/dev/null || true
+    setfacl -m u:${u}:--x /etc/letsencrypt/live 2>/dev/null || true
+    setfacl -m u:${u}:--x /etc/letsencrypt/archive 2>/dev/null || true
+    [[ -d "$live_dir" ]] && setfacl -m u:${u}:rx "$live_dir" 2>/dev/null || true
+    [[ -d "$archive_dir" ]] && setfacl -m u:${u}:rx "$archive_dir" 2>/dev/null || true
+    [[ -n "$cert_real" && -f "$cert_real" ]] && setfacl -m u:${u}:r "$cert_real" 2>/dev/null || true
+    [[ -n "$key_real" && -f "$key_real" ]] && setfacl -m u:${u}:r "$key_real" 2>/dev/null || true
+    [[ -d "$archive_dir" ]] && setfacl -d -m u:${u}:rX "$archive_dir" 2>/dev/null || true
+  else
+    chmod 755 /etc/letsencrypt /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
+    [[ -d "$live_dir" ]] && chmod 755 "$live_dir" 2>/dev/null || true
+    [[ -d "$archive_dir" ]] && chmod 755 "$archive_dir" 2>/dev/null || true
+    [[ -n "$cert_real" && -f "$cert_real" ]] && chmod 644 "$cert_real" 2>/dev/null || true
+    if [[ -n "$key_real" && -f "$key_real" ]]; then
+      chown root:"$g" "$key_real" 2>/dev/null || true
+      chmod 640 "$key_real" 2>/dev/null || true
+    fi
+  fi
+}
+
 install_hy2_cert_renew_job() {
-  cat > "$HY2_CERT_RENEW_BIN" <<EOF_RENEW
+  cat > "$HY2_CERT_RENEW_BIN" <<'EOF_RENEW'
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN_LOG="$ACME_DOMAIN_LOG"
-[[ -f "\$DOMAIN_LOG" ]] || exit 0
+DOMAIN_LOG="/etc/hysteria/ca.log"
+[[ -f "$DOMAIN_LOG" ]] || exit 0
 
-domain=\$(tr -d '\r\n' < "\$DOMAIN_LOG" 2>/dev/null || true)
-[[ -n "\$domain" ]] || exit 0
+domain=$(tr -d '\r\n' < "$DOMAIN_LOG" 2>/dev/null || true)
+[[ -n "$domain" ]] || exit 0
 
 service_name="hysteria-server"
 if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
@@ -611,7 +744,48 @@ elif systemctl list-unit-files 2>/dev/null | grep -q '^hysteria\.service'; then
   service_name="hysteria"
 fi
 
-certbot renew --webroot -w /var/www/acme --non-interactive --post-hook "systemctl restart \$service_name" >/dev/null 2>&1 || exit 0
+get_service_user() {
+  local svc="/etc/systemd/system/hysteria-server.service"
+  local u="hysteria"
+  if [[ -f "$svc" ]]; then
+    u=$(grep -E '^\s*User=' "$svc" | tail -n1 | cut -d= -f2 | xargs)
+    [[ -z "$u" ]] && u="hysteria"
+  fi
+  printf '%s' "$u"
+}
+
+grant_access() {
+  local d="$1"
+  local u cert key cert_real key_real live_dir archive_dir
+  u=$(get_service_user)
+  cert="/etc/letsencrypt/live/$d/fullchain.pem"
+  key="/etc/letsencrypt/live/$d/privkey.pem"
+  [[ -e "$cert" && -e "$key" ]] || return 0
+  cert_real=$(readlink -f "$cert" 2>/dev/null || true)
+  key_real=$(readlink -f "$key" 2>/dev/null || true)
+  live_dir=$(dirname "$cert")
+  archive_dir=$(dirname "${cert_real:-$key_real}")
+
+  if command -v setfacl >/dev/null 2>&1; then
+    setfacl -m u:${u}:--x /etc/letsencrypt 2>/dev/null || true
+    setfacl -m u:${u}:--x /etc/letsencrypt/live 2>/dev/null || true
+    setfacl -m u:${u}:--x /etc/letsencrypt/archive 2>/dev/null || true
+    setfacl -m u:${u}:rx "$live_dir" 2>/dev/null || true
+    setfacl -m u:${u}:rx "$archive_dir" 2>/dev/null || true
+    [[ -n "$cert_real" ]] && setfacl -m u:${u}:r "$cert_real" 2>/dev/null || true
+    [[ -n "$key_real" ]] && setfacl -m u:${u}:r "$key_real" 2>/dev/null || true
+    setfacl -d -m u:${u}:rX "$archive_dir" 2>/dev/null || true
+  fi
+}
+
+systemctl stop "$service_name" >/dev/null 2>&1 || true
+systemctl stop nginx apache2 caddy >/dev/null 2>&1 || true
+pkill -f nginx >/dev/null 2>&1 || true
+
+certbot renew --standalone --non-interactive >/dev/null 2>&1 || true
+
+grant_access "$domain"
+systemctl start "$service_name" >/dev/null 2>&1 || true
 EOF_RENEW
 
   chmod 700 "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
@@ -835,23 +1009,11 @@ fix_hysteria_file_perms() {
     chmod 600 "$ca_log" 2>/dev/null || true
   fi
 
-  local cfg_cert cfg_key cert_real key_real
   if [[ -f "$cfg" ]]; then
-    cfg_cert=$(grep -E ^\s*cert: "$cfg" 2>/dev/null | awk '{print $2}' | tail -n1)
-    cfg_key=$(grep -E ^\s*key: "$cfg" 2>/dev/null | awk '{print $2}' | tail -n1)
-    if [[ "$cfg_cert" == /etc/letsencrypt/live/* || "$cfg_key" == /etc/letsencrypt/live/* ]]; then
-      cert_real=$(readlink -f "$cfg_cert" 2>/dev/null || true)
-      key_real=$(readlink -f "$cfg_key" 2>/dev/null || true)
-      chmod 755 /etc/letsencrypt /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-      [[ -n "$cfg_cert" ]] && chmod 755 "$(dirname "$cfg_cert")" 2>/dev/null || true
-      [[ -n "$cert_real" ]] && chmod 755 "0 0dirname "$cert_real")" 2>/dev/null || true
-      [[ -n "$key_real" ]] && chmod 755 "0 0dirname "$key_real")" 2>/dev/null || true
-      [[ -n "$cert_real" ]] && chmod 644 "$cert_real" 2>/dev/null || true
-      if [[ -n "$key_real" ]]; then
-        chown root:"$g" "$key_real" 2>/dev/null || true
-        chmod 640 "$key_real" 2>/dev/null || true
-      fi
-    fi
+    local cfg_cert cfg_key
+    cfg_cert=$(awk '/^tls:/,/^[^ ]/ {if ($1=="cert:") print $2}' "$cfg" 2>/dev/null | tail -n1)
+    cfg_key=$(awk '/^tls:/,/^[^ ]/ {if ($1=="key:") print $2}' "$cfg" 2>/dev/null | tail -n1)
+    grant_letsencrypt_cert_access "$cfg_cert" "$cfg_key"
   fi
 
   if [[ -d "$hy_dir" ]]; then
@@ -860,7 +1022,6 @@ fix_hysteria_file_perms() {
     find "$hy_dir" -type f -exec chmod 600 {} \; 2>/dev/null || true
   fi
 }
-
 # -----------------------------
 # 证书安装与配置
 # -----------------------------
@@ -872,7 +1033,7 @@ inst_cert() {
   echo -e " ${GREEN}2.${PLAIN} 必应自签证书${YELLOW}（客户端将跳过证书校验）${PLAIN}"
   echo -e " ${GREEN}3.${PLAIN} 自定义证书路径${YELLOW}（默认强制校验）${PLAIN}"
   echo ""
-  read -rp "请输入选项 [1-3]: " certInput
+  read_input "请输入选项 [1-3]: " certInput
   [[ -z "$certInput" ]] && certInput=1
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
@@ -882,7 +1043,7 @@ inst_cert() {
 
   if [[ $certInput == 1 ]]; then
     realip || exit 1
-    read -rp "请输入需要申请或复用证书的域名: " domain
+    read_input "请输入需要申请或复用证书的域名: " domain
     domain="$(normalize_host_input "$domain")"
     [[ -z $domain ]] && red "未输入域名，无法执行操作。" && exit 1
     is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
@@ -895,24 +1056,10 @@ inst_cert() {
       exit 1
     }
 
-    green "安装申请证书所需依赖..."
-    if command -v apt-get >/dev/null 2>&1; then
-      pkg_install curl wget sudo openssl iproute2 nginx-full certbot >/dev/null 2>&1 || pkg_install curl wget sudo openssl iproute2 nginx certbot >/dev/null 2>&1 || true
-    else
-      pkg_install curl wget sudo openssl iproute2 nginx certbot >/dev/null 2>&1 || true
-    fi
-
-    if ! command -v certbot >/dev/null 2>&1; then
-      red "未检测到 certbot，无法申请 Let’s Encrypt 证书。"
-      exit 1
-    fi
-    if ! command -v nginx >/dev/null 2>&1; then
-      red "未检测到 nginx，无法使用 webroot 方式申请证书。"
-      exit 1
-    fi
+    install_certbot_nginx_deps || exit 1
 
     if ! prepare_cert_for_domain "$domain"; then
-      systemctl start nginx >/dev/null 2>&1 || true
+      release_http_ports_for_hysteria
       red "$domain 的 Let’s Encrypt 证书不可用，程序终止！"
       exit 1
     fi
@@ -928,6 +1075,8 @@ inst_cert() {
     fi
 
     echo "$domain" > "$ACME_DOMAIN_LOG"
+    grant_letsencrypt_cert_access "$cert_path" "$key_path"
+    release_http_ports_for_hysteria
     install_hy2_cert_renew_job
     green "证书已就绪，实际证书保留在 /etc/letsencrypt/live/${CERT_NAME}/"
     yellow "证书路径：$cert_path"
