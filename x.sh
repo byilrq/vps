@@ -927,14 +927,11 @@ if [[ -f $XUIDB ]]; then
 
         output=$($XRAY_BIN x25519 2>/dev/null || true)
 
-        private_key=$(printf '%s\n' "$output" | sed -n 's/^PrivateKey: //p' | head -n1 | tr -d '\r')
-        [[ -z "$private_key" ]] && private_key=$(printf '%s\n' "$output" | sed -n 's/^Private key: //p' | head -n1 | tr -d '\r')
+        private_key=$(printf '%s\n' "$output" | sed -nE 's/^(PrivateKey|Private key):[[:space:]]*//p' | head -n1 | tr -d '\r')
 
-        public_key=$(printf '%s\n' "$output" | sed -n 's/^Password: //p' | head -n1 | tr -d '\r')
-        [[ -z "$public_key" ]] && public_key=$(printf '%s\n' "$output" | sed -n 's/^PublicKey: //p' | head -n1 | tr -d '\r')
-        [[ -z "$public_key" ]] && public_key=$(printf '%s\n' "$output" | sed -n 's/^Public key: //p' | head -n1 | tr -d '\r')
+        public_key=$(printf '%s\n' "$output" | sed -nE 's/^(Password|Password \(PublicKey\)|PublicKey|Public key):[[:space:]]*//p' | head -n1 | tr -d '\r')
 
-        hash32=$(printf '%s\n' "$output" | sed -n 's/^Hash32: //p' | head -n1 | tr -d '\r')
+        hash32=$(printf '%s\n' "$output" | sed -nE 's/^Hash32:[[:space:]]*//p' | head -n1 | tr -d '\r')
 
         if [[ -z "$private_key" ]]; then
             msg_err "生成 REALITY 私钥失败！"
