@@ -163,77 +163,6 @@ download_with_retry() {
 }
 
 # -----------------------------
-# 兼容可编辑输入：支持 Backspace/Delete
-# -----------------------------
-read_input() {
-  local prompt="$1"
-  local __var_name="$2"
-  local __tmp=""
-
-  if [[ -t 0 ]]; then
-    stty sane 2>/dev/null || true
-    stty erase '^?' 2>/dev/null || true
-    bind 'set editing-mode emacs' 2>/dev/null || true
-    bind '"\e[3~": delete-char' 2>/dev/null || true
-    read -e -r -p "$prompt" __tmp
-  else
-    read -r -p "$prompt" __tmp
-  fi
-
-  printf -v "$__var_name" '%s' "$__tmp"
-}
-
-# -----------------------------
-# 安装 Let’s Encrypt / nginx 依赖（不静默吞错）
-# -----------------------------
-install_certbot_nginx_deps() {
-  green "安装申请证书所需依赖：curl wget sudo openssl iproute2 nginx certbot acl"
-
-  fix_dpkg_interrupt
-
-  if command -v apt-get >/dev/null 2>&1; then
-    wait_for_apt_lock || true
-    pkg_update || yellow "软件源刷新失败，将继续尝试安装依赖。"
-
-    if pkg_install curl wget sudo openssl iproute2 nginx-full certbot acl; then
-      :
-    elif pkg_install curl wget sudo openssl iproute2 nginx certbot acl; then
-      :
-    else
-      red "证书依赖安装失败。请检查 apt 源、dpkg 状态或网络。"
-      echo "可手动排查："
-      echo "  dpkg --configure -a"
-      echo "  apt-get -f install -y"
-      echo "  apt-get update"
-      echo "  apt-get install -y curl wget sudo openssl iproute2 nginx certbot"
-      return 1
-    fi
-  elif command -v dnf >/dev/null 2>&1; then
-    dnf -y makecache || true
-    dnf -y install curl wget sudo openssl iproute nginx certbot acl || return 1
-  elif command -v yum >/dev/null 2>&1; then
-    yum -y makecache || true
-    yum -y install curl wget sudo openssl iproute nginx certbot acl || return 1
-  else
-    red "未检测到受支持的包管理器，无法安装证书依赖。"
-    return 1
-  fi
-
-  if ! command -v certbot >/dev/null 2>&1; then
-    red "未检测到 certbot，无法申请 Let’s Encrypt 证书。"
-    return 1
-  fi
-
-  if ! command -v nginx >/dev/null 2>&1; then
-    red "未检测到 nginx，无法使用 webroot 方式申请证书。"
-    return 1
-  fi
-
-  green "证书依赖安装完成"
-  return 0
-}
-
-# -----------------------------
 # 获取本机公网 IP
 # -----------------------------
 realip() {
@@ -310,265 +239,33 @@ cert_not_expiring_soon() {
   openssl x509 -checkend "$seconds" -noout -in "$cert_file" >/dev/null 2>&1
 }
 
-find_cert_name_by_domain() {
-  local cert_domain="$1"
-  local d
-
-  if [[ -f "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" && -f "/etc/letsencrypt/live/${cert_domain}/privkey.pem" ]]; then
-    echo "${cert_domain}"
-    return 0
-  fi
-
-  for d in /etc/letsencrypt/live/"${cert_domain}"*; do
-    [[ -d "$d" ]] || continue
-    if [[ -f "$d/fullchain.pem" && -f "$d/privkey.pem" ]]; then
-      basename "$d"
-      return 0
-    fi
-  done
-
-  return 1
-}
-
-cert_files_exist() {
-  local cert_domain="$1"
-  local cert_name
-
-  if [[ -f "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" && -f "/etc/letsencrypt/live/${cert_domain}/privkey.pem" ]]; then
-    return 0
-  fi
-
-  cert_name=$(find_cert_name_by_domain "$cert_domain" 2>/dev/null || true)
-  [[ -n "$cert_name" ]] && [[ -f "/etc/letsencrypt/live/${cert_name}/fullchain.pem" && -f "/etc/letsencrypt/live/${cert_name}/privkey.pem" ]]
-}
-
-get_cert_paths() {
-  local cert_domain="$1"
-  local cert_name cert_file key_file
-
-  cert_name=$(find_cert_name_by_domain "$cert_domain" 2>/dev/null || true)
-  [[ -n "$cert_name" ]] || return 1
-
-  cert_file="/etc/letsencrypt/live/${cert_name}/fullchain.pem"
-  key_file="/etc/letsencrypt/live/${cert_name}/privkey.pem"
-
-  [[ -f "$cert_file" && -f "$key_file" ]] || return 1
-
-  echo "$cert_name|$cert_file|$key_file"
-}
-
-cert_is_valid() {
-  local cert_domain="$1"
-  local cert_info cert_file
-
-  cert_info=$(get_cert_paths "$cert_domain") || return 1
-  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
-
-  [[ -f "$cert_file" ]] || return 1
-  openssl x509 -checkend 0 -noout -in "$cert_file" >/dev/null 2>&1 || return 1
-
-  cert_matches_domain "$cert_file" "$cert_domain"
-}
-
-cert_key_matches() {
-  local cert_domain="$1"
-  local cert_info cert_file key_file
-
-  cert_info=$(get_cert_paths "$cert_domain") || return 1
-  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
-  key_file=$(echo "$cert_info" | cut -d'|' -f3)
-
-  [[ -f "$cert_file" && -f "$key_file" ]] || return 1
-
-  local cert_pub key_pub
-  cert_pub=$(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform pem 2>/dev/null)
-  key_pub=$(openssl pkey -in "$key_file" -pubout -outform pem 2>/dev/null)
-
-  [[ -n "$cert_pub" && -n "$key_pub" && "$cert_pub" == "$key_pub" ]]
-}
-
-print_cert_paths() {
-  local cert_domain="$1"
-  local cert_info cert_name cert_file key_file
-
-  cert_info=$(get_cert_paths "$cert_domain" 2>/dev/null || true)
-  if [[ -n "$cert_info" ]]; then
-    cert_name=$(echo "$cert_info" | cut -d'|' -f1)
-    cert_file=$(echo "$cert_info" | cut -d'|' -f2)
-    key_file=$(echo "$cert_info" | cut -d'|' -f3)
-    echo "本脚本将检查以下 Let’s Encrypt 证书路径："
-    echo "检查 ${cert_file}"
-    echo "检查 ${key_file}"
-    echo "证书目录名：${cert_name}"
-  else
-    echo "当前尚未发现 ${cert_domain} 对应的 /etc/letsencrypt/live 证书目录。"
-  fi
-}
-
-show_local_cert_info() {
-  local cert_domain="$1"
-  local cert_info cert_file
-
-  cert_info=$(get_cert_paths "$cert_domain" 2>/dev/null || true)
-  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
-
-  if [[ -f "$cert_file" ]]; then
-    echo "域名: ${cert_domain}"
-    openssl x509 -noout -subject -issuer -dates -in "$cert_file" 2>/dev/null
-  else
-    echo "域名: ${cert_domain}"
-    echo "本地未找到证书文件。"
-  fi
-}
-
-issue_cert_for_domain() {
-  local cert_domain="$1"
-
-  mkdir -p /var/www/acme
-  mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /var/www/html
-
-  systemctl stop nginx 2>/dev/null || true
-  systemctl stop apache2 2>/dev/null || true
-  systemctl stop caddy 2>/dev/null || true
-  pkill -f nginx 2>/dev/null || true
-  pkill -f apache2 2>/dev/null || true
-  pkill -f caddy 2>/dev/null || true
-  sleep 2
-
-  if ss -lnt | grep -q ':80 '; then
-    red "80 端口仍被占用，无法申请证书。"
-    ss -lntp | grep ':80 ' || true
-    return 1
-  fi
-
-  cat > /etc/nginx/sites-available/acme-bootstrap.conf <<EOF_CONF
-server {
-    listen 80;
-    server_name ${cert_domain};
-
-    location ^~ /.well-known/acme-challenge/ {
-        root /var/www/acme;
-        default_type "text/plain";
-    }
-
-    location / {
-        root /var/www/html;
-        index index.html;
-    }
-}
-EOF_CONF
-
-  rm -f /etc/nginx/sites-enabled/*
-  ln -sf /etc/nginx/sites-available/acme-bootstrap.conf /etc/nginx/sites-enabled/acme-bootstrap.conf
-
-  nginx -t || return 1
-  systemctl restart nginx || return 1
-
-  local certbot_rc=0
-  certbot certonly --webroot -w /var/www/acme --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain" || certbot_rc=$?
-
-  # 证书申请完成后立即释放 80/443，避免 Hysteria masquerade 与 nginx 抢端口。
-  release_http_ports_for_hysteria
-
-  [[ "$certbot_rc" -eq 0 ]] || return 1
-
-  if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
-    return 0
-  fi
-
-  return 1
-}
-
-try_use_local_cert() {
-  local cert_domain="$1"
-
-  echo "----------------------------------------------------------------"
-  echo "检查本地已有 Let’s Encrypt 证书：${cert_domain}"
-  echo "----------------------------------------------------------------"
-  print_cert_paths "$cert_domain"
-
-  if ! cert_files_exist "$cert_domain"; then
-    red "${cert_domain} 本地证书文件不存在。"
-    return 1
-  fi
-
-  if ! cert_is_valid "$cert_domain"; then
-    red "${cert_domain} 本地证书无效：可能已过期、无法读取，或证书域名与 ${cert_domain} 不匹配。"
-    return 1
-  fi
-
-  if ! cert_key_matches "$cert_domain"; then
-    red "${cert_domain} 的 fullchain.pem 与 privkey.pem 不匹配。"
-    return 1
-  fi
-
-  green "${cert_domain} 本地 Let’s Encrypt 证书有效，且私钥匹配，继续使用。"
-  show_local_cert_info "$cert_domain"
-  return 0
-}
-
-prepare_cert_for_domain() {
-  local cert_domain="$1"
-  local cert_choice=""
-
-  while true; do
-    echo "----------------------------------------------------------------"
-    echo "Let’s Encrypt 证书处理：${cert_domain}"
-    echo "----------------------------------------------------------------"
-    print_cert_paths "$cert_domain"
-    echo
-    echo "Y = 重新申请 Let’s Encrypt 证书（certbot + nginx webroot）"
-    echo "n = 使用 VPS 本地已有 /etc/letsencrypt/live 证书（若有效）"
-    echo "q = 退出脚本"
-    read_input "请选择 [Y/n/q]: " cert_choice
-
-    case "$cert_choice" in
-      [Nn])
-        if try_use_local_cert "$cert_domain"; then
-          return 0
-        fi
-        echo
-        yellow "你可以现在手动放置正确证书后，再次选择 n 继续检测。"
-        ;;
-      [Qq])
-        red "已退出证书处理流程。"
-        return 1
-        ;;
-      *)
-        echo "开始为 ${cert_domain} 申请新 Let’s Encrypt 证书..."
-        if issue_cert_for_domain "$cert_domain"; then
-          green "${cert_domain} 证书申请成功。"
-          show_local_cert_info "$cert_domain"
-          return 0
-        else
-          red "${cert_domain} 证书申请失败！"
-          yellow "你可以修复解析/端口问题，或手动放置证书后再次选择 n。"
-        fi
-        ;;
-    esac
-  done
-}
-
 existing_official_cert_usable() {
   local expect_domain="$1"
-  local cert_info cert_file key_file stored_domain=""
-
-  [[ -n "$expect_domain" ]] || return 1
-  cert_info=$(get_cert_paths "$expect_domain" 2>/dev/null || true)
-  [[ -n "$cert_info" ]] || return 1
-
-  cert_file=$(echo "$cert_info" | cut -d'|' -f2)
-  key_file=$(echo "$cert_info" | cut -d'|' -f3)
+  local cert_file="/etc/hysteria/cert.crt"
+  local key_file="/etc/hysteria/private.key"
+  local stored_domain=""
 
   [[ -s "$cert_file" && -s "$key_file" ]] || return 1
-  cert_is_valid "$expect_domain" || return 1
-  cert_key_matches "$expect_domain" || return 1
+
+  if [[ -f "$ACME_DOMAIN_LOG" ]]; then
+    stored_domain=$(tr -d '\r\n' < "$ACME_DOMAIN_LOG" 2>/dev/null)
+  fi
+  [[ -z "$stored_domain" ]] && stored_domain=$(get_cert_primary_domain "$cert_file" 2>/dev/null || true)
+
+  [[ -n "$stored_domain" ]] || return 1
+
+  if [[ -n "$expect_domain" && "$stored_domain" != "$expect_domain" ]]; then
+    cert_matches_domain "$cert_file" "$expect_domain" || return 1
+    stored_domain="$expect_domain"
+  fi
+
+  cert_matches_domain "$cert_file" "$stored_domain" || return 1
   cert_not_expiring_soon "$cert_file" 14 || return 1
 
-  stored_domain="$expect_domain"
   echo "$stored_domain"
   return 0
 }
+
 ensure_hy2_input_chain() {
   iptables -N HY2_INPUT >/dev/null 2>&1 || true
   iptables -F HY2_INPUT >/dev/null 2>&1 || true
@@ -670,72 +367,28 @@ EOF
   chmod 600 "$HY2_STATE_FILE" >/dev/null 2>&1 || true
 }
 
-release_http_ports_for_hysteria() {
-  # Hysteria masquerade uses TCP 80/443; certbot's temporary nginx must not keep these ports.
-  systemctl stop nginx 2>/dev/null || true
-  systemctl disable nginx 2>/dev/null || true
-  systemctl stop apache2 2>/dev/null || true
-  systemctl disable apache2 2>/dev/null || true
-  systemctl stop caddy 2>/dev/null || true
-  systemctl disable caddy 2>/dev/null || true
-  pkill -f nginx 2>/dev/null || true
-  pkill -f apache2 2>/dev/null || true
-  pkill -f caddy 2>/dev/null || true
-}
-
-grant_letsencrypt_cert_access() {
-  local cert_file="$1"
-  local key_file="$2"
-  local svc="/etc/systemd/system/hysteria-server.service"
-  local u="hysteria" g="hysteria"
-  local cert_real key_real live_dir archive_dir
-
-  [[ -n "$cert_file" && -n "$key_file" ]] || return 0
-  [[ "$cert_file" == /etc/letsencrypt/live/* || "$key_file" == /etc/letsencrypt/live/* ]] || return 0
-
-  if [[ -f "$svc" ]]; then
-    u=$(grep -E '^\s*User=' "$svc" | tail -n1 | cut -d= -f2 | xargs)
-    g=$(grep -E '^\s*Group=' "$svc" | tail -n1 | cut -d= -f2 | xargs)
-    [[ -z "$u" ]] && u="hysteria"
-    [[ -z "$g" ]] && g="$u"
-  fi
-
-  cert_real=$(readlink -f "$cert_file" 2>/dev/null || true)
-  key_real=$(readlink -f "$key_file" 2>/dev/null || true)
-  live_dir=$(dirname "$cert_file")
-  archive_dir=$(dirname "${cert_real:-$key_real}")
-
-  if command -v setfacl >/dev/null 2>&1; then
-    setfacl -m u:${u}:--x /etc/letsencrypt 2>/dev/null || true
-    setfacl -m u:${u}:--x /etc/letsencrypt/live 2>/dev/null || true
-    setfacl -m u:${u}:--x /etc/letsencrypt/archive 2>/dev/null || true
-    [[ -d "$live_dir" ]] && setfacl -m u:${u}:rx "$live_dir" 2>/dev/null || true
-    [[ -d "$archive_dir" ]] && setfacl -m u:${u}:rx "$archive_dir" 2>/dev/null || true
-    [[ -n "$cert_real" && -f "$cert_real" ]] && setfacl -m u:${u}:r "$cert_real" 2>/dev/null || true
-    [[ -n "$key_real" && -f "$key_real" ]] && setfacl -m u:${u}:r "$key_real" 2>/dev/null || true
-    [[ -d "$archive_dir" ]] && setfacl -d -m u:${u}:rX "$archive_dir" 2>/dev/null || true
-  else
-    chmod 755 /etc/letsencrypt /etc/letsencrypt/live /etc/letsencrypt/archive 2>/dev/null || true
-    [[ -d "$live_dir" ]] && chmod 755 "$live_dir" 2>/dev/null || true
-    [[ -d "$archive_dir" ]] && chmod 755 "$archive_dir" 2>/dev/null || true
-    [[ -n "$cert_real" && -f "$cert_real" ]] && chmod 644 "$cert_real" 2>/dev/null || true
-    if [[ -n "$key_real" && -f "$key_real" ]]; then
-      chown root:"$g" "$key_real" 2>/dev/null || true
-      chmod 640 "$key_real" 2>/dev/null || true
-    fi
-  fi
-}
-
 install_hy2_cert_renew_job() {
-  cat > "$HY2_CERT_RENEW_BIN" <<'EOF_RENEW'
+  local cert_file="/etc/hysteria/cert.crt"
+  local key_file="/etc/hysteria/private.key"
+
+  cat > "$HY2_CERT_RENEW_BIN" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-DOMAIN_LOG="/etc/hysteria/ca.log"
-[[ -f "$DOMAIN_LOG" ]] || exit 0
+CERT_FILE="$cert_file"
+KEY_FILE="$key_file"
+DOMAIN_LOG="$ACME_DOMAIN_LOG"
+ACME_BIN="/root/.acme.sh/acme.sh"
 
-domain=$(tr -d '\r\n' < "$DOMAIN_LOG" 2>/dev/null || true)
-[[ -n "$domain" ]] || exit 0
+[[ -x "\$ACME_BIN" ]] || exit 0
+[[ -s "\$CERT_FILE" && -s "\$KEY_FILE" && -f "\$DOMAIN_LOG" ]] || exit 0
+
+domain=\$(tr -d '\r\n' < "\$DOMAIN_LOG" 2>/dev/null || true)
+[[ -n "\$domain" ]] || exit 0
+
+if openssl x509 -checkend \$((7 * 24 * 3600)) -noout -in "\$CERT_FILE" >/dev/null 2>&1; then
+  exit 0
+fi
 
 service_name="hysteria-server"
 if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
@@ -744,56 +397,21 @@ elif systemctl list-unit-files 2>/dev/null | grep -q '^hysteria\.service'; then
   service_name="hysteria"
 fi
 
-get_service_user() {
-  local svc="/etc/systemd/system/hysteria-server.service"
-  local u="hysteria"
-  if [[ -f "$svc" ]]; then
-    u=$(grep -E '^\s*User=' "$svc" | tail -n1 | cut -d= -f2 | xargs)
-    [[ -z "$u" ]] && u="hysteria"
-  fi
-  printf '%s' "$u"
-}
-
-grant_access() {
-  local d="$1"
-  local u cert key cert_real key_real live_dir archive_dir
-  u=$(get_service_user)
-  cert="/etc/letsencrypt/live/$d/fullchain.pem"
-  key="/etc/letsencrypt/live/$d/privkey.pem"
-  [[ -e "$cert" && -e "$key" ]] || return 0
-  cert_real=$(readlink -f "$cert" 2>/dev/null || true)
-  key_real=$(readlink -f "$key" 2>/dev/null || true)
-  live_dir=$(dirname "$cert")
-  archive_dir=$(dirname "${cert_real:-$key_real}")
-
-  if command -v setfacl >/dev/null 2>&1; then
-    setfacl -m u:${u}:--x /etc/letsencrypt 2>/dev/null || true
-    setfacl -m u:${u}:--x /etc/letsencrypt/live 2>/dev/null || true
-    setfacl -m u:${u}:--x /etc/letsencrypt/archive 2>/dev/null || true
-    setfacl -m u:${u}:rx "$live_dir" 2>/dev/null || true
-    setfacl -m u:${u}:rx "$archive_dir" 2>/dev/null || true
-    [[ -n "$cert_real" ]] && setfacl -m u:${u}:r "$cert_real" 2>/dev/null || true
-    [[ -n "$key_real" ]] && setfacl -m u:${u}:r "$key_real" 2>/dev/null || true
-    setfacl -d -m u:${u}:rX "$archive_dir" 2>/dev/null || true
-  fi
-}
-
-systemctl stop "$service_name" >/dev/null 2>&1 || true
-systemctl stop nginx apache2 caddy >/dev/null 2>&1 || true
-pkill -f nginx >/dev/null 2>&1 || true
-
-certbot renew --standalone --non-interactive >/dev/null 2>&1 || true
-
-grant_access "$domain"
-systemctl start "$service_name" >/dev/null 2>&1 || true
-EOF_RENEW
+"\$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+"\$ACME_BIN" --renew -d "\$domain" --ecc --force >/dev/null 2>&1
+"\$ACME_BIN" --install-cert -d "\$domain" \
+  --key-file "\$KEY_FILE" \
+  --fullchain-file "\$CERT_FILE" \
+  --ecc \
+  --reloadcmd "systemctl restart \$service_name" >/dev/null 2>&1
+EOF
 
   chmod 700 "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
 
-  cat > "$HY2_CERT_WEEKLY_CRON" <<EOF_CRON
+  cat > "$HY2_CERT_WEEKLY_CRON" <<EOF
 #!/usr/bin/env bash
 "$HY2_CERT_RENEW_BIN"
-EOF_CRON
+EOF
   chmod 755 "$HY2_CERT_WEEKLY_CRON" >/dev/null 2>&1 || true
 
   if [[ -f /etc/crontab ]]; then
@@ -805,6 +423,7 @@ EOF_CRON
   systemctl disable --now acme.timer >/dev/null 2>&1 || true
   systemctl disable --now acme-sh.timer >/dev/null 2>&1 || true
 }
+
 install_hy2_boot_fix_service() {
   cat > "$HY2_FIREWALL_RESTORE_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -1009,19 +628,13 @@ fix_hysteria_file_perms() {
     chmod 600 "$ca_log" 2>/dev/null || true
   fi
 
-  if [[ -f "$cfg" ]]; then
-    local cfg_cert cfg_key
-    cfg_cert=$(awk '/^tls:/,/^[^ ]/ {if ($1=="cert:") print $2}' "$cfg" 2>/dev/null | tail -n1)
-    cfg_key=$(awk '/^tls:/,/^[^ ]/ {if ($1=="key:") print $2}' "$cfg" 2>/dev/null | tail -n1)
-    grant_letsencrypt_cert_access "$cfg_cert" "$cfg_key"
-  fi
-
   if [[ -d "$hy_dir" ]]; then
     chown -R root:root "$hy_dir" 2>/dev/null || true
     chmod 700 "$hy_dir" 2>/dev/null || true
     find "$hy_dir" -type f -exec chmod 600 {} \; 2>/dev/null || true
   fi
 }
+
 # -----------------------------
 # 证书安装与配置
 # -----------------------------
@@ -1029,11 +642,11 @@ fix_hysteria_file_perms() {
 inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
-  echo -e " ${GREEN}1.${PLAIN} Let’s Encrypt 自动申请/复用${YELLOW}（默认，certbot + nginx webroot，强制校验证书）${PLAIN}"
+  echo -e " ${GREEN}1.${PLAIN} Acme 脚本自动申请${YELLOW}（默认，强制校验证书）${PLAIN}"
   echo -e " ${GREEN}2.${PLAIN} 必应自签证书${YELLOW}（客户端将跳过证书校验）${PLAIN}"
   echo -e " ${GREEN}3.${PLAIN} 自定义证书路径${YELLOW}（默认强制校验）${PLAIN}"
   echo ""
-  read_input "请输入选项 [1-3]: " certInput
+  read -rp "请输入选项 [1-3]: " certInput
   [[ -z "$certInput" ]] && certInput=1
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
@@ -1042,11 +655,26 @@ inst_cert() {
   cert_mode="official"
 
   if [[ $certInput == 1 ]]; then
+    cert_path="/etc/hysteria/cert.crt"
+    key_path="/etc/hysteria/private.key"
+
     realip || exit 1
-    read_input "请输入需要申请或复用证书的域名: " domain
+    read -rp "请输入需要申请或复用证书的域名: " domain
     domain="$(normalize_host_input "$domain")"
     [[ -z $domain ]] && red "未输入域名，无法执行操作。" && exit 1
     is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
+
+    local reusable_domain=""
+    reusable_domain=$(existing_official_cert_usable "$domain" 2>/dev/null || true)
+    if [[ -n "$reusable_domain" ]]; then
+      green "检测到域名 $reusable_domain 的本地正式证书已存在且有效，跳过重复申请"
+      echo "$reusable_domain" > "$ACME_DOMAIN_LOG"
+      hy_domain="$reusable_domain"
+      tls_insecure="false"
+      cert_mode="official"
+      install_hy2_cert_renew_job
+      return 0
+    fi
 
     green "已输入的域名：$domain"
     green "检查域名解析..."
@@ -1056,36 +684,62 @@ inst_cert() {
       exit 1
     }
 
-    install_certbot_nginx_deps || exit 1
-
-    if ! prepare_cert_for_domain "$domain"; then
-      release_http_ports_for_hysteria
-      red "$domain 的 Let’s Encrypt 证书不可用，程序终止！"
+    green "检查 80 端口..."
+    check_port_80_free || {
+      red "80 端口被占用，acme standalone 模式会失败或长时间卡住"
+      yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
       exit 1
+    }
+
+    green "安装申请证书所需依赖..."
+    pkg_install curl wget sudo socat openssl >/dev/null 2>&1 || true
+
+    green "安装 acme.sh ..."
+    curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
+      red "安装 acme.sh 失败"
+      exit 1
+    }
+
+    source ~/.bashrc >/dev/null 2>&1 || true
+    bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+    bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+    green "开始签发证书，这一步可能需要几十秒..."
+    if [[ -n $(echo "$ip" | grep ":") ]]; then
+      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
+        red "签发失败"
+        exit 1
+      }
+    else
+      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
+        red "签发失败"
+        exit 1
+      }
     fi
 
-    CERT_INFO=$(get_cert_paths "$domain" 2>/dev/null || true)
-    CERT_NAME=$(echo "$CERT_INFO" | cut -d'|' -f1)
-    cert_path=$(echo "$CERT_INFO" | cut -d'|' -f2)
-    key_path=$(echo "$CERT_INFO" | cut -d'|' -f3)
+    bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
+      --key-file "$key_path" \
+      --fullchain-file "$cert_path" \
+      --ecc \
+      --reloadcmd "systemctl restart $(get_hysteria_service_name)" || {
+      red "安装证书失败"
+      exit 1
+    }
 
-    if [[ -z "$CERT_NAME" || -z "$cert_path" || -z "$key_path" ]]; then
-      red "无法定位 ${domain} 的 /etc/letsencrypt/live 证书文件，程序终止。"
+    if [[ -s "$cert_path" && -s "$key_path" ]]; then
+      echo "$domain" > "$ACME_DOMAIN_LOG"
+      install_hy2_cert_renew_job
+      green "证书申请成功，已保存到 /etc/hysteria/"
+      yellow "证书路径：$cert_path"
+      yellow "私钥路径：$key_path"
+      yellow "已创建每周检测任务：证书若已过期或 7 天内到期，将自动续签并重启 Hysteria"
+      hy_domain="$domain"
+      tls_insecure="false"
+      cert_mode="official"
+    else
+      red "证书文件生成异常，请检查 acme.sh 输出"
       exit 1
     fi
-
-    echo "$domain" > "$ACME_DOMAIN_LOG"
-    grant_letsencrypt_cert_access "$cert_path" "$key_path"
-    release_http_ports_for_hysteria
-    install_hy2_cert_renew_job
-    green "证书已就绪，实际证书保留在 /etc/letsencrypt/live/${CERT_NAME}/"
-    yellow "证书路径：$cert_path"
-    yellow "私钥路径：$key_path"
-    yellow "Hysteria 将直接引用上述 Let’s Encrypt 路径，不使用 /root/cert/<域名>/ 软链接。"
-    yellow "已创建每周检测任务：调用 certbot renew，并在续签后重启 Hysteria"
-    hy_domain="$domain"
-    tls_insecure="false"
-    cert_mode="letsencrypt"
 
   elif [[ $certInput == 3 ]]; then
     read -rp "请输入公钥文件 crt 的路径: " cert_path
@@ -1125,6 +779,8 @@ inst_cert() {
     yellow "当前为自签证书模式，客户端将跳过证书校验"
   fi
 }
+
+# -----------------------------
 # 端口与跳跃端口设置
 # -----------------------------
 
@@ -1651,7 +1307,7 @@ EOF
 unsthysteria() {
   local keep_cert="false"
 
-  if [[ -f /etc/hysteria/ca.log ]]; then
+  if [[ -f /etc/hysteria/ca.log && -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]]; then
     keep_cert="true"
   fi
 
@@ -1677,7 +1333,7 @@ unsthysteria() {
   if [[ "$keep_cert" == "true" ]]; then
     mkdir -p /etc/hysteria >/dev/null 2>&1 || true
     rm -f /etc/hysteria/config.yaml >/dev/null 2>&1 || true
-    green "Hysteria 2 已卸载完成，已保留 /etc/letsencrypt/live 中的 Let’s Encrypt 证书与域名记录，重装时可自动复用。"
+    green "Hysteria 2 已卸载完成，已保留正式证书与域名记录，重装时可自动复用。"
   else
     rm -rf /etc/hysteria >/dev/null 2>&1 || true
     green "Hysteria 2 已彻底卸载完成。"
@@ -1756,30 +1412,20 @@ showconf() {
 # -----------------------------
 
 changeport() {
-  local oldport port
-  local current_domain current_cert_mode current_first current_end
-  local jumpInput firstport endport mport_value
-  local link auth share_host sni insecure_flag current_link_host
-  local hy_service
-
+  local oldport current_domain current_cert_mode current_first current_end mport_value current_link
   oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
-  [[ -z "$oldport" ]] && oldport=443
 
-  load_hy2_state >/dev/null 2>&1 || true
-  current_first="${HY2_FIRST_PORT:-}"
-  current_end="${HY2_END_PORT:-}"
-  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
-  current_cert_mode="${HY2_CERT_MODE:-$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)}"
+  clear_hy2_jump_rules
+  clear_hy2_input_rules
 
   while true; do
-    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认当前端口：$oldport）: " port
-    [[ -z "$port" ]] && port="$oldport"
+    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " port
+    [[ -z $port ]] && port=443
 
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
     ((port >= 1 && port <= 65535)) || { red "端口必须在 1-65535 之间"; continue; }
 
-    # 如果输入的是当前监听端口，允许通过；否则检查是否被其它程序占用
-    if [[ "$port" != "$oldport" ]] && ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
+    if ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
       red "UDP 端口 $port 已被占用，请更换"
       continue
     fi
@@ -1787,127 +1433,38 @@ changeport() {
     break
   done
 
-  echo ""
-  green "Hysteria 2 端口使用模式如下："
-  echo ""
-  echo -e " ${GREEN}1.${PLAIN} 单端口"
-  echo -e " ${GREEN}2.${PLAIN} 端口跳跃"
-  echo ""
+  sed -i "1s/:$oldport/:$port/g" /etc/hysteria/config.yaml 2>/dev/null || true
+  sed -i "s/:$oldport/:$port/g" /root/hy/hy-client.yaml 2>/dev/null || true
+
+  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
+  load_hy2_state >/dev/null 2>&1 || true
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
 
   if [[ -n "$current_first" && -n "$current_end" ]]; then
-    read -rp "请输入选项 [1-2]（回车默认继续端口跳跃：$current_first-$current_end）: " jumpInput
-    [[ -z "$jumpInput" ]] && jumpInput=2
+    mport_value="$current_first-$current_end"
+    apply_hy2_firewall_rules "$port" "$current_first" "$current_end"
+    save_hy2_state "$port" "$current_first" "$current_end" "$current_domain" "$current_cert_mode"
   else
-    read -rp "请输入选项 [1-2]（回车默认单端口）: " jumpInput
-    [[ -z "$jumpInput" ]] && jumpInput=1
-  fi
-
-  if [[ "$jumpInput" == "2" ]]; then
-    while true; do
-      read -rp "设置跳端口起始端口 [1-65535]（回车默认：${current_first:-10000}）: " firstport
-      read -rp "设置跳端口结束端口 [1-65535]（回车默认：${current_end:-65535}）: " endport
-
-      [[ -z "$firstport" ]] && firstport="${current_first:-10000}"
-      [[ -z "$endport" ]] && endport="${current_end:-65535}"
-
-      [[ "$firstport" =~ ^[0-9]+$ && "$endport" =~ ^[0-9]+$ ]] || {
-        red "跳端口范围必须是数字"
-        continue
-      }
-
-      ((firstport >= 1 && firstport <= 65535 && endport >= 1 && endport <= 65535)) || {
-        red "跳端口必须在 1-65535 之间"
-        continue
-      }
-
-      ((firstport < endport)) || {
-        red "范围无效：起始端口必须小于结束端口"
-        continue
-      }
-
-      break
-    done
-
-    mport_value="$firstport-$endport"
-  else
-    firstport=""
-    endport=""
     mport_value="$port"
+    apply_hy2_firewall_rules "$port" "" ""
+    save_hy2_state "$port" "" "" "$current_domain" "$current_cert_mode"
   fi
 
-  # 更新服务端监听端口
-  if [[ -f /etc/hysteria/config.yaml ]]; then
-    sed -i "1s/listen: :.*/listen: :$port/" /etc/hysteria/config.yaml 2>/dev/null || true
-  fi
-
-  # 更新客户端 server 端口，保留原 host
-  if [[ -f /root/hy/hy-client.yaml ]]; then
-    sed -i -E "s#^server: (.+):[0-9]+#server: \1:$port#" /root/hy/hy-client.yaml 2>/dev/null || true
-  fi
-
-  # 尽量从旧链接中保留分享 host
   if [[ -f /root/hy/ur1.txt ]]; then
-    current_link_host=$(sed -nE 's#^hysteria2://[^@]+@([^:/]+|\[[^]]+\]):[0-9]+/.*#\1#p' /root/hy/ur1.txt | head -n1)
+    current_link=$(cat /root/hy/ur1.txt 2>/dev/null)
+    current_link=$(echo "$current_link" | sed -E "s#(@[^:]+:)[0-9]+/#\\1${port}/#")
+    current_link=$(echo "$current_link" | sed -E "s#mport=[0-9]+(-[0-9]+)?#mport=${mport_value}#")
+    echo "$current_link" > /root/hy/ur1.txt
   fi
-
-  auth=$(grep -E '^auth:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
-  sni=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
-  insecure_flag=$(grep -E '^\s*insecure:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
-
-  [[ -z "$current_domain" ]] && current_domain="$sni"
-  [[ -z "$current_cert_mode" ]] && current_cert_mode="unknown"
-
-  if [[ -n "$current_link_host" ]]; then
-    share_host="$current_link_host"
-  elif [[ -n "$sni" ]]; then
-    share_host="$sni"
-  else
-    share_host=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | sed -E 's#:[0-9]+$##' | tr -d '\r')
-  fi
-
-  # 重建分享链接，确保端口和 mport 都是最新
-  if [[ -n "$auth" && -n "$share_host" && -n "$sni" ]]; then
-    if [[ "$insecure_flag" == "true" ]]; then
-      echo "hysteria2://$auth@$share_host:$port/?sni=$sni&insecure=1&mport=$mport_value#H" > /root/hy/ur1.txt
-    else
-      echo "hysteria2://$auth@$share_host:$port/?sni=$sni&mport=$mport_value#H" > /root/hy/ur1.txt
-    fi
-  else
-    # 兜底：如果无法重建，就只替换旧链接中的端口和 mport
-    if [[ -f /root/hy/ur1.txt ]]; then
-      link=$(cat /root/hy/ur1.txt 2>/dev/null)
-      link=$(echo "$link" | sed -E "s#(@[^:]+:)[0-9]+/#\1${port}/#")
-      if echo "$link" | grep -q 'mport='; then
-        link=$(echo "$link" | sed -E "s#mport=[0-9]+(-[0-9]+)?#mport=${mport_value}#")
-      else
-        link=$(echo "$link" | sed -E "s#(#H)?$#\&mport=${mport_value}#H#")
-      fi
-      echo "$link" > /root/hy/ur1.txt
-    fi
-  fi
-
-  # 重新应用防火墙和状态
-  apply_hy2_firewall_rules "$port" "$firstport" "$endport"
-  save_hy2_state "$port" "$firstport" "$endport" "$current_domain" "$current_cert_mode"
 
   fix_hysteria_file_perms
   save_firewall_rules
-
-  hy_service=$(get_hysteria_service_name)
-  systemctl restart "$hy_service" >/dev/null 2>&1 || {
-    red "Hysteria 2 服务重启失败，请检查日志：journalctl -u $hy_service -n 50 --no-pager"
-    return 1
-  }
-
+  systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria.service >/dev/null 2>&1 || true
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
-  green "Hysteria 2 监听端口已修改为：$port"
-  if [[ -n "$firstport" && -n "$endport" ]]; then
-    green "端口跳跃范围已修改为：$firstport-$endport -> $port"
-  else
-    yellow "当前为单端口模式：$port"
-  fi
-
+  green "Hysteria 2 端口已成功修改为：$port"
   showconf
 }
 
@@ -2073,197 +1630,8 @@ menu_hy_conf() {
 # -----------------------------
 # 核心更新 / 工具功能
 # -----------------------------
-normalize_hysteria_version() {
-  local v="$1"
-  v="${v#app/}"
-  v="${v#v}"
-  printf '%s' "$v"
-}
-
-get_hysteria_current_version() {
-  local bin=""
-  local raw_ver=""
-  if [[ -x /usr/local/bin/hysteria ]]; then
-    bin="/usr/local/bin/hysteria"
-  elif [[ -x /usr/bin/hysteria ]]; then
-    bin="/usr/bin/hysteria"
-  else
-    return 1
-  fi
-
-  raw_ver=$("$bin" version 2>/dev/null | grep -Eo '(app/)?v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?' | head -n1 | tr -d '\r')
-  [[ -n "$raw_ver" ]] || return 1
-  normalize_hysteria_version "$raw_ver"
-}
-
-get_hysteria_latest_version() {
-  local raw_ver=""
-  raw_ver=$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
-    | grep '"tag_name"' | head -n1 | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
-  [[ -n "$raw_ver" ]] || return 1
-  normalize_hysteria_version "$raw_ver"
-}
-
-install_hysteria_auto_update() {
-  local updater="/usr/local/bin/hysteria-core-auto-update"
-  local cron_file="/etc/cron.weekly/hysteria-core-auto-update"
-
-  cat > "$updater" <<'EOF'
-#!/usr/bin/env bash
-set -u
-
-LOG="/var/log/hysteria-core-update.log"
-BIN="/usr/local/bin/hysteria"
-[[ -x "$BIN" ]] || BIN="/usr/bin/hysteria"
-
-mkdir -p /var/log >/dev/null 2>&1 || true
-
-log() {
-  echo "$(date '+%F %T') $*" >> "$LOG"
-}
-
-normalize_ver() {
-  local v="$1"
-  v="${v#app/}"
-  v="${v#v}"
-  printf '%s' "$v"
-}
-
-get_current_ver() {
-  local raw_ver=""
-  [[ -x "$BIN" ]] || return 1
-  raw_ver=$("$BIN" version 2>/dev/null | grep -Eo '(app/)?v?[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z]+)?' | head -n1 | tr -d '\r')
-  [[ -n "$raw_ver" ]] || return 1
-  normalize_ver "$raw_ver"
-}
-
-get_latest_ver() {
-  local raw_ver=""
-  raw_ver=$(curl -fsSL https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null \
-    | grep '"tag_name"' | head -n1 | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
-  [[ -n "$raw_ver" ]] || return 1
-  normalize_ver "$raw_ver"
-}
-
-current_ver="$(get_current_ver 2>/dev/null)"
-latest_ver="$(get_latest_ver 2>/dev/null)"
-
-log "current=${current_ver:-unknown} latest=${latest_ver:-unknown}"
-
-if [[ -z "$latest_ver" ]]; then
-  log "failed to fetch latest version"
-  exit 0
-fi
-
-if [[ -z "$current_ver" || "$current_ver" != "$latest_ver" ]]; then
-  backup="${BIN}.bak.$(date +%F-%H%M%S)"
-  [[ -x "$BIN" ]] && cp -f "$BIN" "$backup" >/dev/null 2>&1 || true
-
-  systemctl stop hysteria-server.service >/dev/null 2>&1 || systemctl stop hysteria-server >/dev/null 2>&1 || true
-
-  if bash <(curl -fsSL https://get.hy2.sh/); then
-    if systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria-server >/dev/null 2>&1; then
-      log "updated successfully to ${latest_ver}"
-      exit 0
-    fi
-
-    log "restart failed after update, trying rollback"
-    if [[ -f "$backup" ]]; then
-      cp -f "$backup" "$BIN" >/dev/null 2>&1 || true
-      chmod +x "$BIN" >/dev/null 2>&1 || true
-      systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria-server >/dev/null 2>&1 || true
-      log "rollback finished"
-    fi
-    exit 1
-  else
-    log "update command failed"
-    if [[ -f "$backup" ]]; then
-      cp -f "$backup" "$BIN" >/dev/null 2>&1 || true
-      chmod +x "$BIN" >/dev/null 2>&1 || true
-      systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria-server >/dev/null 2>&1 || true
-      log "rollback finished after failed update"
-    fi
-    exit 1
-  fi
-else
-  log "already latest"
-fi
-EOF
-
-  chmod 755 "$updater" >/dev/null 2>&1 || true
-
-  cat > "$cron_file" <<EOF
-#!/usr/bin/env bash
-bash /usr/local/bin/hysteria-core-auto-update >/dev/null 2>&1
-EOF
-  chmod 755 "$cron_file" >/dev/null 2>&1 || true
-
-  bash "$updater" >/dev/null 2>&1 || true
-
-  green "已开启 Hysteria 核心自动更新（每周检测一次）"
-  yellow "更新脚本：$updater"
-  yellow "定时任务：$cron_file"
-}
-
-disable_hysteria_auto_update() {
-  rm -f /etc/cron.weekly/hysteria-core-auto-update >/dev/null 2>&1 || true
-  green "已关闭 Hysteria 核心自动更新"
-}
-
-show_hysteria_update_log() {
-  local log_file="/var/log/hysteria-core-update.log"
-  if [[ -f "$log_file" ]]; then
-    yellow "最近 50 行更新日志："
-    tail -n 50 "$log_file"
-  else
-    yellow "暂无更新日志：$log_file（说明定时任务还没跑过，或刚开启自动更新）"
-  fi
-  read -rp "回车返回菜单..." _
-}
-
-menu_update_core() {
-  while true; do
-    clear
-    green "Hysteria 内核更新设置："
-    echo ""
-    echo -e " ${GREEN}1.${tianlan} 手动更新内核"
-    echo -e " ${GREEN}2.${tianlan} 开启自动更新"
-    echo -e " ${GREEN}3.${tianlan} 关闭自动更新"
-    echo -e " ${GREEN}4.${tianlan} 查看更新日志"
-    echo " ---------------------------------------------------"
-    echo -e " ${GREEN}0.${PLAIN} 返回"
-    echo ""
-
-    local cur_ver latest_ver auto_status
-    cur_ver="$(get_hysteria_current_version 2>/dev/null)"
-    latest_ver="$(get_hysteria_latest_version 2>/dev/null)"
-    [[ -z "$cur_ver" ]] && cur_ver="未知"
-    [[ -z "$latest_ver" ]] && latest_ver="获取失败"
-    if [[ -x /etc/cron.weekly/hysteria-core-auto-update ]]; then
-      auto_status="已开启"
-    else
-      auto_status="已关闭"
-    fi
-    yellow "当前版本：$cur_ver"
-    yellow "最新版本：$latest_ver"
-    yellow "自动更新：$auto_status"
-    echo ""
-
-    read -rp "请输入选项 [0-4]: " updateInput
-
-    case $updateInput in
-      1) update_core ;;
-      2) install_hysteria_auto_update; read -rp "回车返回菜单..." _ ;;
-      3) disable_hysteria_auto_update; read -rp "回车返回菜单..." _ ;;
-      4) show_hysteria_update_log ;;
-      0) break ;;
-      *) yellow "无效选项"; sleep 1 ;;
-    esac
-  done
-}
-
 update_core() {
-  green "手动更新：将调用官方安装脚本更新 Hysteria 核心。"
+  green "官方更新方式必须先通过脚本安装后再使用，否则可能失败。"
   systemctl stop hysteria-server.service >/dev/null 2>&1 || true
   rm -f /usr/local/bin/hysteria
   bash <(curl -fsSL https://get.hy2.sh/) || { red "更新失败"; return 1; }
@@ -2486,7 +1854,7 @@ menu() {
     echo -e " ${GREEN}5.${tianlan} 修改系统配置"
     echo -e " ${GREEN}6.${tianlan} 显示配置文件"
     echo -e " ${GREEN}7.${tianlan} 查询运行状态"
-    echo -e " ${GREEN}8.${tianlan} 内核更新设置"
+    echo -e " ${GREEN}8.${tianlan} 更新内核"
     echo -e " ${GREEN}9.${tianlan} 回程测试"
     echo -e " ${GREEN}10.${tianlan} IP 质量检测"
     echo -e " ${GREEN}11.${tianlan} 系统查询"
@@ -2504,7 +1872,7 @@ menu() {
       5) run_sys_conf ;;
       6) showconf ;;
       7) showstatus ;;
-      8) menu_update_core ;;
+      8) update_core ;;
       9) besttrace ;;
       10) ipquality ;;
       11) linux_ps ;;
