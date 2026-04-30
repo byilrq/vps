@@ -80,6 +80,34 @@ read_tty() {
 }
 
 # -----------------------------
+#  下载文件（带重试）
+# -----------------------------
+download_with_retry() {
+    local url="$1"
+    local out="$2"
+    local retry="${3:-3}"
+    local i
+
+    for ((i=1; i<=retry; i++)); do
+        rm -f "$out" 2>/dev/null || true
+
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL --connect-timeout 10 --retry 2 "$url" -o "$out" && return 0
+        elif command -v wget >/dev/null 2>&1; then
+            wget -q --timeout=10 --tries=2 -O "$out" "$url" && return 0
+        else
+            red "未检测到 curl 或 wget，无法下载文件"
+            return 1
+        fi
+
+        yellow "下载失败，正在重试 (${i}/${retry})..."
+        sleep 1
+    done
+
+    return 1
+}
+
+# -----------------------------
 #  清理运行中的服务
 # -----------------------------
 cleanup_services() {
@@ -3021,44 +3049,15 @@ cron_reboot() {
   reboot
 }
 # -----------------------------
-#  系统参数配置菜单
+#  系统参数配置菜单（独立脚本）
 # -----------------------------
-system_config_menu() {
-    while :; do
-        clear >/dev/null 2>&1 || true
-        echo -e "${cyan}系统参数配置${none}"
-        echo "--------------------------------------------------"
-        echo "1) BBR 优化"
-        echo "2) 配置 firewall"
-        echo "3) 修改时区"
-        echo "4) 修改 DNS"
-        echo "5) 设置 Swap"
-        echo "6) 修改 SSH 端口2222"
-        echo "7) 设置 SSH 登录方式"
-        echo "8) 设置系统清理"
-		echo "9) 设置IP优先级"
-		echo "10) 设置定时重启"
-        echo "0) 返回"
-        echo "--------------------------------------------------"
+run_sys_conf() {
+  local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_conf.sh"
+  local tmp="/tmp/sys_conf.sh"
 
-        local c=""
-        read -rp "请选择: " c
-
-        case "$c" in
-            1) bbr; pause ;;
-            2) setup_ufw; pause ;;
-            3) change_tz; pause ;;
-            4) set_dns_ui; pause ;;
-            5) swap_cache; pause ;;
-            6) ssh_port_change 2222; pause ;;
-            7) auth_key root; pause ;;
-            8) sys_cle; pause ;;
-			9) set_ip_priority;;
-			10) cron_reboot;;
-            0) return 0 ;;
-            *) msg_err "无效输入"; pause ;;
-        esac
-    done
+  download_with_retry "$url" "$tmp" || { red "下载 sys_conf.sh 失败"; read -rp "回车返回..." _; return 1; }
+  [[ -s "$tmp" ]] || { red "sys_conf.sh 文件为空"; read -rp "回车返回..." _; return 1; }
+  bash "$tmp"
 }
 
 # -----------------------------
@@ -3388,7 +3387,7 @@ menu() {
             3) xray_updata ;;
             4) print_node_info ;;
             5) detect_target_site ;;
-            6) system_config_menu ;;
+            6) run_sys_conf ;;
             7) besttrace_test ;;
             8) ip_quality_check ;;
             9) system_query ;;
