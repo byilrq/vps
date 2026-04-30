@@ -85,19 +85,54 @@ get_ssh_port() {
 # -----------------------------
 # 1) Change timezone
 # -----------------------------
-change_tz(){
+set_timezone() {
   need_root
+
+  local tz_choice
   local tz
-  read -rp "请输入要设置的时区（默认 Asia/Shanghai，留空使用默认）: " tz
-  [[ -z "$tz" ]] && tz="Asia/Shanghai"
+
+  echo "请选择要设置的时区："
+  echo "1. Shanghai"
+  echo "2. Tokyo"
+  echo "3. Los_Angeles"
+  echo "4. Singapore"
+  echo "5. Netherlands"
+  read -rp "请输入选项 [1-5]（默认 1）: " tz_choice
+
+  [[ -z "$tz_choice" ]] && tz_choice="1"
+
+  case "$tz_choice" in
+    1)
+      tz="Asia/Shanghai"
+      ;;
+    2)
+      tz="Asia/Tokyo"
+      ;;
+    3)
+      tz="America/Los_Angeles"
+      ;;
+    4)
+      tz="Asia/Singapore"
+      ;;
+    5)
+      tz="Europe/Amsterdam"
+      ;;
+    *)
+      red "无效选项：$tz_choice"
+      return 1
+      ;;
+  esac
+
   if ! timedatectl list-timezones | grep -qx "$tz"; then
     red "时区无效：$tz"
     yellow "提示：timedatectl list-timezones 查看可用时区"
     return 1
   fi
+
   timedatectl set-timezone "$tz"
   green "系统时区已经改为：$tz"
   timedatectl
+
   read -rp "回车返回菜单..." _
 }
 
