@@ -85,7 +85,7 @@ get_ssh_port() {
 # -----------------------------
 # 1) Change timezone
 # -----------------------------
-set_timezone() {
+change_tz() {
   need_root
 
   local tz_choice
