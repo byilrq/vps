@@ -16,6 +16,12 @@ green(){ echo -e "${GREEN}\033[01m$1${PLAIN}"; }
 yellow(){ echo -e "${YELLOW}\033[01m$1${PLAIN}"; }
 skyblue(){ echo -e "\033[1;36m$1\033[0m"; }
 
+msg_ok() { green "$*"; }
+msg_err() { red "$*"; }
+msg_inf() { skyblue "$*"; }
+msg_warn() { yellow "$*"; }
+
+
 need_root() {
   if [[ $EUID -ne 0 ]]; then
     red "注意: 请在 root 用户下运行脚本"
@@ -934,6 +940,259 @@ firewall() {
   done
 }
 # -----------------------------
+#  设置 SSH 登录方式
+# -----------------------------
+auth_key() {
+    local target_user="${1:-root}"
+    local target_group user_home ssh_dir ak pubkey cfg bak choice new_pass
+    local sshd_bin cloud_cfg cloud_bak
+
+    if [[ $EUID -ne 0 ]]; then
+        msg_err "请使用 root 权限执行此函数。"
+        return 1
+    fi
+
+    user_home="$(getent passwd "$target_user" | cut -d: -f6)"
+    target_group="$(id -gn "$target_user" 2>/dev/null)"
+    target_group="${target_group:-$target_user}"
+
+    cfg="/etc/ssh/sshd_config"
+    cloud_cfg="/etc/ssh/sshd_config.d/50-cloud-init.conf"
+    sshd_bin="$(command -v sshd 2>/dev/null)"
+
+    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
+        msg_err "找不到用户或家目录：$target_user"
+        return 1
+    fi
+
+    if [[ ! -f "$cfg" ]]; then
+        msg_err "找不到 SSH 配置文件：$cfg"
+        return 1
+    fi
+
+    _auth_key_backup_cfg() {
+        bak="${cfg}.bak.$(date +%Y%m%d-%H%M%S)"
+        cp -a "$cfg" "$bak" || return 1
+    }
+
+    _auth_key_backup_cloud_cfg() {
+        if [[ -f "$cloud_cfg" ]]; then
+            cloud_bak="${cloud_cfg}.bak.$(date +%Y%m%d-%H%M%S)"
+            cp -a "$cloud_cfg" "$cloud_bak" || return 1
+        fi
+    }
+
+    _auth_key_set_cfg() {
+        local key="$1"
+        local value="$2"
+
+        if grep -qE "^[#[:space:]]*${key}[[:space:]]+" "$cfg"; then
+            sed -i -E "s#^[#[:space:]]*${key}[[:space:]].*#${key} ${value}#g" "$cfg"
+        else
+            echo "${key} ${value}" >> "$cfg"
+        fi
+    }
+
+    _auth_key_set_cloud_password_auth() {
+        local value="$1"
+
+        mkdir -p /etc/ssh/sshd_config.d || return 1
+
+        if [[ -f "$cloud_cfg" ]]; then
+            _auth_key_backup_cloud_cfg || return 1
+        fi
+
+        cat > "$cloud_cfg" <<EOF
+PasswordAuthentication ${value}
+EOF
+    }
+
+    _auth_key_restore_on_fail() {
+        [[ -n "$bak" && -f "$bak" ]] && cp -a "$bak" "$cfg"
+        [[ -n "$cloud_bak" && -f "$cloud_bak" ]] && cp -a "$cloud_bak" "$cloud_cfg"
+    }
+
+    _auth_key_check_and_restart() {
+        if [[ -n "$sshd_bin" ]]; then
+            if ! "$sshd_bin" -t -f "$cfg" >/dev/null 2>&1; then
+                _auth_key_restore_on_fail
+                msg_err "sshd_config 校验失败，已恢复备份。"
+                return 1
+            fi
+        fi
+
+        if systemctl restart ssh >/dev/null 2>&1 \
+            || systemctl restart sshd >/dev/null 2>&1 \
+            || service ssh restart >/dev/null 2>&1 \
+            || service sshd restart >/dev/null 2>&1; then
+            return 0
+        fi
+
+        _auth_key_restore_on_fail
+        msg_err "SSH 服务重启失败，已恢复备份。"
+        return 1
+    }
+
+    _auth_key_gen_password() {
+        local upper lower digit special all result
+
+        upper='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        lower='abcdefghijklmnopqrstuvwxyz'
+        digit='0123456789'
+        special='$%*&#'
+        all="${upper}${lower}${digit}${special}"
+
+        _pick_one() {
+            local chars="$1"
+            printf '%s' "$chars" | fold -w1 | shuf -n1
+        }
+
+        result="$(_pick_one "$upper")"
+        result+="$(_pick_one "$lower")"
+        result+="$(_pick_one "$digit")"
+        result+="$(_pick_one "$special")"
+
+        while [[ ${#result} -lt 16 ]]; do
+            result+="$(_pick_one "$all")"
+        done
+
+        printf '%s\n' "$result" | fold -w1 | shuf | tr -d '\n'
+    }
+
+    while true; do
+        echo "=============================="
+        echo " SSH 管理用户：$target_user"
+        echo " 1. 仅 SSH 密钥登录"
+        echo " 2. 仅 SSH 密码登录"
+        echo " 3. 重置 SSH 密码"
+        echo " 0. 返回上一级"
+        echo "=============================="
+        read -rp "请选择 [0-3]： " choice
+
+        bak=""
+        cloud_bak=""
+
+        case "$choice" in
+            1)
+                echo "请输入公钥字符串（一整行，以 ssh-ed25519/ssh-rsa/ecdsa... 开头）："
+                read -r pubkey
+
+                if ! printf '%s\n' "$pubkey" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
+                    msg_err "公钥格式不正确。"
+                    echo
+                    continue
+                fi
+
+                ssh_dir="$user_home/.ssh"
+                ak="$ssh_dir/authorized_keys"
+
+                mkdir -p "$ssh_dir" || { msg_err "创建 .ssh 目录失败。"; echo; continue; }
+                chmod 700 "$ssh_dir"
+                touch "$ak" || { msg_err "创建 authorized_keys 失败。"; echo; continue; }
+                chmod 600 "$ak"
+                chown -R "$target_user:$target_group" "$ssh_dir"
+
+                if ! awk '{print $1" "$2}' "$ak" | grep -Fxq "$(printf '%s\n' "$pubkey" | awk '{print $1" "$2}')"; then
+                    printf '%s\n' "$pubkey" >> "$ak"
+                fi
+
+                _auth_key_backup_cfg || {
+                    msg_err "备份 SSH 配置失败。"
+                    echo
+                    continue
+                }
+
+                _auth_key_set_cfg "PubkeyAuthentication" "yes"
+                _auth_key_set_cfg "PasswordAuthentication" "no"
+                _auth_key_set_cfg "KbdInteractiveAuthentication" "no"
+                _auth_key_set_cfg "ChallengeResponseAuthentication" "no"
+                _auth_key_set_cfg "UsePAM" "yes"
+                _auth_key_set_cfg "AuthorizedKeysFile" ".ssh/authorized_keys"
+
+                if [[ "$target_user" == "root" ]]; then
+                    _auth_key_set_cfg "PermitRootLogin" "yes"
+                fi
+
+                _auth_key_set_cloud_password_auth "no" || {
+                    msg_err "写入 cloud-init SSH 配置失败。"
+                    echo
+                    continue
+                }
+
+                if _auth_key_check_and_restart; then
+                    msg_ok "已切换为仅 SSH 密钥登录。建议保留当前会话，并新开终端先测试登录。"
+                fi
+                echo
+                ;;
+
+            2)
+                _auth_key_backup_cfg || {
+                    msg_err "备份 SSH 配置失败。"
+                    echo
+                    continue
+                }
+
+                _auth_key_set_cfg "PubkeyAuthentication" "no"
+                _auth_key_set_cfg "PasswordAuthentication" "yes"
+                _auth_key_set_cfg "KbdInteractiveAuthentication" "no"
+                _auth_key_set_cfg "ChallengeResponseAuthentication" "no"
+                _auth_key_set_cfg "UsePAM" "yes"
+
+                if [[ "$target_user" == "root" ]]; then
+                    _auth_key_set_cfg "PermitRootLogin" "yes"
+                fi
+
+                _auth_key_set_cloud_password_auth "yes" || {
+                    msg_err "写入 cloud-init SSH 配置失败。"
+                    echo
+                    continue
+                }
+
+                if _auth_key_check_and_restart; then
+                    msg_ok "已切换为仅 SSH 密码登录。测试示例：ssh -p 2222 -o PreferredAuthentications=password -o PubkeyAuthentication=no ${target_user}@IP"
+                fi
+                echo
+                ;;
+
+            3)
+                new_pass="$(_auth_key_gen_password)"
+
+                if [[ -z "$new_pass" || ${#new_pass} -ne 16 ]]; then
+                    msg_err "生成随机密码失败。"
+                    echo
+                    continue
+                fi
+
+                if ! printf '%s:%s\n' "$target_user" "$new_pass" | chpasswd; then
+                    msg_err "重置密码失败。"
+                    echo
+                    continue
+                fi
+
+                msg_ok "用户 [$target_user] 的 SSH 密码已重置。"
+                echo "新密码：$new_pass"
+
+                if grep -qiE '^[[:space:]]*PasswordAuthentication[[:space:]]+no\b' "$cfg" \
+                    || [[ -f "$cloud_cfg" && -n "$(grep -iE '^[[:space:]]*PasswordAuthentication[[:space:]]+no\b' "$cloud_cfg" 2>/dev/null)" ]]; then
+                    echo "注意：当前 SSH 可能未开启密码登录，如需使用密码登录，请执行菜单 2。"
+                fi
+                echo
+                ;;
+
+            0)
+                return 0
+                ;;
+
+            *)
+                msg_err "无效选项，请重新输入。"
+                echo
+                ;;
+        esac
+    done
+}
+
+
+# -----------------------------
 #  系统清理
 # -----------------------------
 sys_cle() {
@@ -1104,29 +1363,31 @@ menu_sys_conf() {
     echo -e "# ${tianlan}系统参数配置（sys_conf.sh）#"
     echo "#############################################################"
     echo ""
-    echo -e " ${GREEN}1.${tianlan} 修改时区"
-    echo -e " ${GREEN}2.${tianlan} 修改DNS"
-    echo -e " ${GREEN}3.${tianlan} 设置缓存"
-    echo -e " ${GREEN}4.${tianlan} 设置IPV4/6优先级"
-    echo -e " ${GREEN}5.${tianlan} BBR优化"
-    echo -e " ${GREEN}6.${tianlan} 设置定时重启"
-    echo -e " ${GREEN}7.${tianlan} 修改SSH端口2222"
-    echo -e " ${GREEN}8.${tianlan} 设置防火墙"
-    echo -e " ${GREEN}9.${tianlan} 系统清理"
+    echo -e " ${GREEN}1.${tianlan} BBR 优化"
+    echo -e " ${GREEN}2.${tianlan} 配置 firewall"
+    echo -e " ${GREEN}3.${tianlan} 修改时区"
+    echo -e " ${GREEN}4.${tianlan} 修改 DNS"
+    echo -e " ${GREEN}5.${tianlan} 设置 Swap"
+    echo -e " ${GREEN}6.${tianlan} 修改 SSH 端口2222"
+    echo -e " ${GREEN}7.${tianlan} 设置 SSH 登录方式"
+    echo -e " ${GREEN}8.${tianlan} 设置系统清理"
+    echo -e " ${GREEN}9.${tianlan} 设置IP优先级"
+    echo -e " ${GREEN}10.${tianlan} 设置定时重启"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-9]: " choice
+    read -rp "请选择 [0-10]: " choice
     case "$choice" in
-      1) change_tz ;;
-      2) set_dns_ui ;;
-      3) swap_cache ;;
-      4) set_ip_priority ;;
-      5) bbr ;;
-      6) cron_reboot ;;
-      7) ssh_port 2222 ;;
-      8) firewall ;;
-      9) sys_cle ;;
+      1) bbr ;;
+      2) firewall ;;
+      3) change_tz ;;
+      4) set_dns_ui ;;
+      5) swap_cache ;;
+      6) ssh_port 2222 ;;
+      7) auth_key root ;;
+      8) sys_cle ;;
+      9) set_ip_priority ;;
+      10) cron_reboot ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
