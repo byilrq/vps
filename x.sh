@@ -887,56 +887,78 @@ install_panel() {
 }
 
 # -----------------------------
+#  Xray 自动更新任务：下载 xray_update.sh 并写入每月 1 日 03:00 cron
+#  参数：y = 写入任务后立即执行一次；n = 只下载并写入任务
+# -----------------------------
+setup_xray_update_cron() {
+    local run_now="${1:-n}"
+    local RAW_XRAY_UPDATE_URL="https://raw.githubusercontent.com/byilrq/vps/main/xray_update.sh"
+    local LOCAL_XRAY_UPDATE="/root/xray_update.sh"
+    local XRAY_CRON_LOG="/var/log/xray_update.log"
+    local XRAY_CRON_LINE="0 3 1 * * /bin/bash ${LOCAL_XRAY_UPDATE} >>${XRAY_CRON_LOG} 2>&1"
+
+    touch "$XRAY_CRON_LOG" >/dev/null 2>&1 || true
+
+    echo "下载/刷新 xray_update.sh 到 /root ..."
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$RAW_XRAY_UPDATE_URL" -o "$LOCAL_XRAY_UPDATE" || {
+            msg_err "下载 xray_update.sh 失败，Xray 自动更新任务未写入"
+            return 1
+        }
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$LOCAL_XRAY_UPDATE" "$RAW_XRAY_UPDATE_URL" || {
+            msg_err "下载 xray_update.sh 失败，Xray 自动更新任务未写入"
+            return 1
+        }
+    else
+        msg_err "未检测到 curl/wget，无法下载 xray_update.sh，Xray 自动更新任务未写入"
+        return 1
+    fi
+
+    [[ -s "$LOCAL_XRAY_UPDATE" ]] || {
+        msg_err "xray_update.sh 文件为空，Xray 自动更新任务未写入"
+        return 1
+    }
+
+    chmod +x "$LOCAL_XRAY_UPDATE" || {
+        msg_err "赋予执行权限失败：$LOCAL_XRAY_UPDATE"
+        return 1
+    }
+
+    echo "写入/刷新 Xray 月度自动更新任务 ..."
+    (
+        crontab -l 2>/dev/null \
+            | grep -Fv "/root/xray_update.sh" \
+            | grep -Fv "/root/xray_fresh.sh" || true
+        echo "$XRAY_CRON_LINE"
+    ) | crontab - || {
+        msg_err "写入 crontab 失败"
+        return 1
+    }
+
+    if [[ "$run_now" =~ ^[Yy]$ ]]; then
+        echo "执行一次本地 xray_update.sh ..."
+        /bin/bash "$LOCAL_XRAY_UPDATE" || {
+            msg_err "xray_update.sh 执行失败，但自动更新任务已写入"
+            return 1
+        }
+    fi
+
+    msg_ok "已设置 Xray 自动更新：每月 1 日 03:00 执行 /root/xray_update.sh"
+    echo "本地脚本: $LOCAL_XRAY_UPDATE"
+    echo "日志文件: $XRAY_CRON_LOG"
+}
+
+# -----------------------------
 #  手动更新 Xray + 固定写入每月 1 日 03:00 cron
 # -----------------------------
 xray_updata() {
-    local RAW_XRAY_FRESH_URL="https://raw.githubusercontent.com/byilrq/vps/main/xray_fresh.sh"
-    local LOCAL_XRAY_FRESH="/root/xray_fresh.sh"
-    local XRAY_CRON_LOG="/var/log/xray_fresh.log"
-
     echo "----------------------------------------------------------------"
     echo "更新 Xray-core"
     echo "----------------------------------------------------------------"
 
-    touch "$XRAY_CRON_LOG" >/dev/null 2>&1 || true
-
-    echo "下载最新 xray_fresh.sh 到 /root ..."
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$RAW_XRAY_FRESH_URL" -o "$LOCAL_XRAY_FRESH" || {
-            msg_err "下载 xray_fresh.sh 失败"
-            return 1
-        }
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$LOCAL_XRAY_FRESH" "$RAW_XRAY_FRESH_URL" || {
-            msg_err "下载 xray_fresh.sh 失败"
-            return 1
-        }
-    else
-        msg_err "未检测到 curl/wget，无法下载 xray_fresh.sh"
-        return 1
-    fi
-
-    chmod +x "$LOCAL_XRAY_FRESH" || {
-        msg_err "赋予执行权限失败：$LOCAL_XRAY_FRESH"
-        return 1
-    }
-
-    echo "执行一次本地 xray_fresh.sh ..."
-    /bin/bash "$LOCAL_XRAY_FRESH" || {
-        msg_err "xray_fresh.sh 执行失败"
-        return 1
-    }
-
-    echo "写入固定月度计划任务 ..."
-    (
-        crontab -l 2>/dev/null | grep -Fv "$LOCAL_XRAY_FRESH" || true
-        echo "0 3 1 * * /bin/bash $LOCAL_XRAY_FRESH >>$XRAY_CRON_LOG 2>&1"
-    ) | crontab -
-
-    msg_ok "Xray 手动更新已执行完成"
-    msg_ok "已设置 cron：每月 1 日 03:00 执行 /root/xray_fresh.sh"
-    echo "本地脚本: $LOCAL_XRAY_FRESH"
-    echo "日志文件: $XRAY_CRON_LOG"
+    setup_xray_update_cron "y" || return 1
+    msg_ok "Xray 手动更新已执行完成，自动更新任务已确认写入"
 }
 
 # -----------------------------
@@ -1594,11 +1616,12 @@ setup_cronjob() {
     echo "----------------------------------------------------------------"
     echo "配置计划任务"
     echo "----------------------------------------------------------------"
-    echo "即将写入以下3个 crontab："
+    echo "即将写入以下4个 crontab："
     echo "1. 开机启动 sub2sing-box"
     echo "2. 每日重启 x-ui 并重载 nginx"
     echo "3. 每月自动续签证书"
-    read -rp "确认是否写入3个计划任务？(Y/n): " confirm_cron
+    echo "4. 每月自动更新 Xray-core"
+    read -rp "确认是否写入4个计划任务？(Y/n): " confirm_cron
     if [[ "$confirm_cron" =~ ^[Nn]$ ]]; then
         msg_err "已跳过计划任务配置。"
     else
@@ -1608,6 +1631,8 @@ setup_cronjob() {
             echo '@daily x-ui restart > /dev/null 2>&1 && nginx -s reload > /dev/null 2>&1'
             echo '@monthly certbot renew --webroot -w /var/www/acme --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1'
         } | crontab -
+
+        setup_xray_update_cron "n" || msg_err "Xray 自动更新任务写入失败，请稍后从菜单 3 重试。"
     fi
 }
 
