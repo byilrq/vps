@@ -899,7 +899,7 @@ setup_xray_update_cron() {
 
     touch "$XRAY_CRON_LOG" >/dev/null 2>&1 || true
 
-    echo "下载/刷新 xray_update.sh 到 /root ..."
+    echo "下载/刷新 xray_update.sh 到 /root（支持扫描 Xray-core 最高版本）..."
     if command -v curl >/dev/null 2>&1; then
         curl -fsSL "$RAW_XRAY_UPDATE_URL" -o "$LOCAL_XRAY_UPDATE" || {
             msg_err "下载 xray_update.sh 失败，Xray 自动更新任务未写入"
@@ -954,11 +954,11 @@ setup_xray_update_cron() {
 # -----------------------------
 xray_updata() {
     echo "----------------------------------------------------------------"
-    echo "更新 Xray-core"
+    echo "更新 Xray-core（应用到 3x-ui 面板）"
     echo "----------------------------------------------------------------"
 
     setup_xray_update_cron "y" || return 1
-    msg_ok "Xray 手动更新已执行完成，自动更新任务已确认写入"
+    msg_ok "Xray 手动更新已执行完成，自动更新任务已确认写入。请刷新 3x-ui 面板版本弹窗查看。"
 }
 
 # -----------------------------
@@ -3388,7 +3388,7 @@ menu() {
         echo -e " ${blue}${bold}1)${none} ${blue}安装${none}"
         echo -e " ${red}${bold}2)${none} ${red}卸载${none}"
         echo -e "${gray}--------------------------------------------------${none}"
-        echo -e " ${yellow}${bold}3)${none} ${yellow}更新xray${none}"
+        echo -e " ${yellow}${bold}3)${none} ${yellow}更新 Xray-core${none}"
         echo -e " ${yellow}${bold}4)${none} ${yellow}打印节点信息${none}"
         echo -e " ${yellow}${bold}5)${none} ${yellow}目标网站检测${none}"
         echo -e " ${yellow}${bold}6)${none} ${yellow}系统参数配置${none}"
