@@ -1210,9 +1210,7 @@ masquerade:
   proxy:
     url: https://$proxysite
     rewriteHost: true
-  listenHTTP: :80
   listenHTTPS: :443
-  forceHTTPS: true
 EOF
 
   cat > /root/hy/hy-client.yaml <<EOF
