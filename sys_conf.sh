@@ -397,10 +397,10 @@ bbr() {
   setup_xanmod_repo() {
     install_base_packages || return 1
 
-    mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
-    local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
+    mkdir -p /etc/apt/keyrings /etc/apt/sources.list.d
+    local keyring="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
     local repo_file="/etc/apt/sources.list.d/xanmod-release.list"
-    local tmp
+    local tmp codename
     tmp="$(mktemp)"
 
     if ! wget -qO "$tmp" https://dl.xanmod.org/archive.key; then
@@ -416,7 +416,20 @@ bbr() {
     fi
     rm -f "$tmp"
 
-    echo "deb [signed-by=${keyring}] https://deb.xanmod.org releases main" > "$repo_file"
+    codename=""
+    if [ -r /etc/os-release ]; then
+      . /etc/os-release
+      codename="${VERSION_CODENAME:-}"
+    fi
+    if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
+      codename="$(lsb_release -sc 2>/dev/null || true)"
+    fi
+    if [ -z "$codename" ]; then
+      error "无法识别系统发行版代号，不能配置 XanMod 源"
+      return 1
+    fi
+
+    echo "deb [signed-by=${keyring}] http://deb.xanmod.org ${codename} main" > "$repo_file"
     apt-get update -y
   }
 
@@ -454,9 +467,25 @@ bbr() {
 
     setup_xanmod_repo || return 1
 
-    local flavor pkg
+    local flavor pkg fallback_pkgs cand
     flavor="$(cpu_level_to_flavor)"
     pkg="linux-xanmod-${flavor}"
+
+    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+      warn "仓库中未找到 ${pkg}，尝试选择可用的 XanMod 内核包"
+      fallback_pkgs="linux-xanmod-x64v4 linux-xanmod-x64v3 linux-xanmod-x64v2 linux-xanmod-x64v1 linux-xanmod"
+      pkg=""
+      for cand in $fallback_pkgs; do
+        if apt-cache show "$cand" >/dev/null 2>&1; then
+          pkg="$cand"
+          break
+        fi
+      done
+      if [ -z "$pkg" ]; then
+        error "未找到可安装的 XanMod 内核包，请检查 XanMod 源是否支持当前系统版本"
+        return 1
+      fi
+    fi
 
     info "准备安装支持 BBR 的 XanMod 内核: ${pkg}"
     if apt-get install -y "$pkg"; then
