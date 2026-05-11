@@ -400,8 +400,11 @@ bbr() {
     mkdir -p /etc/apt/keyrings /etc/apt/sources.list.d
     local keyring="/etc/apt/keyrings/xanmod-archive-keyring.gpg"
     local repo_file="/etc/apt/sources.list.d/xanmod-release.list"
-    local tmp codename
+    local tmp codename repo
     tmp="$(mktemp)"
+
+    # 清掉旧的 XanMod 源文件，避免 apt update 被旧配置干扰
+    rm -f /etc/apt/sources.list.d/xanmod*.list 2>/dev/null || true
 
     if ! wget -qO "$tmp" https://dl.xanmod.org/archive.key; then
       rm -f "$tmp"
@@ -424,13 +427,33 @@ bbr() {
     if [ -z "$codename" ] && command -v lsb_release >/dev/null 2>&1; then
       codename="$(lsb_release -sc 2>/dev/null || true)"
     fi
-    if [ -z "$codename" ]; then
-      error "无法识别系统发行版代号，不能配置 XanMod 源"
-      return 1
-    fi
 
-    echo "deb [signed-by=${keyring}] http://deb.xanmod.org ${codename} main" > "$repo_file"
-    apt-get update -y
+    # XanMod 官方源有时使用 releases，有时发行版代号可用；这里逐个尝试，成功一个就停止
+    local repo_candidates=()
+    repo_candidates+=("deb [signed-by=${keyring}] http://deb.xanmod.org releases main")
+    if [ -n "$codename" ]; then
+      repo_candidates+=("deb [signed-by=${keyring}] http://deb.xanmod.org ${codename} main")
+    fi
+    # 国内/网络不稳定时的兜底镜像
+    repo_candidates+=("deb [signed-by=${keyring}] https://mirrors.tuna.tsinghua.edu.cn/xanmod releases main")
+
+    for repo in "${repo_candidates[@]}"; do
+      echo "$repo" > "$repo_file"
+      if apt-get update -y; then
+        if apt-cache search '^linux-xanmod' | grep -q '^linux-xanmod'; then
+          info "XanMod 源配置成功: $repo"
+          return 0
+        fi
+        warn "该源可更新但未发现 linux-xanmod 包: $repo"
+      else
+        warn "该 XanMod 源不可用，尝试下一个: $repo"
+      fi
+    done
+
+    rm -f "$repo_file"
+    apt-get update -y >/dev/null 2>&1 || true
+    error "所有 XanMod 源均不可用或未发现 linux-xanmod 包"
+    return 1
   }
 
   cpu_level_to_flavor() {
@@ -467,28 +490,39 @@ bbr() {
 
     setup_xanmod_repo || return 1
 
-    local flavor pkg fallback_pkgs cand
+    local flavor pkg cand available_pkgs
     flavor="$(cpu_level_to_flavor)"
     pkg="linux-xanmod-${flavor}"
 
-    if ! apt-cache show "$pkg" >/dev/null 2>&1; then
+    available_pkgs="$(apt-cache search '^linux-xanmod' | awk '{print $1}' | sort -u || true)"
+
+    if ! echo "$available_pkgs" | grep -qx "$pkg"; then
       warn "仓库中未找到 ${pkg}，尝试选择可用的 XanMod 内核包"
-      fallback_pkgs="linux-xanmod-x64v4 linux-xanmod-x64v3 linux-xanmod-x64v2 linux-xanmod-x64v1 linux-xanmod"
       pkg=""
-      for cand in $fallback_pkgs; do
-        if apt-cache show "$cand" >/dev/null 2>&1; then
+
+      # 优先选择和 CPU 等级匹配的包；不存在时再按兼容性从高到低回退
+      for cand in "linux-xanmod-${flavor}" linux-xanmod-x64v4 linux-xanmod-x64v3 linux-xanmod-x64v2 linux-xanmod-x64v1 linux-xanmod; do
+        if echo "$available_pkgs" | grep -qx "$cand"; then
           pkg="$cand"
           break
         fi
       done
+
+      # 如果包名带分支后缀，也尽量选一个基础 linux-xanmod 包
       if [ -z "$pkg" ]; then
+        pkg="$(echo "$available_pkgs" | grep -E '^linux-xanmod($|-x64v[1-4]$)' | head -n1 || true)"
+      fi
+
+      if [ -z "$pkg" ]; then
+        echo "可见的 XanMod 包列表："
+        echo "$available_pkgs" | sed 's/^/  - /'
         error "未找到可安装的 XanMod 内核包，请检查 XanMod 源是否支持当前系统版本"
         return 1
       fi
     fi
 
     info "准备安装支持 BBR 的 XanMod 内核: ${pkg}"
-    if apt-get install -y "$pkg"; then
+    if apt-get install -y --install-recommends "$pkg"; then
       update-grub >/dev/null 2>&1 || true
       ok "XanMod 内核安装完成"
     else
