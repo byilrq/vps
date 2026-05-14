@@ -1,6 +1,8 @@
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/h.sh && bash h.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/x.sh && bash x.sh
-wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/s.sh && bash s.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/trafficcop/t.sh && bash t.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/node/node.sh && bash node.sh
+
 sni: 如果你用的是ca证书，这里填入你的域名,如果你是自签证书，这里填入www.bing.com;
 insecure: 如果你用的是ca证书,自签证书insecure为false。
 
