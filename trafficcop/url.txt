@@ -1,0 +1,6 @@
+卸载脚本：
+sudo rm -rf /root/TrafficCop
+## 一键安装
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/TrafficCop/main/t.sh && bash t.sh
+
+
