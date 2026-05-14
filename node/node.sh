@@ -16,7 +16,8 @@ PYTHON_SCRIPT="$WORK_DIR/node.py"
 SCRIPT_PATH="/root/node.sh"
 SERVICE_NAME="node"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
-GITHUB_NODE_PY_URL="https://raw.githubusercontent.com/byilrq/vpsys/refs/heads/main/node.py"
+GITHUB_NODE_PY_URL="https://raw.githubusercontent.com/byilrq/vps/main/node/node.py"
+https://github.com/byilrq/vps/blob/main/node/node.py
 
 CRON_LOG="$WORK_DIR/node_cron.log"
 BOOT_LOG="$WORK_DIR/node_boot.log"
