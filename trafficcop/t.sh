@@ -13,7 +13,7 @@ NC='\033[0m' # No Color
 
 # 基础目录
 WORK_DIR="/root/TrafficCop"
-REPO_URL="https://raw.githubusercontent.com/byilrq/TrafficCop/main"
+REPO_URL="https://raw.githubusercontent.com/byilrq/vps/main/trafficcop"
 
 # 检查root权限
 check_root() {
