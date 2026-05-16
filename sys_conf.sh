@@ -1445,6 +1445,31 @@ acme_purge_keep_xui() {
   echo "[DONE] 清理完成"
 }
 
+
+# -----------------------------
+#  SSH 设置
+# -----------------------------
+ssh_settings() {
+  need_root
+  while true; do
+    clear
+    echo "=============================="
+    echo " SSH 设置"
+    echo " 1. 修改 SSH 端口2222"
+    echo " 2. 设置 SSH 登录方式"
+    echo " 0. 返回上一级"
+    echo "=============================="
+    read -rp "请选择 [0-2]： " ssh_choice
+
+    case "$ssh_choice" in
+      1) ssh_port 2222 ;;
+      2) auth_key root ;;
+      0) return 0 ;;
+      *) yellow "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
 # -----------------------------
 # Menu
 # -----------------------------
@@ -1457,30 +1482,28 @@ menu_sys_conf() {
     echo "#############################################################"
     echo ""
     echo -e " ${GREEN}1.${tianlan} BBR 优化"
-    echo -e " ${GREEN}2.${tianlan} 配置 firewall"
-    echo -e " ${GREEN}3.${tianlan} 修改时区"
+    echo -e " ${GREEN}2.${tianlan} 设置firewall"
+    echo -e " ${GREEN}3.${tianlan} 设置时区"
     echo -e " ${GREEN}4.${tianlan} 修改 DNS"
     echo -e " ${GREEN}5.${tianlan} 设置 Swap"
-    echo -e " ${GREEN}6.${tianlan} 修改 SSH 端口2222"
-    echo -e " ${GREEN}7.${tianlan} 设置 SSH 登录方式"
-    echo -e " ${GREEN}8.${tianlan} 设置系统清理"
-    echo -e " ${GREEN}9.${tianlan} 设置IP优先级"
-    echo -e " ${GREEN}10.${tianlan} 设置定时重启"
+    echo -e " ${GREEN}6.${tianlan} 设置 SSH"
+    echo -e " ${GREEN}7.${tianlan} 设置系统清理"
+    echo -e " ${GREEN}8.${tianlan} 设置IP优先级"
+    echo -e " ${GREEN}9.${tianlan} 设置定时重启"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-10]: " choice
+    read -rp "请选择 [0-9]: " choice
     case "$choice" in
       1) bbr ;;
       2) firewall ;;
       3) change_tz ;;
       4) set_dns_ui ;;
       5) swap_cache ;;
-      6) ssh_port 2222 ;;
-      7) auth_key root ;;
-      8) sys_cle ;;
-      9) set_ip_priority ;;
-      10) cron_reboot ;;
+      6) ssh_settings ;;
+      7) sys_cle ;;
+      8) set_ip_priority ;;
+      9) cron_reboot ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
