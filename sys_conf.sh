@@ -1206,13 +1206,55 @@ EOF
                 ;;
 
             3)
-                new_pass="$(_auth_key_gen_password)"
+                echo "=============================="
+                echo " 重置 SSH 密码：$target_user"
+                echo " 1. 生成随机密码"
+                echo " 2. 手动输入密码（可视，支持退格修改）"
+                echo " 0. 取消"
+                echo "=============================="
+                read -rp "请选择 [0-2]： " pass_choice
 
-                if [[ -z "$new_pass" || ${#new_pass} -ne 16 ]]; then
-                    msg_err "生成随机密码失败。"
-                    echo
-                    continue
-                fi
+                case "$pass_choice" in
+                    1)
+                        new_pass="$(_auth_key_gen_password)"
+
+                        if [[ -z "$new_pass" || ${#new_pass} -ne 16 ]]; then
+                            msg_err "生成随机密码失败。"
+                            echo
+                            continue
+                        fi
+                        ;;
+                    2)
+                        while true; do
+                            read -e -r -p "请输入新 SSH 密码（可视，支持退格修改）: " new_pass
+                            read -e -r -p "请再次输入新 SSH 密码（可视，支持退格修改）: " new_pass_confirm
+
+                            if [[ -z "$new_pass" ]]; then
+                                msg_err "密码不能为空，请重新输入。"
+                                echo
+                                continue
+                            fi
+
+                            if [[ "$new_pass" != "$new_pass_confirm" ]]; then
+                                msg_err "两次输入的密码不一致，请重新输入。"
+                                echo
+                                continue
+                            fi
+
+                            break
+                        done
+                        ;;
+                    0)
+                        msg_warn "已取消重置密码。"
+                        echo
+                        continue
+                        ;;
+                    *)
+                        msg_err "无效选项，请重新输入。"
+                        echo
+                        continue
+                        ;;
+                esac
 
                 if ! printf '%s:%s\n' "$target_user" "$new_pass" | chpasswd; then
                     msg_err "重置密码失败。"
