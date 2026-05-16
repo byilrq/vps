@@ -367,6 +367,70 @@ EOF
   chmod 600 "$HY2_STATE_FILE" >/dev/null 2>&1 || true
 }
 
+
+# -----------------------------
+# 动态生成 Hysteria 2 分享链接
+# 不再依赖 /root/hy/ur1.txt，每次从现有配置生成。
+# -----------------------------
+generate_hy2_link() {
+  local client_file="/root/hy/hy-client.yaml"
+  local config_file="/etc/hysteria/config.yaml"
+  local server auth sni insecure host port first end mport link_host
+
+  [[ -f "$client_file" ]] || { red "客户端配置不存在：$client_file"; return 1; }
+
+  server=$(awk '/^server:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
+')
+  auth=$(awk '/^auth:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
+')
+  sni=$(awk '/^[[:space:]]*sni:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
+')
+  insecure=$(awk '/^[[:space:]]*insecure:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
+')
+
+  [[ -n "$server" && -n "$auth" ]] || { red "无法从 $client_file 读取 server/auth"; return 1; }
+
+  if [[ "$server" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+  else
+    host="${server%:*}"
+    port="${server##*:}"
+  fi
+
+  if [[ -z "$port" || "$port" == "$server" ]]; then
+    port=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' "$config_file" 2>/dev/null | tr -d '
+')
+  fi
+
+  load_hy2_state >/dev/null 2>&1 || true
+  first="${HY2_FIRST_PORT:-}"
+  end="${HY2_END_PORT:-}"
+
+  if [[ -n "$first" && -n "$end" ]]; then
+    mport="$first-$end"
+  else
+    mport="$port"
+  fi
+
+  # 保持原来的链接格式：优先使用 sni/证书域名作为链接 host，没有时回退到 server host。
+  if [[ -n "$sni" ]]; then
+    link_host="$sni"
+  else
+    link_host="$host"
+  fi
+
+  if [[ "$link_host" == *:* && "$link_host" != \[*\] ]]; then
+    link_host="[$link_host]"
+  fi
+
+  if [[ "$insecure" == "true" ]]; then
+    echo "hysteria2://$auth@$link_host:$port/?sni=$sni&insecure=1&mport=$mport#H"
+  else
+    echo "hysteria2://$auth@$link_host:$port/?sni=$sni&mport=$mport#H"
+  fi
+}
+
 install_hy2_cert_renew_job() {
   local cert_file="/etc/hysteria/cert.crt"
   local key_file="/etc/hysteria/private.key"
@@ -1242,13 +1306,6 @@ transport:
     hopInterval: 30s
 EOF
 
-  if [[ "$tls_insecure" == "true" ]]; then
-    ur1="hysteria2://$auth_pwd@$share_host:$port/?sni=$hy_domain&insecure=1&mport=$port_range#H"
-  else
-    ur1="hysteria2://$auth_pwd@$share_host:$port/?sni=$hy_domain&mport=$port_range#H"
-  fi
-
-  echo "$ur1" > /root/hy/ur1.txt
 
   apply_hy2_firewall_rules "$port" "$firstport" "$endport"
   save_hy2_state "$port" "$firstport" "$endport" "$hy_domain" "$cert_mode"
@@ -1279,10 +1336,12 @@ EOF
   green "$(cat /etc/hysteria/config.yaml)"
   yellow "客户端配置 /root/hy/hy-client.yaml："
   green "$(cat /root/hy/hy-client.yaml)"
-  yellow "分享链接 /root/hy/ur1.txt："
-  green "$(cat /root/hy/ur1.txt)"
+  local hy2_link
+  hy2_link=$(generate_hy2_link) || hy2_link=""
+  yellow "分享链接（动态生成）："
+  green "$hy2_link"
   yellow "二维码："
-  qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+  [[ -n "$hy2_link" ]] && qrencode -o - -t ANSIUTF8 "$hy2_link" || true
 
   if [[ "$tls_insecure" == "true" ]]; then
     yellow "当前证书模式：自签证书，客户端已启用跳过证书校验（insecure: true）"
@@ -1394,14 +1453,19 @@ showstatus() {
 }
 
 showconf() {
+  local hy2_link
+
   yellow "服务端配置 /etc/hysteria/config.yaml："
   green "$(cat /etc/hysteria/config.yaml 2>/dev/null)"
   yellow "客户端配置 /root/hy/hy-client.yaml："
   green "$(cat /root/hy/hy-client.yaml 2>/dev/null)"
-  yellow "分享链接 /root/hy/ur1.txt："
-  green "$(cat /root/hy/ur1.txt 2>/dev/null)"
+
+  hy2_link=$(generate_hy2_link) || hy2_link=""
+  yellow "分享链接（动态生成）："
+  green "$hy2_link"
   yellow "二维码："
-  [[ -f /root/hy/ur1.txt ]] && qrencode -o - -t ANSIUTF8 "$(cat /root/hy/ur1.txt)" || true
+  [[ -n "$hy2_link" ]] && qrencode -o - -t ANSIUTF8 "$hy2_link" || true
+
   read -rp "回车返回菜单..." _
 }
 
@@ -1410,7 +1474,7 @@ showconf() {
 # -----------------------------
 
 changeport() {
-  local oldport current_domain current_cert_mode current_first current_end mport_value current_link
+  local oldport current_domain current_cert_mode current_first current_end
   oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
 
   clear_hy2_jump_rules
@@ -1441,20 +1505,11 @@ changeport() {
   current_end="${HY2_END_PORT:-}"
 
   if [[ -n "$current_first" && -n "$current_end" ]]; then
-    mport_value="$current_first-$current_end"
     apply_hy2_firewall_rules "$port" "$current_first" "$current_end"
     save_hy2_state "$port" "$current_first" "$current_end" "$current_domain" "$current_cert_mode"
   else
-    mport_value="$port"
     apply_hy2_firewall_rules "$port" "" ""
     save_hy2_state "$port" "" "" "$current_domain" "$current_cert_mode"
-  fi
-
-  if [[ -f /root/hy/ur1.txt ]]; then
-    current_link=$(cat /root/hy/ur1.txt 2>/dev/null)
-    current_link=$(echo "$current_link" | sed -E "s#(@[^:]+:)[0-9]+/#\\1${port}/#")
-    current_link=$(echo "$current_link" | sed -E "s#mport=[0-9]+(-[0-9]+)?#mport=${mport_value}#")
-    echo "$current_link" > /root/hy/ur1.txt
   fi
 
   fix_hysteria_file_perms
@@ -1467,30 +1522,12 @@ changeport() {
 }
 
 
-update_hysteria_link() {
-  local newpasswd="$1"
-  local link_file="${2:-/root/hy/ur1.txt}"
-  local link new_link
-
-  [[ -f "$link_file" ]] || { red "链接文件不存在：$link_file"; return 1; }
-  link=$(cat "$link_file")
-  [[ -n "$link" ]] || { red "链接文件为空：$link_file"; return 1; }
-
-  new_link=$(echo "$link" | sed "s#\(hysteria2://\)[^@]*@#\1${newpasswd}@#")
-  echo "$new_link" > "$link_file"
-  skyblue "$new_link"
-  skyblue "Hysteria 2 二维码如下"
-  qrencode -o - -t ANSIUTF8 "$new_link" || true
-}
-
 changepasswd() {
   local config_file="/etc/hysteria/config.yaml"
   local client_file="/root/hy/hy-client.yaml"
-  local link_file="/root/hy/ur1.txt"
 
   [[ -f $config_file ]] || { red "配置文件不存在：$config_file"; return 1; }
   [[ -f $client_file ]] || { red "客户端配置不存在：$client_file"; return 1; }
-  [[ -f $link_file ]] || { red "分享链接不存在：$link_file"; return 1; }
 
   cp "$config_file" "${config_file}.bak" >/dev/null 2>&1 || true
 
@@ -1511,7 +1548,6 @@ changepasswd() {
     echo "auth: $passwd" >> "$client_file"
   fi
 
-  update_hysteria_link "$passwd" "$link_file" >/dev/null 2>&1 || true
 
   fix_hysteria_file_perms
   save_firewall_rules
@@ -1544,29 +1580,6 @@ change_cert() {
     sed -i "/^tls:/a\  insecure: $tls_insecure" /root/hy/hy-client.yaml
   fi
 
-  if [[ -f /root/hy/ur1.txt ]]; then
-    local auth host port_range_val share_host
-    auth=$(grep -E '^auth:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
-    host=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | cut -d: -f1)
-    old_port=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk -F':' '{print $NF}')
-    port_range_val="$old_port"
-
-    if [[ -n "$hy_domain" ]]; then
-      share_host="$hy_domain"
-    else
-      share_host="$host"
-    fi
-
-    if [[ -n "${HY2_FIRST_PORT:-}" && -n "${HY2_END_PORT:-}" ]]; then
-      port_range_val="${HY2_FIRST_PORT}-${HY2_END_PORT}"
-    fi
-
-    if [[ "$tls_insecure" == "true" ]]; then
-      echo "hysteria2://$auth@$share_host:$old_port/?sni=$hy_domain&insecure=1&mport=$port_range_val#H" > /root/hy/ur1.txt
-    else
-      echo "hysteria2://$auth@$share_host:$old_port/?sni=$hy_domain&mport=$port_range_val#H" > /root/hy/ur1.txt
-    fi
-  fi
 
   save_hy2_state "$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d "\r")" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$hy_domain" "$cert_mode"
   fix_hysteria_file_perms
