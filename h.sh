@@ -1786,6 +1786,14 @@ get_hysteria_current_version() {
   echo "$ver"
 }
 
+normalize_hysteria_version() {
+  local raw="$1" ver
+  ver=$(echo "$raw" | grep -Eo 'v?[0-9]+(\.[0-9]+)+' | head -n1)
+  [[ -n "$ver" ]] || return 1
+  [[ "$ver" == v* ]] || ver="v$ver"
+  echo "$ver"
+}
+
 get_hysteria_latest_version() {
   local latest
   latest=$(curl -fsSL --connect-timeout 10 --max-time 20 \
@@ -1799,8 +1807,7 @@ get_hysteria_latest_version() {
   fi
 
   [[ -n "$latest" ]] || return 1
-  [[ "$latest" == v* ]] || latest="v$latest"
-  echo "$latest"
+  normalize_hysteria_version "$latest"
 }
 
 version_lt() {
@@ -1857,6 +1864,14 @@ get_current_version() {
   echo "$ver"
 }
 
+normalize_version() {
+  local raw="$1" ver
+  ver=$(echo "$raw" | grep -Eo 'v?[0-9]+(\.[0-9]+)+' | head -n1)
+  [[ -n "$ver" ]] || return 1
+  [[ "$ver" == v* ]] || ver="v$ver"
+  echo "$ver"
+}
+
 get_latest_version() {
   local latest
   latest=$(curl -fsSL --connect-timeout 10 --max-time 20 \
@@ -1870,8 +1885,7 @@ get_latest_version() {
   fi
 
   [[ -n "$latest" ]] || return 1
-  [[ "$latest" == v* ]] || latest="v$latest"
-  echo "$latest"
+  normalize_version "$latest"
 }
 
 version_lt() {
