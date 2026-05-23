@@ -346,7 +346,7 @@ save_hy2_state() {
   local state_service
   local state_masquerade
 
-  [[ -n "$state_port" ]] || state_port=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
+  [[ -n "$state_port" ]] || state_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
   [[ -n "$state_domain" ]] || state_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
   [[ -n "$state_cert_mode" ]] || state_cert_mode="unknown"
   state_service=$(get_hysteria_service_name)
@@ -367,6 +367,67 @@ EOF
   chmod 600 "$HY2_STATE_FILE" >/dev/null 2>&1 || true
 }
 
+
+
+# -----------------------------
+# Hysteria 2 配置读写辅助：避免把 YAML 中所有冒号误替换
+# -----------------------------
+get_hy2_listen_port() {
+  local config_file="${1:-/etc/hysteria/config.yaml}"
+  sed -nE 's/^[[:space:]]*listen:[[:space:]]*:([0-9]+)[[:space:]]*$/\1/p' "$config_file" 2>/dev/null | head -n1 | tr -d '\r'
+}
+
+get_hy2_client_server() {
+  local client_file="${1:-/root/hy/hy-client.yaml}"
+  awk '/^server:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '\r'
+}
+
+get_hy2_client_host() {
+  local server host
+  server="$(get_hy2_client_server "${1:-/root/hy/hy-client.yaml}")"
+  if [[ "$server" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+  elif [[ "$server" == *:* ]]; then
+    host="${server%:*}"
+  else
+    host="$server"
+  fi
+  printf '%s' "$host"
+}
+
+set_hy2_listen_port() {
+  local port="$1"
+  local config_file="${2:-/etc/hysteria/config.yaml}"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  if grep -qE '^[[:space:]]*listen:[[:space:]]*:' "$config_file" 2>/dev/null; then
+    sed -i -E "s#^[[:space:]]*listen:[[:space:]]*:[0-9]+[[:space:]]*\$#listen: :${port}#" "$config_file"
+  else
+    sed -i -E "1s#.*#listen: :$port#" "$config_file"
+  fi
+}
+
+set_hy2_client_server_port() {
+  local port="$1"
+  local client_file="${2:-/root/hy/hy-client.yaml}"
+  local server host
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  server="$(get_hy2_client_server "$client_file")"
+  if [[ "$server" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+    host="[${BASH_REMATCH[1]}]"
+  elif [[ "$server" == *:* ]]; then
+    host="${server%:*}"
+  else
+    host="$server"
+  fi
+  [[ -n "$host" ]] || host="127.0.0.1"
+  sed -i -E "s#^server:[[:space:]]*.*#server: $host:$port#" "$client_file"
+}
+
+validate_port_range() {
+  local first="$1" end="$2"
+  [[ "$first" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || return 1
+  ((first >= 1 && first <= 65535 && end >= 1 && end <= 65535 && first < end)) || return 1
+}
 
 # -----------------------------
 # 动态生成 Hysteria 2 分享链接
@@ -398,9 +459,8 @@ generate_hy2_link() {
     port="${server##*:}"
   fi
 
-  if [[ -z "$port" || "$port" == "$server" ]]; then
-    port=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' "$config_file" 2>/dev/null | tr -d '
-')
+  if [[ -z "$port" || "$port" == "$server" || ! "$port" =~ ^[0-9]+$ ]]; then
+    port=$(get_hy2_listen_port "$config_file")
   fi
 
   load_hy2_state >/dev/null 2>&1 || true
@@ -506,7 +566,7 @@ range_end="${HY2_END_PORT:-}"
 service_name="${HY2_SERVICE:-hysteria-server}"
 
 if [[ -z "$listen_port" && -f "$CONFIG_FILE" ]]; then
-  listen_port=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' "$CONFIG_FILE" 2>/dev/null | tr -d '\r')
+  listen_port=$(sed -nE 's/^[[:space:]]*listen:[[:space:]]*:([0-9]+)[[:space:]]*$/\1/p' "$CONFIG_FILE" 2>/dev/null | head -n1 | tr -d '\r')
 fi
 [[ -n "$listen_port" ]] || exit 0
 
@@ -1406,7 +1466,7 @@ starthysteria() {
   hy_service=$(get_hysteria_service_name)
 
   load_hy2_state >/dev/null 2>&1 || true
-  current_port="${HY2_PORT:-$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')}"
+  current_port="${HY2_PORT:-$(get_hy2_listen_port /etc/hysteria/config.yaml)}"
   current_first="${HY2_FIRST_PORT:-}"
   current_end="${HY2_END_PORT:-}"
 
@@ -1474,29 +1534,28 @@ showconf() {
 # -----------------------------
 
 changeport() {
-  local oldport current_domain current_cert_mode current_first current_end
-  oldport=$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d '\r')
-
-  clear_hy2_jump_rules
-  clear_hy2_input_rules
+  local oldport newport current_domain current_cert_mode current_first current_end hy_service
+  oldport=$(get_hy2_listen_port /etc/hysteria/config.yaml)
+  load_hy2_state >/dev/null 2>&1 || true
+  [[ -z "$oldport" ]] && oldport="${HY2_PORT:-443}"
 
   while true; do
-    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " port
-    [[ -z $port ]] && port=443
+    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车保持当前：$oldport）: " newport
+    [[ -z "$newport" ]] && newport="$oldport"
 
-    [[ "$port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
-    ((port >= 1 && port <= 65535)) || { red "端口必须在 1-65535 之间"; continue; }
+    [[ "$newport" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
+    ((newport >= 1 && newport <= 65535)) || { red "端口必须在 1-65535 之间"; continue; }
 
-    if ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$port"; then
-      red "UDP 端口 $port 已被占用，请更换"
+    if [[ "$newport" != "$oldport" ]] && ss -lun | awk '{print $5}' | sed 's/.*://g' | grep -qw "$newport"; then
+      red "UDP 端口 $newport 已被占用，请更换"
       continue
     fi
 
     break
   done
 
-  sed -i "1s/:$oldport/:$port/g" /etc/hysteria/config.yaml 2>/dev/null || true
-  sed -i "s/:$oldport/:$port/g" /root/hy/hy-client.yaml 2>/dev/null || true
+  set_hy2_listen_port "$newport" /etc/hysteria/config.yaml || { red "写入服务端监听端口失败"; return 1; }
+  set_hy2_client_server_port "$newport" /root/hy/hy-client.yaml || { red "写入客户端 server 端口失败"; return 1; }
 
   current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
   current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
@@ -1504,23 +1563,67 @@ changeport() {
   current_first="${HY2_FIRST_PORT:-}"
   current_end="${HY2_END_PORT:-}"
 
-  if [[ -n "$current_first" && -n "$current_end" ]]; then
-    apply_hy2_firewall_rules "$port" "$current_first" "$current_end"
-    save_hy2_state "$port" "$current_first" "$current_end" "$current_domain" "$current_cert_mode"
-  else
-    apply_hy2_firewall_rules "$port" "" ""
-    save_hy2_state "$port" "" "" "$current_domain" "$current_cert_mode"
-  fi
+  apply_hy2_firewall_rules "$newport" "$current_first" "$current_end"
+  save_hy2_state "$newport" "$current_first" "$current_end" "$current_domain" "$current_cert_mode"
 
   fix_hysteria_file_perms
   save_firewall_rules
-  systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria.service >/dev/null 2>&1 || true
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1 || true
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
-  green "Hysteria 2 端口已成功修改为：$port"
+  green "Hysteria 2 监听端口已成功修改为：$newport"
   showconf
 }
 
+changejump() {
+  local current_port current_first current_end first end current_domain current_cert_mode hy_service
+  load_hy2_state >/dev/null 2>&1 || true
+  current_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
+  [[ -z "$current_port" ]] && current_port="${HY2_PORT:-443}"
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
+
+  if [[ -n "$current_first" && -n "$current_end" ]]; then
+    yellow "当前跳变端口范围：$current_first-$current_end -> $current_port"
+  else
+    yellow "当前为单端口模式，未启用跳变端口"
+  fi
+
+  read -rp "设置跳变端口起始端口（回车关闭跳变端口）: " first
+  read -rp "设置跳变端口结束端口（回车关闭跳变端口）: " end
+
+  if [[ -z "$first" && -z "$end" ]]; then
+    first=""
+    end=""
+    yellow "已选择关闭跳变端口，仅保留监听端口：$current_port"
+  else
+    while ! validate_port_range "$first" "$end"; do
+      red "范围无效：端口必须为 1-65535，且起始端口必须小于结束端口"
+      read -rp "起始端口: " first
+      read -rp "结束端口: " end
+    done
+  fi
+
+  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
+
+  apply_hy2_firewall_rules "$current_port" "$first" "$end"
+  save_hy2_state "$current_port" "$first" "$end" "$current_domain" "$current_cert_mode"
+
+  fix_hysteria_file_perms
+  save_firewall_rules
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1 || true
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
+
+  if [[ -n "$first" && -n "$end" ]]; then
+    green "跳变端口已修改为：$first-$end -> $current_port"
+  else
+    green "跳变端口已关闭，当前监听端口：$current_port"
+  fi
+  showconf
+}
 
 changepasswd() {
   local config_file="/etc/hysteria/config.yaml"
@@ -1558,20 +1661,29 @@ changepasswd() {
 }
 
 change_cert() {
-  local old_cert old_key old_hydomain old_tls_insecure old_port
+  local old_cert old_key old_host current_port current_first current_end current_cert_mode hy_service
   load_hy2_state >/dev/null 2>&1 || true
   old_cert=$(grep -E '^\s*cert:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_key=$(grep -E '^\s*key:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
-  old_hydomain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
-  old_tls_insecure=$(grep -E '^\s*insecure:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')
-  old_port=$(grep -E '^server:' /root/hy/hy-client.yaml 2>/dev/null | awk -F':' '{print $NF}')
+  old_host=$(get_hy2_client_host /root/hy/hy-client.yaml)
+  current_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
+  [[ -z "$current_port" ]] && current_port="${HY2_PORT:-443}"
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
 
   inst_cert
 
   [[ -n "$old_cert" ]] && sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
   [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
 
-  grep -q '^server: ' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^server: .*#server: ${old_hydomain:-$hy_domain}:${old_port:-443}#" /root/hy/hy-client.yaml
+  # 证书变更只更新 TLS/SNI，不擅自改 server host，避免把连接地址改成证书域名。
+  if [[ -n "$old_host" ]]; then
+    if [[ "$old_host" == *:* && "$old_host" != \[*\] ]]; then
+      sed -i -E "s#^server:[[:space:]]*.*#server: [$old_host]:$current_port#" /root/hy/hy-client.yaml
+    else
+      sed -i -E "s#^server:[[:space:]]*.*#server: $old_host:$current_port#" /root/hy/hy-client.yaml
+    fi
+  fi
   grep -q '^ *sni:' /root/hy/hy-client.yaml 2>/dev/null && sed -i "s#^ *sni: .*#  sni: $hy_domain#" /root/hy/hy-client.yaml
 
   if grep -q '^ *insecure:' /root/hy/hy-client.yaml 2>/dev/null; then
@@ -1580,11 +1692,12 @@ change_cert() {
     sed -i "/^tls:/a\  insecure: $tls_insecure" /root/hy/hy-client.yaml
   fi
 
-
-  save_hy2_state "$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d "\r")" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$hy_domain" "$cert_mode"
+  current_cert_mode="${cert_mode:-$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)}"
+  save_hy2_state "$current_port" "$current_first" "$current_end" "$hy_domain" "$current_cert_mode"
   fix_hysteria_file_perms
   save_firewall_rules
-  systemctl restart hysteria-server.service >/dev/null 2>&1 || systemctl restart hysteria.service >/dev/null 2>&1 || true
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1 || true
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
   green "证书类型/路径已修改"
@@ -1592,7 +1705,7 @@ change_cert() {
 }
 
 changeproxysite() {
-  local oldproxysite
+  local oldproxysite current_port current_domain current_cert_mode hy_service
   load_hy2_state >/dev/null 2>&1 || true
   oldproxysite=$(grep -E '^\s*url:\s*https://' /etc/hysteria/config.yaml 2>/dev/null | awk -F'https://' '{print $2}')
 
@@ -1604,10 +1717,14 @@ changeproxysite() {
     sed -i "s#url: https://.*#url: https://$proxysite#g" /etc/hysteria/config.yaml 2>/dev/null || true
   fi
 
-  save_hy2_state "$(awk -F':' 'NR==1{gsub(/ /,"",$2); print $2}' /etc/hysteria/config.yaml 2>/dev/null | tr -d "\r")" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}')" "$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)"
+  current_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
+  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
+  save_hy2_state "$current_port" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$current_domain" "$current_cert_mode"
   fix_hysteria_file_perms
   save_firewall_rules
-  systemctl restart hysteria-server.service >/dev/null 2>&1 || true
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1 || true
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
   green "伪装网站已修改为：$proxysite"
@@ -1618,20 +1735,22 @@ menu_hy_conf() {
   while true; do
     clear
     green "Hysteria 2 配置修改菜单："
-    echo -e " ${GREEN}1.${tianlan} 修改端口"
-    echo -e " ${GREEN}2.${tianlan} 修改密码"
-    echo -e " ${GREEN}3.${tianlan} 修改证书类型/路径"
-    echo -e " ${GREEN}4.${tianlan} 修改伪装网站"
+    echo -e " ${GREEN}1.${tianlan} 修改监听端口"
+    echo -e " ${GREEN}2.${tianlan} 修改跳变端口"
+    echo -e " ${GREEN}3.${tianlan} 修改密码"
+    echo -e " ${GREEN}4.${tianlan} 修改证书类型/路径"
+    echo -e " ${GREEN}5.${tianlan} 修改伪装网站"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo ""
-    read -rp "请选择 [0-4]: " confAnswer
+    read -rp "请选择 [0-5]: " confAnswer
 
     case $confAnswer in
       1) changeport ;;
-      2) changepasswd ;;
-      3) change_cert ;;
-      4) changeproxysite ;;
+      2) changejump ;;
+      3) changepasswd ;;
+      4) change_cert ;;
+      5) changeproxysite ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
