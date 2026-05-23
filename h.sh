@@ -196,6 +196,9 @@ ACME_DOMAIN_LOG="/etc/hysteria/ca.log"
 HY2_STATE_FILE="/etc/hysteria/state.env"
 HY2_CERT_RENEW_BIN="/usr/local/bin/hysteria-cert-renew"
 HY2_CERT_WEEKLY_CRON="/etc/cron.weekly/hysteria-cert-renew"
+HY2_CORE_UPDATE_BIN="/usr/local/bin/hysteria-core-update"
+HY2_CORE_MONTHLY_CRON="/etc/cron.d/hysteria-core-update"
+HY2_CORE_UPDATE_LOG="/var/log/hysteria-core-update.log"
 HY2_FIREWALL_RESTORE_BIN="/usr/local/bin/hysteria-firewall-restore"
 HY2_BOOT_FIX_SERVICE="/etc/systemd/system/hysteria-boot-fix.service"
 
@@ -1370,6 +1373,7 @@ EOF
   apply_hy2_firewall_rules "$port" "$firstport" "$endport"
   save_hy2_state "$port" "$firstport" "$endport" "$hy_domain" "$cert_mode"
   install_hy2_boot_fix_service
+  install_hy2_core_update_job
   fix_hysteria_file_perms
 
   systemctl daemon-reload
@@ -1438,8 +1442,8 @@ unsthysteria() {
   rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /lib/systemd/system/hysteria.service /etc/systemd/system/hysteria.service >/dev/null 2>&1 || true
-  rm -f "$HY2_BOOT_FIX_SERVICE" "$HY2_FIREWALL_RESTORE_BIN" "$HY2_STATE_FILE" "$HY2_CERT_WEEKLY_CRON" >/dev/null 2>&1 || true
-  rm -f /usr/local/bin/hysteria /usr/bin/hysteria "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
+  rm -f "$HY2_BOOT_FIX_SERVICE" "$HY2_FIREWALL_RESTORE_BIN" "$HY2_STATE_FILE" "$HY2_CERT_WEEKLY_CRON" "$HY2_CORE_MONTHLY_CRON" >/dev/null 2>&1 || true
+  rm -f /usr/local/bin/hysteria /usr/bin/hysteria "$HY2_CERT_RENEW_BIN" "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1 || true
   rm -rf /root/hy /root/hysteria.sh /var/lib/hysteria >/dev/null 2>&1 || true
 
   remove_hy2_input_chain >/dev/null 2>&1 || true
@@ -1760,17 +1764,246 @@ menu_hy_conf() {
 # -----------------------------
 # 核心更新 / 工具功能
 # -----------------------------
-update_core() {
-  green "官方更新方式必须先通过脚本安装后再使用，否则可能失败。"
-  systemctl stop hysteria-server.service >/dev/null 2>&1 || true
-  rm -f /usr/local/bin/hysteria
-  bash <(curl -fsSL https://get.hy2.sh/) || { red "更新失败"; return 1; }
-  systemctl enable --now hysteria-server.service >/dev/null 2>&1 || true
-  systemctl restart hysteria-server.service
-  green "Hysteria 内核已更新并重启"
-  read -rp "回车返回菜单..." _
+get_hysteria_bin() {
+  if [[ -x /usr/local/bin/hysteria ]]; then
+    echo "/usr/local/bin/hysteria"
+  elif [[ -x /usr/bin/hysteria ]]; then
+    echo "/usr/bin/hysteria"
+  elif command -v hysteria >/dev/null 2>&1; then
+    command -v hysteria
+  else
+    return 1
+  fi
 }
 
+get_hysteria_current_version() {
+  local bin out ver
+  bin=$(get_hysteria_bin 2>/dev/null) || return 1
+  out=$("$bin" version 2>&1 || true)
+  ver=$(echo "$out" | grep -Eo 'v?[0-9]+(\.[0-9]+)+' | head -n1)
+  [[ -n "$ver" ]] || return 1
+  [[ "$ver" == v* ]] || ver="v$ver"
+  echo "$ver"
+}
+
+get_hysteria_latest_version() {
+  local latest
+  latest=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+    https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | \
+    grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
+
+  if [[ -z "$latest" ]]; then
+    latest=$(curl -fsSI --connect-timeout 10 --max-time 20 \
+      https://github.com/apernet/hysteria/releases/latest 2>/dev/null | \
+      awk -F'/' 'tolower($1) ~ /^location:/ {print $NF}' | tr -d '\r')
+  fi
+
+  [[ -n "$latest" ]] || return 1
+  [[ "$latest" == v* ]] || latest="v$latest"
+  echo "$latest"
+}
+
+version_lt() {
+  local a b lowest
+  a="${1#v}"
+  b="${2#v}"
+  [[ "$a" == "$b" ]] && return 1
+  lowest=$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)
+  [[ "$lowest" == "$a" ]]
+}
+
+install_hy2_core_update_job() {
+  mkdir -p /usr/local/bin /etc/cron.d >/dev/null 2>&1 || true
+
+  cat > "$HY2_CORE_UPDATE_BIN" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+LOG_FILE="/var/log/hysteria-core-update.log"
+
+log() {
+  echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"
+}
+
+get_service_name() {
+  if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
+    echo "hysteria-server"
+  elif systemctl list-unit-files 2>/dev/null | grep -q '^hysteria\.service'; then
+    echo "hysteria"
+  else
+    echo "hysteria-server"
+  fi
+}
+
+get_hysteria_bin() {
+  if [[ -x /usr/local/bin/hysteria ]]; then
+    echo "/usr/local/bin/hysteria"
+  elif [[ -x /usr/bin/hysteria ]]; then
+    echo "/usr/bin/hysteria"
+  elif command -v hysteria >/dev/null 2>&1; then
+    command -v hysteria
+  else
+    return 1
+  fi
+}
+
+get_current_version() {
+  local bin out ver
+  bin=$(get_hysteria_bin 2>/dev/null) || return 1
+  out=$("$bin" version 2>&1 || true)
+  ver=$(echo "$out" | grep -Eo 'v?[0-9]+(\.[0-9]+)+' | head -n1)
+  [[ -n "$ver" ]] || return 1
+  [[ "$ver" == v* ]] || ver="v$ver"
+  echo "$ver"
+}
+
+get_latest_version() {
+  local latest
+  latest=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+    https://api.github.com/repos/apernet/hysteria/releases/latest 2>/dev/null | \
+    grep -m1 '"tag_name"' | sed -E 's/.*"tag_name"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/' | tr -d '\r')
+
+  if [[ -z "$latest" ]]; then
+    latest=$(curl -fsSI --connect-timeout 10 --max-time 20 \
+      https://github.com/apernet/hysteria/releases/latest 2>/dev/null | \
+      awk -F'/' 'tolower($1) ~ /^location:/ {print $NF}' | tr -d '\r')
+  fi
+
+  [[ -n "$latest" ]] || return 1
+  [[ "$latest" == v* ]] || latest="v$latest"
+  echo "$latest"
+}
+
+version_lt() {
+  local a b lowest
+  a="${1#v}"
+  b="${2#v}"
+  [[ "$a" == "$b" ]] && return 1
+  lowest=$(printf '%s\n%s\n' "$a" "$b" | sort -V | head -n1)
+  [[ "$lowest" == "$a" ]]
+}
+
+service_name=$(get_service_name)
+current=$(get_current_version 2>/dev/null || echo "未安装")
+latest=$(get_latest_version 2>/dev/null || true)
+
+if [[ -z "$latest" ]]; then
+  log "获取 Hysteria 最新版本失败，跳过更新。当前版本：$current"
+  exit 0
+fi
+
+log "当前版本：$current，最新版本：$latest"
+
+if [[ "$current" != "未安装" ]] && ! version_lt "$current" "$latest"; then
+  log "当前已是最新版本，无需更新。"
+  exit 0
+fi
+
+log "发现新版本，开始更新 Hysteria 内核。"
+backup=""
+bin=$(get_hysteria_bin 2>/dev/null || true)
+if [[ -n "$bin" && -x "$bin" ]]; then
+  backup="${bin}.bak.$(date +%Y%m%d%H%M%S)"
+  cp -a "$bin" "$backup" 2>/dev/null || true
+fi
+
+systemctl stop "$service_name" >/dev/null 2>&1 || true
+if bash <(curl -fsSL https://get.hy2.sh/); then
+  systemctl enable --now "$service_name" >/dev/null 2>&1 || systemctl start "$service_name" >/dev/null 2>&1 || true
+  systemctl restart "$service_name" >/dev/null 2>&1 || true
+
+  if systemctl is-active --quiet "$service_name"; then
+    new_version=$(get_current_version 2>/dev/null || echo "$latest")
+    log "Hysteria 内核更新完成：$current -> $new_version"
+    exit 0
+  fi
+
+  log "更新后服务未正常运行，尝试回滚。"
+else
+  log "官方安装脚本执行失败，尝试回滚。"
+fi
+
+if [[ -n "$backup" && -s "$backup" && -n "$bin" ]]; then
+  cp -a "$backup" "$bin" 2>/dev/null || true
+  chmod +x "$bin" 2>/dev/null || true
+fi
+systemctl restart "$service_name" >/dev/null 2>&1 || true
+log "更新失败，已执行回滚尝试。请手动检查：journalctl -u $service_name -n 50 --no-pager"
+exit 1
+EOF
+
+  chmod 700 "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1 || true
+
+  cat > "$HY2_CORE_MONTHLY_CRON" <<EOF
+SHELL=/bin/bash
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+# 每月 1 号 04:20 自动检测 Hysteria 内核版本，只有发现新版才更新。
+20 4 1 * * root "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1
+EOF
+  chmod 644 "$HY2_CORE_MONTHLY_CRON" >/dev/null 2>&1 || true
+
+  green "已安装每月 1 号内核检测更新任务：$HY2_CORE_MONTHLY_CRON"
+  yellow "日志文件：$HY2_CORE_UPDATE_LOG"
+}
+
+update_core() {
+  local current latest hy_service backup bin new_version
+
+  green "检测 Hysteria 2 内核版本..."
+  current=$(get_hysteria_current_version 2>/dev/null || echo "未安装")
+  latest=$(get_hysteria_latest_version 2>/dev/null || true)
+
+  yellow "当前安装版本：$current"
+  if [[ -z "$latest" ]]; then
+    red "获取最新版本失败，请检查网络或 GitHub 访问。"
+    read -rp "回车返回菜单..." _
+    return 1
+  fi
+  yellow "GitHub 最新版本：$latest"
+
+  install_hy2_core_update_job
+
+  if [[ "$current" != "未安装" ]] && ! version_lt "$current" "$latest"; then
+    green "当前已是最新版本，无需更新。"
+    read -rp "回车返回菜单..." _
+    return 0
+  fi
+
+  yellow "发现可更新版本，开始执行官方更新脚本。"
+  hy_service=$(get_hysteria_service_name)
+  bin=$(get_hysteria_bin 2>/dev/null || true)
+  backup=""
+  if [[ -n "$bin" && -x "$bin" ]]; then
+    backup="${bin}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$bin" "$backup" 2>/dev/null || true
+  fi
+
+  systemctl stop "$hy_service" >/dev/null 2>&1 || true
+  if bash <(curl -fsSL https://get.hy2.sh/); then
+    systemctl enable --now "$hy_service" >/dev/null 2>&1 || systemctl start "$hy_service" >/dev/null 2>&1 || true
+    systemctl restart "$hy_service" >/dev/null 2>&1 || true
+
+    if systemctl is-active --quiet "$hy_service"; then
+      new_version=$(get_hysteria_current_version 2>/dev/null || echo "$latest")
+      green "Hysteria 内核已更新并重启：$current -> $new_version"
+      read -rp "回车返回菜单..." _
+      return 0
+    fi
+
+    red "更新后服务未正常运行，尝试回滚。"
+  else
+    red "官方安装脚本执行失败，尝试回滚。"
+  fi
+
+  if [[ -n "$backup" && -s "$backup" && -n "$bin" ]]; then
+    cp -a "$backup" "$bin" 2>/dev/null || true
+    chmod +x "$bin" 2>/dev/null || true
+  fi
+  systemctl restart "$hy_service" >/dev/null 2>&1 || true
+  red "更新失败，已尝试恢复旧内核。请检查：journalctl -u $hy_service -n 50 --no-pager"
+  read -rp "回车返回菜单..." _
+  return 1
+}
 # -----------------------------
 # 回程路由与 IP 质量检测
 # -----------------------------
