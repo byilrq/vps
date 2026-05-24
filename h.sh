@@ -13,17 +13,75 @@ hui='\e[37m'
 zi='\033[35m'
 tianlan='\033[96m'
 
+# -----------------------------
+# 函数：红色输出
+# -----------------------------
 red() { echo -e "${RED}\033[01m$1${PLAIN}"; }
+# -----------------------------
+# 函数：绿色输出
+# -----------------------------
 green() { echo -e "${GREEN}\033[01m$1${PLAIN}"; }
+# -----------------------------
+# 函数：黄色输出
+# -----------------------------
 yellow() { echo -e "${YELLOW}\033[01m$1${PLAIN}"; }
+# -----------------------------
+# 函数：天蓝色输出
+# -----------------------------
 skyblue() { echo -e "\033[1;36m$1\033[0m"; }
 
+
+# -----------------------------
+# 函数：可编辑明文输入
+# -----------------------------
+read_confirmed() {
+  local __var="$1"
+  local prompt="$2"
+  local default_value="${3:-}"
+  local allow_empty="${4:-false}"
+  local value
+
+  read -erp "$prompt" value
+  [[ -z "$value" && -n "$default_value" ]] && value="$default_value"
+
+  if [[ -z "$value" && "$allow_empty" != "true" ]]; then
+    red "输入不能为空。"
+    return 1
+  fi
+
+  printf -v "$__var" '%s' "$value"
+  return 0
+}
+
+# -----------------------------
+# 函数：可编辑明文密码输入
+# -----------------------------
+read_confirmed_password() {
+  local __var="$1"
+  local prompt="$2"
+  local value
+
+  read -erp "$prompt" value
+  [[ -z "$value" ]] && value=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+
+  if [[ ! "$value" =~ ^[A-Za-z0-9._~@%+-]+$ ]]; then
+    red "密码仅支持字母、数字和 . _ ~ @ % + -，避免破坏 YAML 或分享链接"
+    return 1
+  fi
+
+  printf -v "$__var" '%s' "$value"
+  return 0
+}
+
+# -----------------------------
+# 函数：检查 root 权限
+# -----------------------------
 need_root() {
   [[ $EUID -ne 0 ]] && red "注意：请在 root 用户下运行脚本" && exit 1
 }
 
 # -----------------------------
-# 等待 apt 锁释放（Debian/Ubuntu）
+# 函数：等待 apt/dpkg 锁释放
 # -----------------------------
 wait_for_apt_lock() {
   local max_attempts=120
@@ -57,6 +115,9 @@ CMD=(
   "$(grep . /etc/issue 2>/dev/null | cut -d \\ -f1 | sed '/^[ ]*$/d')"
 )
 
+# -----------------------------
+# 函数：检测系统发行版
+# -----------------------------
 detect_os() {
   local i
   for i in "${CMD[@]}"; do
@@ -74,6 +135,9 @@ detect_os() {
   [[ -z $SYSTEM ]] && red "暂不支持当前 VPS 的操作系统。" && exit 1
 }
 
+# -----------------------------
+# 函数：确保 curl 可用
+# -----------------------------
 ensure_curl() {
   if [[ -z $(type -P curl) ]]; then
     if [[ "$SYSTEM" != "CentOS" ]]; then
@@ -84,7 +148,7 @@ ensure_curl() {
   fi
 }
 # -----------------------------
-# 自动修复被中断的 dpkg 状态
+# 函数：修复中断的 dpkg 状态
 # -----------------------------
 fix_dpkg_interrupt() {
   if command -v dpkg >/dev/null 2>&1; then
@@ -104,7 +168,7 @@ fix_dpkg_interrupt() {
   fi
 }
 # -----------------------------
-# 软件包管理辅助函数
+# 函数：刷新软件源缓存
 # -----------------------------
 pkg_update() {
   if command -v apt-get >/dev/null 2>&1; then
@@ -123,6 +187,9 @@ pkg_update() {
   fi
 }
 
+# -----------------------------
+# 函数：安装系统软件包
+# -----------------------------
 pkg_install() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
@@ -146,6 +213,9 @@ pkg_install() {
   fi
 }
 
+# -----------------------------
+# 函数：带重试下载文件
+# -----------------------------
 download_with_retry() {
   local url="$1"
   local out="$2"
@@ -163,7 +233,7 @@ download_with_retry() {
 }
 
 # -----------------------------
-# 获取本机公网 IP
+# 函数：获取本机公网 IP
 # -----------------------------
 realip() {
   ip=$(curl -4fsS --max-time 8 ip.sb 2>/dev/null)
@@ -177,12 +247,18 @@ realip() {
   return 0
 }
 
+# -----------------------------
+# 函数：校验域名格式
+# -----------------------------
 is_valid_domain() {
   local d="$1"
   [[ -n "$d" ]] || return 1
   [[ "$d" =~ ^([A-Za-z0-9][-A-Za-z0-9]{0,62}\.)+[A-Za-z]{2,63}$ ]]
 }
 
+# -----------------------------
+# 函数：规范化域名/主机输入
+# -----------------------------
 normalize_host_input() {
   local v="$1"
   v="${v#http://}"
@@ -197,11 +273,14 @@ HY2_STATE_FILE="/etc/hysteria/state.env"
 HY2_CERT_RENEW_BIN="/usr/local/bin/hysteria-cert-renew"
 HY2_CERT_WEEKLY_CRON="/etc/cron.weekly/hysteria-cert-renew"
 HY2_CORE_UPDATE_BIN="/usr/local/bin/hysteria-core-update"
-HY2_CORE_MONTHLY_CRON="/etc/cron.d/hysteria-core-update"
+HY2_CORE_WEEKLY_CRON="/etc/cron.d/hysteria-core-update"
 HY2_CORE_UPDATE_LOG="/var/log/hysteria-core-update.log"
 HY2_FIREWALL_RESTORE_BIN="/usr/local/bin/hysteria-firewall-restore"
 HY2_BOOT_FIX_SERVICE="/etc/systemd/system/hysteria-boot-fix.service"
 
+# -----------------------------
+# 函数：获取 Hysteria 服务名
+# -----------------------------
 get_hysteria_service_name() {
   if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
     echo "hysteria-server"
@@ -212,6 +291,9 @@ get_hysteria_service_name() {
   fi
 }
 
+# -----------------------------
+# 函数：读取证书主域名
+# -----------------------------
 get_cert_primary_domain() {
   local cert_file="$1"
   [[ -s "$cert_file" ]] || return 1
@@ -220,6 +302,9 @@ get_cert_primary_domain() {
     tr ',' '\n' | sed -n 's/.*DNS:\([^[:space:]]*\).*/\1/p' | head -n1
 }
 
+# -----------------------------
+# 函数：校验证书域名匹配
+# -----------------------------
 cert_matches_domain() {
   local cert_file="$1"
   local domain="$2"
@@ -232,6 +317,9 @@ cert_matches_domain() {
   openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p' | grep -Fxq "$domain"
 }
 
+# -----------------------------
+# 函数：检查证书有效期
+# -----------------------------
 cert_not_expiring_soon() {
   local cert_file="$1"
   local days="${2:-14}"
@@ -242,6 +330,9 @@ cert_not_expiring_soon() {
   openssl x509 -checkend "$seconds" -noout -in "$cert_file" >/dev/null 2>&1
 }
 
+# -----------------------------
+# 函数：复用本地正式证书
+# -----------------------------
 existing_official_cert_usable() {
   local expect_domain="$1"
   local cert_file="/etc/hysteria/cert.crt"
@@ -269,6 +360,9 @@ existing_official_cert_usable() {
   return 0
 }
 
+# -----------------------------
+# 函数：确保 HY2_INPUT 防火墙链存在
+# -----------------------------
 ensure_hy2_input_chain() {
   iptables -N HY2_INPUT >/dev/null 2>&1 || true
   iptables -F HY2_INPUT >/dev/null 2>&1 || true
@@ -281,6 +375,9 @@ ensure_hy2_input_chain() {
   fi
 }
 
+# -----------------------------
+# 函数：清空 HY2_INPUT 防火墙规则
+# -----------------------------
 clear_hy2_input_rules() {
   iptables -F HY2_INPUT >/dev/null 2>&1 || true
   if command -v ip6tables >/dev/null 2>&1; then
@@ -288,6 +385,9 @@ clear_hy2_input_rules() {
   fi
 }
 
+# -----------------------------
+# 函数：删除 HY2_INPUT 防火墙链
+# -----------------------------
 remove_hy2_input_chain() {
   iptables -D INPUT -j HY2_INPUT >/dev/null 2>&1 || true
   iptables -F HY2_INPUT >/dev/null 2>&1 || true
@@ -300,6 +400,9 @@ remove_hy2_input_chain() {
   fi
 }
 
+# -----------------------------
+# 函数：应用 Hy2 防火墙规则
+# -----------------------------
 apply_hy2_firewall_rules() {
   local listen_port="$1"
   local range_start="$2"
@@ -333,6 +436,9 @@ apply_hy2_firewall_rules() {
   fi
 }
 
+# -----------------------------
+# 函数：加载 Hy2 状态文件
+# -----------------------------
 load_hy2_state() {
   [[ -f "$HY2_STATE_FILE" ]] || return 1
   # shellcheck disable=SC1090
@@ -340,6 +446,9 @@ load_hy2_state() {
   return 0
 }
 
+# -----------------------------
+# 函数：保存 Hy2 状态文件
+# -----------------------------
 save_hy2_state() {
   local state_port="$1"
   local state_range_start="$2"
@@ -373,18 +482,24 @@ EOF
 
 
 # -----------------------------
-# Hysteria 2 配置读写辅助：避免把 YAML 中所有冒号误替换
+# 函数：读取 Hy2 监听端口
 # -----------------------------
 get_hy2_listen_port() {
   local config_file="${1:-/etc/hysteria/config.yaml}"
   sed -nE 's/^[[:space:]]*listen:[[:space:]]*:([0-9]+)[[:space:]]*$/\1/p' "$config_file" 2>/dev/null | head -n1 | tr -d '\r'
 }
 
+# -----------------------------
+# 函数：读取客户端 server 字段
+# -----------------------------
 get_hy2_client_server() {
   local client_file="${1:-/root/hy/hy-client.yaml}"
   awk '/^server:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '\r'
 }
 
+# -----------------------------
+# 函数：读取客户端连接主机
+# -----------------------------
 get_hy2_client_host() {
   local server host
   server="$(get_hy2_client_server "${1:-/root/hy/hy-client.yaml}")"
@@ -398,6 +513,9 @@ get_hy2_client_host() {
   printf '%s' "$host"
 }
 
+# -----------------------------
+# 函数：修改服务端监听端口
+# -----------------------------
 set_hy2_listen_port() {
   local port="$1"
   local config_file="${2:-/etc/hysteria/config.yaml}"
@@ -409,6 +527,9 @@ set_hy2_listen_port() {
   fi
 }
 
+# -----------------------------
+# 函数：修改客户端 server 端口
+# -----------------------------
 set_hy2_client_server_port() {
   local port="$1"
   local client_file="${2:-/root/hy/hy-client.yaml}"
@@ -426,45 +547,76 @@ set_hy2_client_server_port() {
   sed -i -E "s#^server:[[:space:]]*.*#server: $host:$port#" "$client_file"
 }
 
+# -----------------------------
+# 函数：校验端口范围
+# -----------------------------
 validate_port_range() {
   local first="$1" end="$2"
   [[ "$first" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || return 1
   ((first >= 1 && first <= 65535 && end >= 1 && end <= 65535 && first < end)) || return 1
 }
 
+
+# -----------------------------
+# 函数：URL 编码参数
+# -----------------------------
+url_encode() {
+  local string="$1"
+  local length="${#string}"
+  local i char
+
+  for ((i = 0; i < length; i++)); do
+    char="${string:i:1}"
+    case "$char" in
+      [a-zA-Z0-9.~_-]) printf '%s' "$char" ;;
+      *) printf '%%%02X' "'$char" ;;
+    esac
+  done
+}
+
+# -----------------------------
+# 函数：转义 sed 替换字符串
+# -----------------------------
+sed_escape_bang() {
+  printf '%s' "$1" | sed 's/[\&!]/\&/g'
+}
+
 # -----------------------------
 # 动态生成 Hysteria 2 分享链接
 # 不再依赖 /root/hy/ur1.txt，每次从现有配置生成。
 # -----------------------------
+# -----------------------------
+# 函数：动态生成 Hy2 分享链接
+# -----------------------------
 generate_hy2_link() {
   local client_file="/root/hy/hy-client.yaml"
   local config_file="/etc/hysteria/config.yaml"
-  local server auth sni insecure host port first end mport link_host
+  local server auth sni insecure host port first end mport link_host query auth_enc sni_enc
 
   [[ -f "$client_file" ]] || { red "客户端配置不存在：$client_file"; return 1; }
 
-  server=$(awk '/^server:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
-')
-  auth=$(awk '/^auth:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
-')
-  sni=$(awk '/^[[:space:]]*sni:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
-')
-  insecure=$(awk '/^[[:space:]]*insecure:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '
-')
+  server=$(awk '/^server:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '\r\n')
+  auth=$(awk '/^auth:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '\r\n')
+  sni=$(awk '/^[[:space:]]*sni:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '\r\n')
+  insecure=$(awk '/^[[:space:]]*insecure:[[:space:]]*/{print $2; exit}' "$client_file" 2>/dev/null | tr -d '\r\n')
 
   [[ -n "$server" && -n "$auth" ]] || { red "无法从 $client_file 读取 server/auth"; return 1; }
 
   if [[ "$server" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
     host="${BASH_REMATCH[1]}"
     port="${BASH_REMATCH[2]}"
+  elif [[ "$server" =~ ^(.+):([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
   else
-    host="${server%:*}"
-    port="${server##*:}"
+    host="$server"
+    port=""
   fi
 
-  if [[ -z "$port" || "$port" == "$server" || ! "$port" =~ ^[0-9]+$ ]]; then
+  if [[ -z "$port" || ! "$port" =~ ^[0-9]+$ ]]; then
     port=$(get_hy2_listen_port "$config_file")
   fi
+  [[ -n "$host" && -n "$port" ]] || { red "无法解析客户端 server 地址或端口"; return 1; }
 
   load_hy2_state >/dev/null 2>&1 || true
   first="${HY2_FIRST_PORT:-}"
@@ -476,24 +628,28 @@ generate_hy2_link() {
     mport="$port"
   fi
 
-  # 保持原来的链接格式：优先使用 sni/证书域名作为链接 host，没有时回退到 server host。
-  if [[ -n "$sni" ]]; then
-    link_host="$sni"
-  else
-    link_host="$host"
-  fi
-
+  # 分享链接的主机必须是实际连接地址，也就是 client 配置里的 server host。
+  # sni 只作为 TLS 校验参数，不能拿来替代连接地址；否则自签 www.bing.com 会被错误打印为连接主机。
+  link_host="$host"
   if [[ "$link_host" == *:* && "$link_host" != \[*\] ]]; then
     link_host="[$link_host]"
   fi
 
-  if [[ "$insecure" == "true" ]]; then
-    echo "hysteria2://$auth@$link_host:$port/?sni=$sni&insecure=1&mport=$mport#H"
-  else
-    echo "hysteria2://$auth@$link_host:$port/?sni=$sni&mport=$mport#H"
+  auth_enc=$(url_encode "$auth")
+  query="mport=$mport"
+  if [[ -n "$sni" ]]; then
+    sni_enc=$(url_encode "$sni")
+    query="sni=$sni_enc&$query"
   fi
-}
+  if [[ "$insecure" == "true" ]]; then
+    query="${query}&insecure=1"
+  fi
 
+  echo "hysteria2://$auth_enc@$link_host:$port/?$query#H"
+}
+# -----------------------------
+# 函数：安装证书自动续签任务
+# -----------------------------
 install_hy2_cert_renew_job() {
   local cert_file="/etc/hysteria/cert.crt"
   local key_file="/etc/hysteria/private.key"
@@ -551,6 +707,9 @@ EOF
   systemctl disable --now acme-sh.timer >/dev/null 2>&1 || true
 }
 
+# -----------------------------
+# 函数：安装开机防火墙恢复服务
+# -----------------------------
 install_hy2_boot_fix_service() {
   cat > "$HY2_FIREWALL_RESTORE_BIN" <<'EOF'
 #!/usr/bin/env bash
@@ -640,6 +799,9 @@ EOF
   systemctl enable hysteria-boot-fix.service >/dev/null 2>&1 || true
 }
 
+# -----------------------------
+# 函数：确保端口跳跃 NAT 链存在
+# -----------------------------
 ensure_hy2_jump_chain() {
   iptables -t nat -N HY2_JUMP >/dev/null 2>&1 || true
   iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
@@ -652,6 +814,9 @@ ensure_hy2_jump_chain() {
   fi
 }
 
+# -----------------------------
+# 函数：清空端口跳跃 NAT 规则
+# -----------------------------
 clear_hy2_jump_rules() {
   iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
   if command -v ip6tables >/dev/null 2>&1; then
@@ -659,6 +824,9 @@ clear_hy2_jump_rules() {
   fi
 }
 
+# -----------------------------
+# 函数：删除端口跳跃 NAT 链
+# -----------------------------
 remove_hy2_jump_chain() {
   iptables -t nat -D PREROUTING -j HY2_JUMP >/dev/null 2>&1 || true
   iptables -t nat -F HY2_JUMP >/dev/null 2>&1 || true
@@ -672,12 +840,15 @@ remove_hy2_jump_chain() {
 }
 
 # -----------------------------
-# 检查与辅助函数
+# 函数：检查 80 端口占用
 # -----------------------------
 check_port_80_free() {
   ! ss -lntp 2>/dev/null | grep -q ':80 '
 }
 
+# -----------------------------
+# 函数：检查域名解析是否指向本机
+# -----------------------------
 check_domain_ready() {
   local domain="$1"
   local resolved_ip4 resolved_ip6
@@ -695,6 +866,9 @@ check_domain_ready() {
 }
 
 
+# -----------------------------
+# 函数：保存防火墙规则
+# -----------------------------
 save_firewall_rules() {
   if command -v netfilter-persistent >/dev/null 2>&1; then
     systemctl enable netfilter-persistent >/dev/null 2>&1 || true
@@ -710,7 +884,7 @@ save_firewall_rules() {
 
 
 # -----------------------------
-# 修复配置文件与证书权限
+# 函数：修复 Hy2 文件权限
 # -----------------------------
 fix_hysteria_file_perms() {
   local dir="/etc/hysteria"
@@ -766,6 +940,9 @@ fix_hysteria_file_perms() {
 # 证书安装与配置
 # -----------------------------
 
+# -----------------------------
+# 函数：安装或配置 TLS 证书
+# -----------------------------
 inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
@@ -773,8 +950,12 @@ inst_cert() {
   echo -e " ${GREEN}2.${PLAIN} 必应自签证书${YELLOW}（客户端将跳过证书校验）${PLAIN}"
   echo -e " ${GREEN}3.${PLAIN} 自定义证书路径${YELLOW}（默认强制校验）${PLAIN}"
   echo ""
-  read -rp "请输入选项 [1-3]: " certInput
-  [[ -z "$certInput" ]] && certInput=1
+
+  while true; do
+    read_confirmed certInput "请输入选项 [1-3]（回车默认 1）: " "1" || return 1
+    [[ "$certInput" =~ ^[1-3]$ ]] && break
+    red "选项无效，请输入 1、2 或 3。"
+  done
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
@@ -785,11 +966,15 @@ inst_cert() {
     cert_path="/etc/hysteria/cert.crt"
     key_path="/etc/hysteria/private.key"
 
-    realip || exit 1
-    read -rp "请输入需要申请或复用证书的域名: " domain
-    domain="$(normalize_host_input "$domain")"
-    [[ -z $domain ]] && red "未输入域名，无法执行操作。" && exit 1
-    is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
+    realip || return 1
+    while true; do
+      read_confirmed domain "请输入需要申请或复用证书的域名: " "" || return 1
+      domain="$(normalize_host_input "$domain")"
+      if is_valid_domain "$domain"; then
+        break
+      fi
+      red "域名格式无效：$domain"
+    done
 
     local reusable_domain=""
     reusable_domain=$(existing_official_cert_usable "$domain" 2>/dev/null || true)
@@ -808,14 +993,14 @@ inst_cert() {
     check_domain_ready "$domain" || {
       red "当前域名解析的 IP 与当前 VPS 真实 IP 不匹配"
       yellow "建议：关闭 Cloudflare 小云朵（仅 DNS）、检查解析 IP 是否为真实 IP。"
-      exit 1
+      return 1
     }
 
     green "检查 80 端口..."
     check_port_80_free || {
       red "80 端口被占用，acme standalone 模式会失败或长时间卡住"
       yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
-      exit 1
+      return 1
     }
 
     green "安装申请证书所需依赖..."
@@ -824,7 +1009,7 @@ inst_cert() {
     green "安装 acme.sh ..."
     curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
       red "安装 acme.sh 失败"
-      exit 1
+      return 1
     }
 
     source ~/.bashrc >/dev/null 2>&1 || true
@@ -835,22 +1020,18 @@ inst_cert() {
     if [[ -n $(echo "$ip" | grep ":") ]]; then
       timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
         red "签发失败"
-        exit 1
+        return 1
       }
     else
       timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
         red "签发失败"
-        exit 1
+        return 1
       }
     fi
 
-    bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
-      --key-file "$key_path" \
-      --fullchain-file "$cert_path" \
-      --ecc \
-      --reloadcmd "systemctl restart $(get_hysteria_service_name)" || {
+    bash ~/.acme.sh/acme.sh --install-cert -d "${domain}"       --key-file "$key_path"       --fullchain-file "$cert_path"       --ecc       --reloadcmd "systemctl restart $(get_hysteria_service_name)" || {
       red "安装证书失败"
-      exit 1
+      return 1
     }
 
     if [[ -s "$cert_path" && -s "$key_path" ]]; then
@@ -865,18 +1046,28 @@ inst_cert() {
       cert_mode="official"
     else
       red "证书文件生成异常，请检查 acme.sh 输出"
-      exit 1
+      return 1
     fi
 
   elif [[ $certInput == 3 ]]; then
-    read -rp "请输入公钥文件 crt 的路径: " cert_path
-    read -rp "请输入密钥文件 key 的路径: " key_path
-    read -rp "请输入证书的域名: " domain
-    domain="$(normalize_host_input "$domain")"
-
-    [[ -z "$cert_path" || -z "$key_path" || -z "$domain" ]] && red "参数不完整" && exit 1
-    is_valid_domain "$domain" || { red "域名格式无效：$domain"; exit 1; }
-    [[ ! -s "$cert_path" || ! -s "$key_path" ]] && red "证书/私钥文件不存在或为空" && exit 1
+    while true; do
+      read_confirmed cert_path "请输入公钥文件 crt 的路径: " "" || return 1
+      [[ -s "$cert_path" ]] && break
+      red "公钥文件不存在或为空：$cert_path"
+    done
+    while true; do
+      read_confirmed key_path "请输入密钥文件 key 的路径: " "" || return 1
+      [[ -s "$key_path" ]] && break
+      red "密钥文件不存在或为空：$key_path"
+    done
+    while true; do
+      read_confirmed domain "请输入证书的域名: " "" || return 1
+      domain="$(normalize_host_input "$domain")"
+      if is_valid_domain "$domain"; then
+        break
+      fi
+      red "域名格式无效：$domain"
+    done
 
     hy_domain="$domain"
     tls_insecure="false"
@@ -889,12 +1080,12 @@ inst_cert() {
 
     openssl ecparam -genkey -name prime256v1 -out "$key_path" || {
       red "生成私钥失败"
-      exit 1
+      return 1
     }
 
     openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com" || {
       red "生成证书失败"
-      exit 1
+      return 1
     }
 
     hy_domain="www.bing.com"
@@ -911,23 +1102,28 @@ inst_cert() {
 # 端口与跳跃端口设置
 # -----------------------------
 
+# -----------------------------
+# 函数：配置端口跳跃
+# -----------------------------
 inst_jump() {
   green "Hysteria 2 端口使用模式如下："
   echo ""
   echo -e " ${GREEN}1.${PLAIN} 单端口"
   echo -e " ${GREEN}2.${PLAIN} 端口跳跃${YELLOW}（默认）${PLAIN}"
   echo ""
-  read -rp "请输入选项 [1-2]: " jumpInput
-  [[ -z "$jumpInput" ]] && jumpInput=2
+
+  while true; do
+    read_confirmed jumpInput "请输入选项 [1-2]（回车默认 2）: " "2" || return 1
+    [[ "$jumpInput" =~ ^[1-2]$ ]] && break
+    red "选项无效，请输入 1 或 2。"
+  done
 
   if [[ $jumpInput == 2 ]]; then
-    read -rp "设置范围端口的起始端口（建议 10000-65535 之间）: " firstport
-    read -rp "设置范围端口的末尾端口（必须大于起始端口）: " endport
-
-    while [[ -z "$firstport" || -z "$endport" || "$firstport" -ge "$endport" ]]; do
-      red "范围无效：起始端口必须小于末尾端口"
-      read -rp "起始端口: " firstport
-      read -rp "末尾端口: " endport
+    while true; do
+      read_confirmed firstport "设置范围端口的起始端口（建议 10000-65535 之间）: " "" || return 1
+      read_confirmed endport "设置范围端口的末尾端口（必须大于起始端口）: " "" || return 1
+      validate_port_range "$firstport" "$endport" && break
+      red "范围无效：端口必须为 1-65535，且起始端口必须小于末尾端口"
     done
 
     apply_hy2_firewall_rules "$port" "$firstport" "$endport"
@@ -942,18 +1138,19 @@ inst_jump() {
   fi
 }
 
-
 # -----------------------------
 # 监听端口设置
 # -----------------------------
 
+# -----------------------------
+# 函数：配置监听端口
+# -----------------------------
 inst_port() {
   clear_hy2_jump_rules
   clear_hy2_input_rules
 
   while true; do
-    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " port
-    [[ -z $port ]] && port=443
+    read_confirmed port "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " "443" || return 1
 
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
     ((port >= 1 && port <= 65535)) || { red "端口必须在 1-65535 之间"; continue; }
@@ -970,23 +1167,20 @@ inst_port() {
   inst_jump
 }
 
-
 # -----------------------------
-# 设置连接密码
+# 函数：配置连接密码
 # -----------------------------
 inst_pwd() {
-  read -rp "设置 Hysteria 2 密码（回车随机）: " auth_pwd
-  [[ -z $auth_pwd ]] && auth_pwd=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
+  read_confirmed_password auth_pwd "设置 Hysteria 2 密码（回车随机）: " || return 1
   yellow "密码：$auth_pwd"
 }
 
 # -----------------------------
-# 设置伪装站点
+# 函数：配置伪装站点
 # -----------------------------
 inst_site() {
   while true; do
-    read -rp "请输入伪装网站地址（去除 https://） [回车默认：video.unext.jp]: " proxysite
-    [[ -z $proxysite ]] && proxysite="video.unext.jp"
+    read_confirmed proxysite "请输入伪装网站地址（去除 https://） [回车默认：video.unext.jp]: " "video.unext.jp" || return 1
     proxysite="$(normalize_host_input "$proxysite")"
     if is_valid_domain "$proxysite"; then
       yellow "伪装站点：$proxysite"
@@ -995,10 +1189,14 @@ inst_site() {
     red "伪装网站域名格式无效：$proxysite"
   done
 }
+
 # -----------------------------
 # 安装防火墙持久化组件
 # -----------------------------
 
+# -----------------------------
+# 函数：安装防火墙持久化组件
+# -----------------------------
 install_firewall_persistent() {
   green "安装防火墙持久化组件"
 
@@ -1067,7 +1265,7 @@ install_firewall_persistent() {
 }
 
 # -----------------------------
-# 安装环境依赖
+# 函数：安装 Hy2 环境依赖
 # -----------------------------
 install_hy_environment() {
   green "开始安装环境依赖"
@@ -1221,7 +1419,7 @@ install_hy_environment() {
   return 0
 }
 # -----------------------------
-# 安装 Hysteria 内核
+# 函数：安装 Hysteria 内核
 # -----------------------------
 install_hy_core() {
   green "开始安装 Hysteria 2 内核"
@@ -1244,6 +1442,9 @@ install_hy_core() {
 # 安装 Hysteria 2
 # -----------------------------
 
+# -----------------------------
+# 函数：安装并初始化 Hysteria 2
+# -----------------------------
 insthysteria() {
   green "开始安装 Hysteria 2"
 
@@ -1417,7 +1618,7 @@ EOF
   green "1) 普通浏览器访问: https://$hy_domain"
   green "2) 查看日志: journalctl -u $hy_service -f"
 
-  read -rp "回车返回菜单..." _
+  read -erp "回车返回菜单..." _
 }
 
 
@@ -1425,6 +1626,9 @@ EOF
 # 卸载 / 启动 / 停止
 # -----------------------------
 
+# -----------------------------
+# 函数：卸载 Hysteria 2
+# -----------------------------
 unsthysteria() {
   local keep_cert="false"
 
@@ -1442,7 +1646,7 @@ unsthysteria() {
   rm -f /lib/systemd/system/hysteria-server.service /lib/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /etc/systemd/system/hysteria-server.service /etc/systemd/system/hysteria-server@.service >/dev/null 2>&1 || true
   rm -f /lib/systemd/system/hysteria.service /etc/systemd/system/hysteria.service >/dev/null 2>&1 || true
-  rm -f "$HY2_BOOT_FIX_SERVICE" "$HY2_FIREWALL_RESTORE_BIN" "$HY2_STATE_FILE" "$HY2_CERT_WEEKLY_CRON" "$HY2_CORE_MONTHLY_CRON" >/dev/null 2>&1 || true
+  rm -f "$HY2_BOOT_FIX_SERVICE" "$HY2_FIREWALL_RESTORE_BIN" "$HY2_STATE_FILE" "$HY2_CERT_WEEKLY_CRON" "$HY2_CORE_WEEKLY_CRON" >/dev/null 2>&1 || true
   rm -f /usr/local/bin/hysteria /usr/bin/hysteria "$HY2_CERT_RENEW_BIN" "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1 || true
   rm -rf /root/hy /root/hysteria.sh /var/lib/hysteria >/dev/null 2>&1 || true
 
@@ -1460,11 +1664,14 @@ unsthysteria() {
     green "Hysteria 2 已彻底卸载完成。"
   fi
 
-  read -rp "回车返回菜单..." _
+  read -erp "回车返回菜单..." _
 }
 
 
 
+# -----------------------------
+# 函数：启动 Hysteria 2
+# -----------------------------
 starthysteria() {
   local hy_service current_port current_first current_end
   hy_service=$(get_hysteria_service_name)
@@ -1482,6 +1689,9 @@ starthysteria() {
 
 
 
+# -----------------------------
+# 函数：停止 Hysteria 2
+# -----------------------------
 stophysteria() {
   local hy_service
   hy_service=$(get_hysteria_service_name)
@@ -1489,54 +1699,68 @@ stophysteria() {
 }
 
 
-hysteriaswitch() {
-  yellow "请选择需要的操作："
-  echo ""
-  echo -e " ${GREEN}1.${PLAIN} 启动 Hysteria 2"
-  echo -e " ${GREEN}2.${PLAIN} 关闭 Hysteria 2"
-  echo -e " ${GREEN}3.${PLAIN} 重启 Hysteria 2"
-  echo ""
-  read -rp "请输入选项 [0-3]: " switchInput
-
-  case $switchInput in
-    1) starthysteria ;;
-    2) stophysteria ;;
-    3) stophysteria && starthysteria ;;
-    *) return 1 ;;
-  esac
-
-  read -rp "回车返回菜单..." _
-}
-
 # -----------------------------
-# 查看运行状态 / 显示配置
+# 函数：重启 Hysteria 2
+# -----------------------------
+restarthy2() {
+  local hy_service current_port current_first current_end
+  hy_service=$(get_hysteria_service_name)
+
+  load_hy2_state >/dev/null 2>&1 || true
+  current_port="${HY2_PORT:-$(get_hy2_listen_port /etc/hysteria/config.yaml)}"
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
+
+  if [[ -z "$current_port" ]]; then
+    red "无法读取 Hysteria 2 监听端口，请检查 /etc/hysteria/config.yaml"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  apply_hy2_firewall_rules "$current_port" "$current_first" "$current_end" >/dev/null 2>&1 || true
+  save_firewall_rules
+  systemctl restart "$hy_service"
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
+
+  if systemctl is-active --quiet "$hy_service"; then
+    green "Hysteria 2 已重启成功"
+  else
+    red "Hysteria 2 重启失败，请查看日志：journalctl -u $hy_service -n 50 --no-pager"
+  fi
+
+  read -erp "回车返回菜单..." _
+}
+# -----------------------------
+# 函数：查看协议运行状态
 # -----------------------------
 showstatus() {
-  systemctl status hysteria-server.service --no-pager -l
-  read -rp "回车返回菜单..." _
+  local hy_service
+  hy_service=$(get_hysteria_service_name)
+  systemctl status "$hy_service" --no-pager -l
+  read -erp "回车返回菜单..." _
 }
 
+# -----------------------------
+# 函数：打印协议链接与二维码
+# -----------------------------
 showconf() {
   local hy2_link
-
-  yellow "服务端配置 /etc/hysteria/config.yaml："
-  green "$(cat /etc/hysteria/config.yaml 2>/dev/null)"
-  yellow "客户端配置 /root/hy/hy-client.yaml："
-  green "$(cat /root/hy/hy-client.yaml 2>/dev/null)"
-
   hy2_link=$(generate_hy2_link) || hy2_link=""
   yellow "分享链接（动态生成）："
   green "$hy2_link"
   yellow "二维码："
   [[ -n "$hy2_link" ]] && qrencode -o - -t ANSIUTF8 "$hy2_link" || true
 
-  read -rp "回车返回菜单..." _
+  read -erp "回车返回菜单..." _
 }
 
 # -----------------------------
 # 修改 Hysteria 配置
 # -----------------------------
 
+# -----------------------------
+# 函数：修改监听端口
+# -----------------------------
 changeport() {
   local oldport newport current_domain current_cert_mode current_first current_end hy_service
   oldport=$(get_hy2_listen_port /etc/hysteria/config.yaml)
@@ -1544,8 +1768,7 @@ changeport() {
   [[ -z "$oldport" ]] && oldport="${HY2_PORT:-443}"
 
   while true; do
-    read -rp "设置 Hysteria 2 监听端口 [1-65535]（回车保持当前：$oldport）: " newport
-    [[ -z "$newport" ]] && newport="$oldport"
+    read_confirmed newport "设置 Hysteria 2 监听端口 [1-65535]（回车保持当前：$oldport）: " "$oldport" || return 1
 
     [[ "$newport" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
     ((newport >= 1 && newport <= 65535)) || { red "端口必须在 1-65535 之间"; continue; }
@@ -1561,7 +1784,8 @@ changeport() {
   set_hy2_listen_port "$newport" /etc/hysteria/config.yaml || { red "写入服务端监听端口失败"; return 1; }
   set_hy2_client_server_port "$newport" /root/hy/hy-client.yaml || { red "写入客户端 server 端口失败"; return 1; }
 
-  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '
+')
   current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
   load_hy2_state >/dev/null 2>&1 || true
   current_first="${HY2_FIRST_PORT:-}"
@@ -1580,8 +1804,11 @@ changeport() {
   showconf
 }
 
+# -----------------------------
+# 函数：修改跳跃端口
+# -----------------------------
 changejump() {
-  local current_port current_first current_end first end current_domain current_cert_mode hy_service
+  local current_port current_first current_end first end current_domain current_cert_mode hy_service close_jump
   load_hy2_state >/dev/null 2>&1 || true
   current_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
   [[ -z "$current_port" ]] && current_port="${HY2_PORT:-443}"
@@ -1594,22 +1821,30 @@ changejump() {
     yellow "当前为单端口模式，未启用跳变端口"
   fi
 
-  read -rp "设置跳变端口起始端口（回车关闭跳变端口）: " first
-  read -rp "设置跳变端口结束端口（回车关闭跳变端口）: " end
+  while true; do
+    read_confirmed close_jump "是否关闭跳变端口？[y/N]（回车默认 N）: " "N" || return 1
+    case "$close_jump" in
+      y|Y)
+        first=""
+        end=""
+        yellow "已选择关闭跳变端口，仅保留监听端口：$current_port"
+        break
+        ;;
+      n|N)
+        while true; do
+          read_confirmed first "设置跳变端口起始端口: " "${current_first:-}" || return 1
+          read_confirmed end "设置跳变端口结束端口: " "${current_end:-}" || return 1
+          validate_port_range "$first" "$end" && break
+          red "范围无效：端口必须为 1-65535，且起始端口必须小于结束端口"
+        done
+        break
+        ;;
+      *) red "请输入 y 或 n。" ;;
+    esac
+  done
 
-  if [[ -z "$first" && -z "$end" ]]; then
-    first=""
-    end=""
-    yellow "已选择关闭跳变端口，仅保留监听端口：$current_port"
-  else
-    while ! validate_port_range "$first" "$end"; do
-      red "范围无效：端口必须为 1-65535，且起始端口必须小于结束端口"
-      read -rp "起始端口: " first
-      read -rp "结束端口: " end
-    done
-  fi
-
-  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '
+')
   current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
 
   apply_hy2_firewall_rules "$current_port" "$first" "$end"
@@ -1629,6 +1864,9 @@ changejump() {
   showconf
 }
 
+# -----------------------------
+# 函数：修改连接密码
+# -----------------------------
 changepasswd() {
   local config_file="/etc/hysteria/config.yaml"
   local client_file="/root/hy/hy-client.yaml"
@@ -1643,8 +1881,7 @@ changepasswd() {
   [[ -n "$oldpasswd" ]] || { red "无法提取旧密码，请检查 $config_file"; return 1; }
 
   local passwd
-  read -rp "设置 Hysteria 2 密码（回车随机）: " passwd
-  passwd=${passwd:-$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)}
+  read_confirmed_password passwd "设置 Hysteria 2 密码（回车随机）: " || return 1
 
   sed -i "/auth:/,/password:/s/^ *password: .*/  password: $passwd/" "$config_file"
   grep -q "password: $passwd" "$config_file" || { red "写入服务端密码失败"; return 1; }
@@ -1655,17 +1892,21 @@ changepasswd() {
     echo "auth: $passwd" >> "$client_file"
   fi
 
-
   fix_hysteria_file_perms
   save_firewall_rules
-  systemctl restart hysteria-server.service || { red "服务重启失败"; return 1; }
+  local hy_service
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" || { red "服务重启失败"; return 1; }
 
   green "密码已修改并生效"
   showconf
 }
 
+# -----------------------------
+# 函数：修改证书类型或路径
+# -----------------------------
 change_cert() {
-  local old_cert old_key old_host current_port current_first current_end current_cert_mode hy_service
+  local old_cert old_key old_host current_port current_first current_end current_cert_mode hy_service old_cert_esc old_key_esc cert_path_esc key_path_esc
   load_hy2_state >/dev/null 2>&1 || true
   old_cert=$(grep -E '^\s*cert:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
   old_key=$(grep -E '^\s*key:' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}')
@@ -1677,8 +1918,12 @@ change_cert() {
 
   inst_cert
 
-  [[ -n "$old_cert" ]] && sed -i "s!$old_cert!$cert_path!g" /etc/hysteria/config.yaml
-  [[ -n "$old_key"  ]] && sed -i "s!$old_key!$key_path!g" /etc/hysteria/config.yaml
+  old_cert_esc=$(sed_escape_bang "$old_cert")
+  old_key_esc=$(sed_escape_bang "$old_key")
+  cert_path_esc=$(sed_escape_bang "$cert_path")
+  key_path_esc=$(sed_escape_bang "$key_path")
+  [[ -n "$old_cert" ]] && sed -i "s!$old_cert_esc!$cert_path_esc!g" /etc/hysteria/config.yaml
+  [[ -n "$old_key"  ]] && sed -i "s!$old_key_esc!$key_path_esc!g" /etc/hysteria/config.yaml
 
   # 证书变更只更新 TLS/SNI，不擅自改 server host，避免把连接地址改成证书域名。
   if [[ -n "$old_host" ]]; then
@@ -1708,6 +1953,9 @@ change_cert() {
   showconf
 }
 
+# -----------------------------
+# 函数：修改伪装站点
+# -----------------------------
 changeproxysite() {
   local oldproxysite current_port current_domain current_cert_mode hy_service
   load_hy2_state >/dev/null 2>&1 || true
@@ -1735,6 +1983,9 @@ changeproxysite() {
   showconf
 }
 
+# -----------------------------
+# 函数：显示协议配置修改菜单
+# -----------------------------
 menu_hy_conf() {
   while true; do
     clear
@@ -1747,7 +1998,7 @@ menu_hy_conf() {
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo ""
-    read -rp "请选择 [0-5]: " confAnswer
+    read -erp "请选择 [0-5]: " confAnswer
 
     case $confAnswer in
       1) changeport ;;
@@ -1762,7 +2013,7 @@ menu_hy_conf() {
 }
 
 # -----------------------------
-# 核心更新 / 工具功能
+# 函数：查找 Hysteria 可执行文件
 # -----------------------------
 get_hysteria_bin() {
   if [[ -x /usr/local/bin/hysteria ]]; then
@@ -1776,6 +2027,9 @@ get_hysteria_bin() {
   fi
 }
 
+# -----------------------------
+# 函数：读取当前内核版本
+# -----------------------------
 get_hysteria_current_version() {
   local bin out ver
   bin=$(get_hysteria_bin 2>/dev/null) || return 1
@@ -1786,6 +2040,9 @@ get_hysteria_current_version() {
   echo "$ver"
 }
 
+# -----------------------------
+# 函数：规范化内核版本号
+# -----------------------------
 normalize_hysteria_version() {
   local raw="$1" ver
   ver=$(echo "$raw" | grep -Eo 'v?[0-9]+(\.[0-9]+)+' | head -n1)
@@ -1794,6 +2051,9 @@ normalize_hysteria_version() {
   echo "$ver"
 }
 
+# -----------------------------
+# 函数：获取最新内核版本
+# -----------------------------
 get_hysteria_latest_version() {
   local latest
   latest=$(curl -fsSL --connect-timeout 10 --max-time 20 \
@@ -1810,6 +2070,9 @@ get_hysteria_latest_version() {
   normalize_hysteria_version "$latest"
 }
 
+# -----------------------------
+# 函数：比较版本大小
+# -----------------------------
 version_lt() {
   local a b lowest
   a="${1#v}"
@@ -1819,6 +2082,9 @@ version_lt() {
   [[ "$lowest" == "$a" ]]
 }
 
+# -----------------------------
+# 函数：安装内核自动检测更新任务
+# -----------------------------
 install_hy2_core_update_job() {
   mkdir -p /usr/local/bin /etc/cron.d >/dev/null 2>&1 || true
 
@@ -1828,10 +2094,16 @@ set -euo pipefail
 
 LOG_FILE="/var/log/hysteria-core-update.log"
 
+# -----------------------------
+# 函数：写入更新日志
+# -----------------------------
 log() {
   echo "[$(date '+%F %T')] $*" | tee -a "$LOG_FILE"
 }
 
+# -----------------------------
+# 函数：更新脚本内获取服务名
+# -----------------------------
 get_service_name() {
   if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
     echo "hysteria-server"
@@ -1842,6 +2114,9 @@ get_service_name() {
   fi
 }
 
+# -----------------------------
+# 函数：查找 Hysteria 可执行文件
+# -----------------------------
 get_hysteria_bin() {
   if [[ -x /usr/local/bin/hysteria ]]; then
     echo "/usr/local/bin/hysteria"
@@ -1854,6 +2129,9 @@ get_hysteria_bin() {
   fi
 }
 
+# -----------------------------
+# 函数：更新脚本内读取当前版本
+# -----------------------------
 get_current_version() {
   local bin out ver
   bin=$(get_hysteria_bin 2>/dev/null) || return 1
@@ -1864,6 +2142,9 @@ get_current_version() {
   echo "$ver"
 }
 
+# -----------------------------
+# 函数：更新脚本内规范化版本号
+# -----------------------------
 normalize_version() {
   local raw="$1" ver
   ver=$(echo "$raw" | grep -Eo 'v?[0-9]+(\.[0-9]+)+' | head -n1)
@@ -1872,6 +2153,9 @@ normalize_version() {
   echo "$ver"
 }
 
+# -----------------------------
+# 函数：更新脚本内获取最新版本
+# -----------------------------
 get_latest_version() {
   local latest
   latest=$(curl -fsSL --connect-timeout 10 --max-time 20 \
@@ -1888,6 +2172,9 @@ get_latest_version() {
   normalize_version "$latest"
 }
 
+# -----------------------------
+# 函数：比较版本大小
+# -----------------------------
 version_lt() {
   local a b lowest
   a="${1#v}"
@@ -1948,18 +2235,21 @@ EOF
 
   chmod 700 "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1 || true
 
-  cat > "$HY2_CORE_MONTHLY_CRON" <<EOF
+  cat > "$HY2_CORE_WEEKLY_CRON" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# 每月 1 号 04:20 自动检测 Hysteria 内核版本，只有发现新版才更新。
-20 4 1 * * root "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1
+# 每周日 04:20 自动检测 Hysteria 内核版本，只有发现新版才更新。
+20 4 * * 0 root "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1
 EOF
-  chmod 644 "$HY2_CORE_MONTHLY_CRON" >/dev/null 2>&1 || true
+  chmod 644 "$HY2_CORE_WEEKLY_CRON" >/dev/null 2>&1 || true
 
-  green "已安装每月 1 号内核检测更新任务：$HY2_CORE_MONTHLY_CRON"
+  green "已安装每周一次内核检测更新任务：$HY2_CORE_WEEKLY_CRON"
   yellow "日志文件：$HY2_CORE_UPDATE_LOG"
 }
 
+# -----------------------------
+# 函数：手动检测并更新内核
+# -----------------------------
 update_core() {
   local current latest hy_service backup bin new_version
 
@@ -1970,7 +2260,7 @@ update_core() {
   yellow "当前安装版本：$current"
   if [[ -z "$latest" ]]; then
     red "获取最新版本失败，请检查网络或 GitHub 访问。"
-    read -rp "回车返回菜单..." _
+    read -erp "回车返回菜单..." _
     return 1
   fi
   yellow "GitHub 最新版本：$latest"
@@ -1979,7 +2269,7 @@ update_core() {
 
   if [[ "$current" != "未安装" ]] && ! version_lt "$current" "$latest"; then
     green "当前已是最新版本，无需更新。"
-    read -rp "回车返回菜单..." _
+    read -erp "回车返回菜单..." _
     return 0
   fi
 
@@ -2000,7 +2290,7 @@ update_core() {
     if systemctl is-active --quiet "$hy_service"; then
       new_version=$(get_hysteria_current_version 2>/dev/null || echo "$latest")
       green "Hysteria 内核已更新并重启：$current -> $new_version"
-      read -rp "回车返回菜单..." _
+      read -erp "回车返回菜单..." _
       return 0
     fi
 
@@ -2015,33 +2305,45 @@ update_core() {
   fi
   systemctl restart "$hy_service" >/dev/null 2>&1 || true
   red "更新失败，已尝试恢复旧内核。请检查：journalctl -u $hy_service -n 50 --no-pager"
-  read -rp "回车返回菜单..." _
+  read -erp "回车返回菜单..." _
   return 1
 }
 # -----------------------------
-# 回程路由与 IP 质量检测
+# 函数：执行回程路由测试
 # -----------------------------
 besttrace() {
-  wget -qO- git.io/besttrace | bash
-  read -rp "回车返回菜单..." _
-}
-
-ipquality() {
-  curl -sL https://Check.Place | bash -s - -I
-  read -rp "回车返回菜单..." _
+  local tmp="/tmp/besttrace.sh"
+  download_with_retry "https://git.io/besttrace" "$tmp" || { red "下载 besttrace 失败"; read -erp "回车返回菜单..." _; return 1; }
+  [[ -s "$tmp" ]] || { red "besttrace 脚本为空"; read -erp "回车返回菜单..." _; return 1; }
+  bash "$tmp"
+  rm -f "$tmp" >/dev/null 2>&1 || true
+  read -erp "回车返回菜单..." _
 }
 
 # -----------------------------
-# 系统信息总览
+# 函数：执行 IP 质量检测
+# -----------------------------
+ipquality() {
+  local tmp="/tmp/check_place.sh"
+  download_with_retry "https://Check.Place" "$tmp" || { red "下载 IP 质量检测脚本失败"; read -erp "回车返回菜单..." _; return 1; }
+  [[ -s "$tmp" ]] || { red "IP 质量检测脚本为空"; read -erp "回车返回菜单..." _; return 1; }
+  bash "$tmp" -I
+  rm -f "$tmp" >/dev/null 2>&1 || true
+  read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
+# 函数：显示系统信息总览
 # -----------------------------
 linux_ps() {
   clear
 
-  local cpu_info cpu_arch hostname kernel_version os_info current_time timezone
+  local cpu_info cpu_arch hostname kernel_version hy2_core_version os_info current_time timezone
   cpu_info=$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')
   cpu_arch=$(uname -m)
   hostname=$(uname -n)
   kernel_version=$(uname -r)
+  hy2_core_version=$(get_hysteria_current_version 2>/dev/null || echo "未安装")
   os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d '=' -f2 | tr -d '"')
   timezone=$(timedatectl 2>/dev/null | awk -F': ' '/Time zone/ {print $2}' | awk '{print $1}')
   [[ -z "$timezone" ]] && timezone="unknown"
@@ -2155,7 +2457,8 @@ linux_ps() {
   echo -e "${tianlan}-------------"
   echo -e "${tianlan}主机名:       ${hui}$hostname"
   echo -e "${tianlan}系统版本:     ${hui}$os_info"
-  echo -e "${tianlan}Linux版本:    ${hui}$kernel_version"
+  echo -e "${tianlan}Linux内核版本: ${hui}$kernel_version"
+  echo -e "${tianlan}Hy2内核版本:   ${hui}$hy2_core_version"
   echo -e "${tianlan}-------------"
   echo -e "${tianlan}CPU架构:      ${hui}$cpu_arch"
   echo -e "${tianlan}CPU型号:      ${hui}$cpu_info"
@@ -2180,9 +2483,12 @@ linux_ps() {
   echo -e "${tianlan}-------------"
   echo -e "${tianlan}运行时长:     ${hui}$runtime"
   echo
-  read -rp "回车返回菜单..." _
+  read -erp "回车返回菜单..." _
 }
 
+# -----------------------------
+# 函数：执行系统更新
+# -----------------------------
 linux_update() {
   if command -v apt-get >/dev/null 2>&1; then
     wait_for_apt_lock || true
@@ -2198,23 +2504,23 @@ linux_update() {
     return 1
   fi
   green "系统更新完成"
-  read -rp "回车返回菜单..." _
+  read -erp "回车返回菜单..." _
 }
 
 # -----------------------------
-# 下载并执行 sys_conf.sh
+# 函数：下载并执行系统配置脚本
 # -----------------------------
 run_sys_conf() {
   local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_conf.sh"
   local tmp="/tmp/sys_conf.sh"
 
-  download_with_retry "$url" "$tmp" || { red "下载 sys_conf.sh 失败"; read -rp "回车返回..." _; return 1; }
-  [[ -s "$tmp" ]] || { red "sys_conf.sh 文件为空"; read -rp "回车返回..." _; return 1; }
+  download_with_retry "$url" "$tmp" || { red "下载 sys_conf.sh 失败"; read -erp "回车返回..." _; return 1; }
+  [[ -s "$tmp" ]] || { red "sys_conf.sh 文件为空"; read -erp "回车返回..." _; return 1; }
   bash "$tmp"
 }
 
 # -----------------------------
-# 主菜单
+# 函数：显示主菜单
 # -----------------------------
 menu() {
   while true; do
@@ -2226,25 +2532,25 @@ menu() {
     echo -e " ${GREEN}1.${GREEN} 安装 Hy2"
     echo -e " ${GREEN}2.${zi} 卸载 Hy2"
     echo " ---------------------------------------------------"
-    echo -e " ${GREEN}3.${tianlan} 关闭、开启、重启 Hy2"
+    echo -e " ${GREEN}3.${tianlan} 重启 Hy2"
     echo -e " ${GREEN}4.${tianlan} 修改协议配置"
     echo -e " ${GREEN}5.${tianlan} 修改系统配置"
-    echo -e " ${GREEN}6.${tianlan} 显示协议链接"
-    echo -e " ${GREEN}7.${tianlan} 运行状态"
-    echo -e " ${GREEN}8.${tianlan} 内核更新cron"
+    echo -e " ${GREEN}6.${tianlan} 打印协议链接"
+    echo -e " ${GREEN}7.${tianlan} 协议运行状态"
+    echo -e " ${GREEN}8.${tianlan} 内核更新 / 每周cron"
     echo -e " ${GREEN}9.${tianlan} 回程测试"
-    echo -e " ${GREEN}10.${tianlan} IP 质量检测"
+    echo -e " ${GREEN}10.${tianlan} IP质量检测"
     echo -e " ${GREEN}11.${tianlan} 系统查询"
     echo -e " ${GREEN}12.${tianlan} 系统更新"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
-    read -rp "请输入选项 [0-12]: " menuInput
+    read -erp "请输入选项 [0-12]: " menuInput
 
     case $menuInput in
       1) insthysteria ;;
       2) unsthysteria ;;
-      3) hysteriaswitch ;;
+      3) restarthy2 ;;
       4) menu_hy_conf ;;
       5) run_sys_conf ;;
       6) showconf ;;
