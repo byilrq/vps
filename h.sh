@@ -462,7 +462,7 @@ save_hy2_state() {
   [[ -n "$state_domain" ]] || state_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
   [[ -n "$state_cert_mode" ]] || state_cert_mode="unknown"
   state_service=$(get_hysteria_service_name)
-  state_masquerade=$(grep -E '^\s*url:\s*https://' /etc/hysteria/config.yaml 2>/dev/null | awk -F'https://' '{print $2}' | tr -d '\r')
+  state_masquerade=$(grep -E '^\s*url:\s*https?://' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
@@ -1179,11 +1179,39 @@ inst_pwd() {
 # 函数：配置伪装站点
 # -----------------------------
 inst_site() {
+  echo ""
+  green "Hysteria 2 伪装站点模式如下："
+  echo -e " ${GREEN}1.${PLAIN} 外部伪装站${YELLOW}（默认，例如 video.unext.jp）${PLAIN}"
+  echo -e " ${GREEN}2.${PLAIN} 本机 WoW 注册站${YELLOW}（http://127.0.0.1:8080，需要先安装 wow.py local_proxy 模式）${PLAIN}"
+  echo ""
+
   while true; do
-    read_confirmed proxysite "请输入伪装网站地址（去除 https://） [回车默认：video.unext.jp]: " "video.unext.jp" || return 1
+    read_confirmed siteInput "请选择伪装站模式 [1-2]（回车默认 1）: " "1" || return 1
+    [[ "$siteInput" =~ ^[1-2]$ ]] && break
+    red "选项无效，请输入 1 或 2。"
+  done
+
+  if [[ "$siteInput" == "2" ]]; then
+    read_confirmed local_wow_port "请输入本机 WoW 注册站端口（回车默认 8080）: " "8080" || return 1
+    if [[ ! "$local_wow_port" =~ ^[0-9]+$ ]]; then
+      red "端口必须是数字"
+      return 1
+    fi
+    proxysite="127.0.0.1:$local_wow_port"
+    masquerade_url="http://127.0.0.1:$local_wow_port"
+    masquerade_rewrite_host="false"
+    yellow "伪装站点：本机 WoW 注册站 $masquerade_url"
+    yellow "提示：请确认本机测试 curl -I http://127.0.0.1:$local_wow_port 可以返回 200/301/302。"
+    return 0
+  fi
+
+  while true; do
+    read_confirmed proxysite "请输入外部伪装网站地址（去除 https://） [回车默认：video.unext.jp]: " "video.unext.jp" || return 1
     proxysite="$(normalize_host_input "$proxysite")"
     if is_valid_domain "$proxysite"; then
-      yellow "伪装站点：$proxysite"
+      masquerade_url="https://$proxysite"
+      masquerade_rewrite_host="true"
+      yellow "伪装站点：$masquerade_url"
       return 0
     fi
     red "伪装网站域名格式无效：$proxysite"
@@ -1536,8 +1564,8 @@ speedTest: true
 masquerade:
   type: proxy
   proxy:
-    url: https://$proxysite
-    rewriteHost: true
+    url: ${masquerade_url:-https://$proxysite}
+    rewriteHost: ${masquerade_rewrite_host:-true}
   listenHTTPS: :443
 EOF
 
@@ -1957,17 +1985,34 @@ change_cert() {
 # 函数：修改伪装站点
 # -----------------------------
 changeproxysite() {
-  local oldproxysite current_port current_domain current_cert_mode hy_service
+  local current_port current_domain current_cert_mode hy_service target_url target_rewrite
   load_hy2_state >/dev/null 2>&1 || true
-  oldproxysite=$(grep -E '^\s*url:\s*https://' /etc/hysteria/config.yaml 2>/dev/null | awk -F'https://' '{print $2}')
 
-  inst_site
+  inst_site || return 1
+  target_url="${masquerade_url:-https://$proxysite}"
+  target_rewrite="${masquerade_rewrite_host:-true}"
 
-  if [[ -n "$oldproxysite" ]]; then
-    sed -i "s#https://$oldproxysite#https://$proxysite#g" /etc/hysteria/config.yaml
-  else
-    sed -i "s#url: https://.*#url: https://$proxysite#g" /etc/hysteria/config.yaml 2>/dev/null || true
-  fi
+  python3 - "$target_url" "$target_rewrite" <<'PYC'
+from pathlib import Path
+import sys
+p = Path('/etc/hysteria/config.yaml')
+s = p.read_text()
+url = sys.argv[1]
+rewrite = sys.argv[2]
+start = s.find('masquerade:')
+block = f"""masquerade:
+  type: proxy
+  proxy:
+    url: {url}
+    rewriteHost: {rewrite}
+  listenHTTPS: :443
+"""
+if start >= 0:
+    before = s[:start].rstrip() + '\n\n'
+else:
+    before = s.rstrip() + '\n\n'
+p.write_text(before + block)
+PYC
 
   current_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
   current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
@@ -1979,7 +2024,7 @@ changeproxysite() {
   systemctl restart "$hy_service" >/dev/null 2>&1 || true
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
-  green "伪装网站已修改为：$proxysite"
+  green "伪装网站已修改为：$target_url"
   showconf
 }
 
