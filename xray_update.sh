@@ -3,6 +3,11 @@ set -Eeuo pipefail
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 # -----------------------------
+#  日志文件路径
+# -----------------------------
+LOG_FILE="/var/log/xray_update.log"
+
+# -----------------------------
 #  输出函数
 # -----------------------------
 msg_ok()  { echo -e "\e[1;42m $1 \e[0m"; }
@@ -12,11 +17,28 @@ msg_warn(){ echo -e "\e[1;33m$1\e[0m"; }
 
 TMP_DIR=""
 NEED_RESTART_XUI="n"
+BACKUP_TIME=""
+UPDATE_SUCCESS="no"
+FINAL_MESSAGE=""
 
 cleanup() {
     [[ -n "${TMP_DIR:-}" && -d "${TMP_DIR:-}" ]] && rm -rf "$TMP_DIR" || true
+    # 在脚本退出前将最终结果写入日志文件
+    if [[ -n "$FINAL_MESSAGE" ]]; then
+        echo "$FINAL_MESSAGE" >> "$LOG_FILE" 2>/dev/null || true
+    fi
 }
 trap cleanup EXIT
+
+# -----------------------------
+#  记录更新结果到日志文件
+# -----------------------------
+record_result() {
+    local status="$1"   # SUCCESS / FAILED / SKIPPED / INFO
+    local message="$2"
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    FINAL_MESSAGE="[${timestamp}] ${status}: ${message}"
+}
 
 # -----------------------------
 #  CPU 架构识别：匹配 3x-ui 安装脚本命名
@@ -30,7 +52,7 @@ arch() {
         armv6*|armv6) echo "armv6" ;;
         armv5*|armv5) echo "armv5" ;;
         s390x) echo "s390x" ;;
-        *) msg_err "不支持的 CPU 架构: $(uname -m)"; exit 1 ;;
+        *) msg_err "不支持的 CPU 架构: $(uname -m)"; record_result "FAILED" "不支持的 CPU 架构: $(uname -m)"; exit 1 ;;
     esac
 }
 
@@ -45,7 +67,7 @@ xray_pkg_arch() {
         armv7) echo "arm32-v7a" ;;
         armv6|armv5) echo "arm32-v6a" ;;
         s390x) echo "s390x" ;;
-        *) msg_err "当前架构暂不支持自动更新"; exit 1 ;;
+        *) msg_err "当前架构暂不支持自动更新"; record_result "FAILED" "当前架构暂不支持自动更新"; exit 1 ;;
     esac
 }
 
@@ -69,15 +91,18 @@ ensure_tools() {
         apt-get update -y -q >/dev/null 2>&1 || true
         apt-get install -y "${need_pkgs[@]}" >/dev/null 2>&1 || {
             msg_err "依赖安装失败: ${need_pkgs[*]}"
+            record_result "FAILED" "依赖安装失败: ${need_pkgs[*]}"
             exit 1
         }
     elif command -v yum >/dev/null 2>&1; then
         yum install -y "${need_pkgs[@]}" >/dev/null 2>&1 || {
             msg_err "依赖安装失败: ${need_pkgs[*]}"
+            record_result "FAILED" "依赖安装失败: ${need_pkgs[*]}"
             exit 1
         }
     else
         msg_err "未检测到受支持的包管理器，无法安装依赖"
+        record_result "FAILED" "未检测到受支持的包管理器"
         exit 1
     fi
 }
@@ -112,6 +137,7 @@ detect_xray_paths() {
 
     [[ -d "$XRAY_DIR" ]] || {
         msg_err "未找到 x-ui 目录: $XRAY_DIR"
+        record_result "FAILED" "未找到 x-ui 目录: $XRAY_DIR"
         exit 1
     }
 
@@ -123,6 +149,7 @@ detect_xray_paths() {
         XRAY_TARGET="$XRAY_BIN_ARM"
     else
         msg_err "未找到 3x-ui 自带的 xray 可执行文件"
+        record_result "FAILED" "未找到 3x-ui 自带的 xray 可执行文件"
         exit 1
     fi
 }
@@ -215,6 +242,7 @@ start_related_services() {
     if [[ "$NEED_RESTART_XUI" == "y" ]]; then
         systemctl start x-ui >/dev/null 2>&1 || {
             msg_err "x-ui 启动失败，请检查备份并手动回滚"
+            record_result "FAILED" "x-ui 启动失败"
             exit 1
         }
     else
@@ -309,11 +337,13 @@ xray_update() {
 
     if [[ -z "$REMOTE_VER" ]]; then
         msg_err "获取远端 Xray-core 版本失败。请检查 GitHub API 访问或网络/DNS。"
+        record_result "FAILED" "获取远端版本失败"
         exit 1
     fi
 
     if [[ "$FORCE_UPDATE" != "y" ]] && ! need_update "$LOCAL_VER" "$REMOTE_VER"; then
         msg_ok "当前已是最高版本，无需更新"
+        record_result "SKIPPED" "当前版本 ${LOCAL_VER:-未知} 已是最新，无需更新"
         start_related_services
         return 0
     fi
@@ -327,16 +357,19 @@ xray_update() {
 
     download_file "$DOWNLOAD_URL" "$ZIP_FILE" || {
         msg_err "下载失败：${DOWNLOAD_URL}"
+        record_result "FAILED" "下载失败: ${DOWNLOAD_URL}"
         exit 1
     }
 
     unzip -oq "$ZIP_FILE" -d "$TMP_DIR" || {
         msg_err "解压失败"
+        record_result "FAILED" "解压失败"
         exit 1
     }
 
     [[ -f "${TMP_DIR}/xray" ]] || {
         msg_err "解压后未找到 xray 文件"
+        record_result "FAILED" "解压后未找到 xray 文件"
         exit 1
     }
 
@@ -354,6 +387,8 @@ xray_update() {
     echo "备份时间戳: ${BACKUP_TIME:-未知}"
     echo
     echo "建议在面板刷新页面后，再打开版本弹窗确认当前选中版本。"
+
+    record_result "SUCCESS" "从 ${LOCAL_VER:-未知} 更新到 ${REMOTE_VER}"
 }
 
 main() {
