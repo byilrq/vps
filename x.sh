@@ -814,23 +814,8 @@ install_panel() {
 
     cd /usr/local/
 
-    if [ $# == 0 ]; then
-        tag_version=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$tag_version" ]]; then
-            echo "尝试使用 IPv4 获取版本信息..."
-            tag_version=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-            if [[ ! -n "$tag_version" ]]; then
-                echo "获取 x-ui 版本失败，可能受到 GitHub API 限制，请稍后重试。"
-                exit 1
-            fi
-        fi
-        echo "已获取 x-ui 最新版本: ${tag_version}，开始安装..."
-        wget -N -O /usr/local/x-ui-linux-$(arch).tar.gz https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz
-        if [[ $? -ne 0 ]]; then
-            echo "下载 x-ui 失败，请确认服务器可以访问 GitHub。"
-            exit 1
-        fi
-    else
+    # 如果传入了参数（如安装特定版本），则走原逻辑
+    if [ $# -gt 0 ]; then
         tag_version=$1
         tag_version_numeric=${tag_version#v}
         min_version="2.3.5"
@@ -847,8 +832,61 @@ install_panel() {
             echo "下载 x-ui $1 失败，请检查版本是否存在。"
             exit 1
         fi
+    else
+        # 交互模式：获取最新版本，让用户选择
+        echo "正在获取 3x-ui 最新版本信息..."
+        tag_version_latest=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        if [[ ! -n "$tag_version_latest" ]]; then
+            echo "尝试使用 IPv4 获取版本信息..."
+            tag_version_latest=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+            if [[ ! -n "$tag_version_latest" ]]; then
+                echo "获取 x-ui 版本失败，可能受到 GitHub API 限制。将使用默认版本 v2.8.11 进行安装。"
+                tag_version_latest="v2.8.11"
+            fi
+        fi
+
+        echo "--------------------------------------------------------------"
+        echo "当前 3x-ui 最新版本为: ${tag_version_latest}"
+        echo "默认安装版本: v2.8.11"
+        echo "提示: 直接回车将安装 v2.8.11，输入 latest 则安装最新版 ${tag_version_latest}"
+        echo "或者输入其他具体版本号（例如 v2.8.11 或 2.8.11）进行安装"
+        read -rp "请选择: " version_input
+
+        # 处理用户输入
+        if [[ -z "$version_input" ]]; then
+            tag_version="v2.8.11"
+            echo "将安装默认版本: ${tag_version}"
+        elif [[ "$version_input" == "latest" ]]; then
+            tag_version="${tag_version_latest}"
+            echo "将安装最新版本: ${tag_version}"
+        else
+            # 确保版本号以 v 开头
+            if [[ "$version_input" =~ ^v[0-9] ]]; then
+                tag_version="$version_input"
+            else
+                tag_version="v${version_input}"
+            fi
+            echo "将安装指定版本: ${tag_version}"
+        fi
+
+        # 版本号有效性检查（最低版本要求）
+        tag_version_numeric=${tag_version#v}
+        min_version="2.3.5"
+        if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
+            echo "错误: 版本 ${tag_version} 低于最低要求 v2.3.5，安装终止。"
+            exit 1
+        fi
+
+        url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
+        echo "开始下载 x-ui ${tag_version} ..."
+        wget -N -O /usr/local/x-ui-linux-$(arch).tar.gz "${url}"
+        if [[ $? -ne 0 ]]; then
+            echo "下载 x-ui ${tag_version} 失败，请检查版本是否存在或网络连接。"
+            exit 1
+        fi
     fi
 
+    # 以下为公共安装步骤（下载 x-ui.sh、解压、配置等）
     wget -O /usr/bin/x-ui-temp https://raw.githubusercontent.com/MHSanaei/3x-ui/main/x-ui.sh
     if [[ $? -ne 0 ]]; then
         echo "下载 x-ui.sh 失败。"
