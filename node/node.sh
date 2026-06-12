@@ -38,7 +38,148 @@ ensure_runtime_files() {
     mkdir -p "$WORK_DIR"
     touch "$CRON_LOG" "$BOOT_LOG" "$WEB_LOG"
 }
+# ==================== Let's Encrypt 证书处理 ====================
+get_public_ipv4() {
+    local ip=""
+    ip="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
+    if [ -z "$ip" ] && command -v curl >/dev/null 2>&1; then
+        ip="$(curl -4fsS --max-time 5 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
+    fi
+    echo "$ip"
+}
 
+find_cert_name_by_domain() {
+    local cert_domain="$1"
+    local d=""
+    if [ -f "/etc/letsencrypt/live/${cert_domain}/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/${cert_domain}/privkey.pem" ]; then
+        echo "$cert_domain"
+        return 0
+    fi
+    for d in /etc/letsencrypt/live/"${cert_domain}"*; do
+        [ -d "$d" ] || continue
+        if [ -f "$d/fullchain.pem" ] && [ -f "$d/privkey.pem" ]; then
+            basename "$d"
+            return 0
+        fi
+    done
+    return 1
+}
+
+get_cert_paths() {
+    local cert_domain="$1"
+    local cert_name=""
+    cert_name="$(find_cert_name_by_domain "$cert_domain" 2>/dev/null || true)"
+    [ -n "$cert_name" ] || return 1
+    [ -f "/etc/letsencrypt/live/${cert_name}/fullchain.pem" ] || return 1
+    [ -f "/etc/letsencrypt/live/${cert_name}/privkey.pem" ] || return 1
+    echo "${cert_name}|/etc/letsencrypt/live/${cert_name}/fullchain.pem|/etc/letsencrypt/live/${cert_name}/privkey.pem"
+}
+
+cert_files_exist() {
+    get_cert_paths "$1" >/dev/null 2>&1
+}
+
+cert_is_valid() {
+    local cert_domain="$1"
+    local cert_info="" cert_file=""
+    cert_info="$(get_cert_paths "$cert_domain" 2>/dev/null || true)"
+    [ -n "$cert_info" ] || return 1
+    cert_file="$(echo "$cert_info" | cut -d'|' -f2)"
+    [ -f "$cert_file" ] || return 1
+    openssl x509 -checkend 0 -noout -in "$cert_file" >/dev/null 2>&1 || return 1
+    if openssl x509 -in "$cert_file" -noout -text 2>/dev/null | grep -A1 "Subject Alternative Name" | grep -qw "DNS:${cert_domain}"; then
+        return 0
+    fi
+    openssl x509 -in "$cert_file" -noout -subject 2>/dev/null | grep -Eq "CN[[:space:]]*=[[:space:]]*${cert_domain}([,/]|$)"
+}
+
+cert_key_matches() {
+    local cert_domain="$1"
+    local cert_info="" cert_file="" key_file="" cert_pub="" key_pub=""
+    cert_info="$(get_cert_paths "$cert_domain" 2>/dev/null || true)"
+    [ -n "$cert_info" ] || return 1
+    cert_file="$(echo "$cert_info" | cut -d'|' -f2)"
+    key_file="$(echo "$cert_info" | cut -d'|' -f3)"
+    [ -f "$cert_file" ] && [ -f "$key_file" ] || return 1
+    cert_pub="$(openssl x509 -in "$cert_file" -pubkey -noout 2>/dev/null | openssl pkey -pubin -outform pem 2>/dev/null || true)"
+    key_pub="$(openssl pkey -in "$key_file" -pubout -outform pem 2>/dev/null || true)"
+    [ -n "$cert_pub" ] && [ -n "$key_pub" ] && [ "$cert_pub" = "$key_pub" ]
+}
+
+show_local_cert_info() {
+    local cert_domain="$1"
+    local cert_info="" cert_file=""
+    cert_info="$(get_cert_paths "$cert_domain" 2>/dev/null || true)"
+    cert_file="$(echo "$cert_info" | cut -d'|' -f2)"
+    if [ -f "$cert_file" ]; then
+        echo "域名: ${cert_domain}"
+        openssl x509 -noout -subject -issuer -dates -in "$cert_file" 2>/dev/null || true
+    fi
+}
+
+ensure_certbot_installed() {
+    if command -v certbot >/dev/null 2>&1; then
+        return 0
+    fi
+    echo "未检测到 certbot，正在安装..."
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y
+        apt-get install -y certbot
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y certbot
+    else
+        echo "❌ 未检测到 apt-get/yum，无法自动安装 certbot。"
+        return 1
+    fi
+}
+
+prepare_web_cert_for_domain() {
+    local cert_domain="$1"
+    local server_ip="" resolved_ip=""
+    echo "检查域名证书：${cert_domain}"
+
+    if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
+        echo "检测到有效 Let's Encrypt 证书，直接复用。"
+        show_local_cert_info "$cert_domain"
+        return 0
+    fi
+
+    echo "未找到可用正式证书，将自动申请 Let's Encrypt 证书。"
+    server_ip="$(get_public_ipv4)"
+    resolved_ip="$(getent ahostsv4 "$cert_domain" 2>/dev/null | awk 'NR==1{print $1}' || true)"
+    if [ -n "$server_ip" ] && [ -n "$resolved_ip" ] && [ "$server_ip" != "$resolved_ip" ]; then
+        echo "⚠️ 域名解析 IP 与本机公网 IP 可能不一致："
+        echo "   域名解析: $resolved_ip"
+        echo "   本机公网: $server_ip"
+        echo "   证书申请可能失败，请确认 DNS 已指向本机。"
+    fi
+
+    ensure_certbot_installed || return 1
+
+    # 临时停止占用 80 端口的服务
+    systemctl stop nginx 2>/dev/null || true
+    systemctl stop apache2 2>/dev/null || true
+    sleep 2
+
+    # 使用 standalone 方式申请证书（更可靠）
+    if ! certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain"; then
+        echo "❌ Let's Encrypt 证书申请失败。请检查域名解析、80端口、防火墙/安全组。"
+        # 恢复 nginx
+        systemctl start nginx 2>/dev/null || true
+        return 1
+    fi
+
+    systemctl start nginx 2>/dev/null || true
+
+    if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
+        echo "✅ Let's Encrypt 证书已就绪。"
+        show_local_cert_info "$cert_domain"
+        return 0
+    fi
+
+    echo "❌ 证书文件存在性/有效性/私钥匹配校验未通过。"
+    return 1
+}
 chmod_if_needed() {
     local file="$1"
     [ -f "$file" ] || return 0
@@ -484,6 +625,96 @@ test_notification() {
     run_py test
 }
 
+update_node_domain() {
+    echo -e "${BLUE}=============== 更新 Web 管理端域名 ===============${PLAIN}"
+
+    # 确保配置文件存在
+    ensure_runtime_files
+    read_config || true
+    init_default_vars
+
+    local current_domain="${WEB_DOMAIN:-}"
+    if [ -z "$current_domain" ]; then
+        echo "当前未配置域名（使用 HTTP）"
+    else
+        echo "当前域名: $current_domain"
+    fi
+
+    local new_domain=""
+    while [ -z "$new_domain" ]; do
+        read -rp "请输入新域名（留空则关闭 HTTPS 并回退到 HTTP）: " new_domain
+        new_domain="$(echo "$new_domain" | tr -d '[:space:]')"
+    done
+
+    if [ -n "$current_domain" ] && [ "$new_domain" = "$current_domain" ]; then
+        echo "新域名与当前域名相同，无需更新。"
+        return 0
+    fi
+
+    # 准备证书（如果输入了域名）
+    if [ -n "$new_domain" ]; then
+        echo "准备新域名的 SSL 证书..."
+        if ! prepare_web_cert_for_domain "$new_domain"; then
+            echo -e "${RED}❌ 新域名证书准备失败，已停止域名更新。${PLAIN}"
+            return 1
+        fi
+    fi
+
+    # 备份当前配置
+    local bak_suffix=".bak.$(date '+%Y%m%d_%H%M%S')"
+    cp -a "$CONFIG_FILE" "${CONFIG_FILE}${bak_suffix}"
+
+    # 更新配置中的 WEB_DOMAIN
+    sed -i "s/^WEB_DOMAIN=.*/WEB_DOMAIN=\"$new_domain\"/" "$CONFIG_FILE"
+    echo -e "${GREEN}✅ 已更新 $CONFIG_FILE 中的 WEB_DOMAIN 字段。${PLAIN}"
+
+    # 重启服务
+    echo "重启 node 服务以应用新域名..."
+    if have_systemd && systemctl is-active --quiet "$SERVICE_NAME"; then
+        restart_service
+    else
+        echo "停止旧进程..."
+        stop_running
+        echo "启动新服务..."
+        if have_systemd; then
+            install_service || return 1
+            systemctl start "$SERVICE_NAME"
+        else
+            # 无 systemd 则直接后台运行
+            nohup python3 "$PYTHON_SCRIPT" run-all >> "$WORK_DIR/node.log" 2>&1 &
+        fi
+    fi
+
+    sleep 2
+
+    # 检查 HTTPS 是否可访问（如果配置了域名）
+    if [ -n "$new_domain" ]; then
+        echo "测试 HTTPS 连接（端口 $DEFAULT_WEB_PORT）..."
+        if command -v curl >/dev/null 2>&1; then
+            if curl -ksS --max-time 5 "https://${new_domain}:${DEFAULT_WEB_PORT}/" >/dev/null 2>&1; then
+                echo -e "${GREEN}✅ HTTPS 服务已正常响应。${PLAIN}"
+            else
+                echo -e "${YELLOW}⚠️ HTTPS 服务未响应，请检查 node.py 日志和证书权限。${PLAIN}"
+                echo "   日志位置：$WORK_DIR/node_web.log"
+            fi
+        else
+            echo "未检测到 curl，请手动访问 https://${new_domain}:${DEFAULT_WEB_PORT}/ 验证。"
+        fi
+    else
+        echo -e "${GREEN}✅ 已关闭 HTTPS，回退到 HTTP 端口 $DEFAULT_WEB_PORT。${PLAIN}"
+    fi
+
+    echo "============================================="
+    echo -e "${GREEN}✅ Web 管理端域名已更新为：${new_domain:-未配置}${PLAIN}"
+    if [ -n "$new_domain" ]; then
+        echo "证书来源：/etc/letsencrypt/live/${new_domain}"
+        echo "访问地址：https://${new_domain}:${DEFAULT_WEB_PORT}/keywords"
+        echo "管理 PIN：${WEB_PIN}"
+    fi
+    echo "旧配置备份：${CONFIG_FILE}${bak_suffix}"
+    echo "============================================="
+}
+
 if [[ "${1:-}" == "-deps" ]]; then
     install_dependencies
     exit $?
@@ -531,6 +762,7 @@ main_menu() {
         echo -e "${GREEN}6.${PLAIN} 卸载服务"
         echo -e "${GREEN}7.${PLAIN} 重启服务"
         echo -e "${GREEN}8.${PLAIN} 推送测试消息"
+		echo -e "${GREEN}9.${PLAIN} 更新域名/HTTPS"   # 新增
         echo -e "${WHITE}0.${PLAIN} 退出"
         echo -e "${BLUE}======================================${PLAIN}"
         read -rp "请选择操作 [0-8]: " choice
@@ -544,6 +776,7 @@ main_menu() {
             6) uninstall_service ;;
             7) restart_service ;;
             8) test_notification ;;
+			9) update_node_domain ;;   # 新增
             0) exit 0 ;;
             *) echo "无效选项" ;;
         esac
