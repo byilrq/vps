@@ -1,5 +1,6 @@
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/h.sh && bash h.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/x.sh && bash x.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/ntfy.sh && bash ntfy.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/trafficcop/t.sh && bash t.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/node/node.sh && bash node.sh
 
