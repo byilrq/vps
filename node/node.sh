@@ -38,6 +38,65 @@ ensure_runtime_files() {
     mkdir -p "$WORK_DIR"
     touch "$CRON_LOG" "$BOOT_LOG" "$WEB_LOG"
 }
+
+# ==================== 防火墙配置 ====================
+setup_firewall() {
+    local port="$DEFAULT_WEB_PORT"
+    echo -e "${BLUE}正在配置防火墙，开放端口 $port ...${PLAIN}"
+
+    # 1. 检查 iptables 是否已有放行规则
+    if iptables -L INPUT -n | grep -q "dpt:${port}"; then
+        echo -e "${GREEN}✔ 端口 $port 已在 iptables 中放行${PLAIN}"
+    else
+        # 插入规则到 INPUT 链
+        iptables -I INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null || {
+            echo -e "${YELLOW}⚠️ iptables 插入失败，可能权限不足或未安装${PLAIN}"
+        }
+        echo -e "${GREEN}✔ iptables 规则已添加${PLAIN}"
+    fi
+
+    # 2. 检查是否存在自定义链（如 HY2_INPUT），如果有则同样放行
+    if iptables -L HY2_INPUT -n >/dev/null 2>&1; then
+        if ! iptables -L HY2_INPUT -n | grep -q "dpt:${port}"; then
+            iptables -I HY2_INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null
+            echo -e "${GREEN}✔ 已在 HY2_INPUT 链放行端口${PLAIN}"
+        fi
+    fi
+
+    # 3. 处理 ufw（如果存在且启用）
+    if command -v ufw >/dev/null 2>&1 && ufw status | grep -q "Status: active"; then
+        if ! ufw status | grep -q "$port/tcp"; then
+            ufw allow "$port/tcp" >/dev/null 2>&1
+            echo -e "${GREEN}✔ ufw 规则已添加${PLAIN}"
+        else
+            echo -e "${GREEN}✔ ufw 已有放行规则${PLAIN}"
+        fi
+    fi
+
+    # 4. 处理 firewalld（CentOS/RHEL）
+    if command -v firewall-cmd >/dev/null 2>&1 && systemctl is-active --quiet firewalld; then
+        if ! firewall-cmd --list-ports | grep -q "$port/tcp"; then
+            firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1
+            firewall-cmd --reload >/dev/null 2>&1
+            echo -e "${GREEN}✔ firewalld 规则已添加${PLAIN}"
+        else
+            echo -e "${GREEN}✔ firewalld 已有放行规则${PLAIN}"
+        fi
+    fi
+
+    # 5. 持久化 iptables 规则（Debian/Ubuntu）
+    if command -v netfilter-persistent >/dev/null 2>&1; then
+        netfilter-persistent save >/dev/null 2>&1
+        echo -e "${GREEN}✔ iptables 规则已持久化（netfilter-persistent）${PLAIN}"
+    elif command -v iptables-save >/dev/null 2>&1; then
+        mkdir -p /etc/iptables
+        iptables-save > /etc/iptables/rules.v4 2>/dev/null
+        echo -e "${GREEN}✔ iptables 规则已保存到 /etc/iptables/rules.v4${PLAIN}"
+    fi
+
+    echo -e "${GREEN}✅ 防火墙配置完成${PLAIN}"
+}
+
 # ==================== Let's Encrypt 证书处理 ====================
 get_public_ipv4() {
     local ip=""
@@ -416,6 +475,7 @@ deploy_from_github() {
     download_node_py || return 1
     ensure_config_exists
     cleanup_old_cron >/dev/null 2>&1 || true
+	setup_firewall          # <--- 新增这一行
     restart_service
 }
 
