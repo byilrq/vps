@@ -1262,7 +1262,9 @@ VALUES ('2','1','${ws_email}','0','0','0','0','0');
 EOF_SQL
 
         /usr/local/x-ui/x-ui setting -username "${config_username}" -password "${config_password}" -port "${panel_port}" -webBasePath "${panel_path}"
-        /usr/local/x-ui/x-ui cert -webCert "/root/cert/${domain}/fullchain.pem" -webCertKey "/root/cert/${domain}/privkey.pem"
+        /usr/local/x-ui/x-ui cert \
+			-webCert "/etc/letsencrypt/live/${domain}/fullchain.pem" \
+		-webCertKey "/etc/letsencrypt/live/${domain}/privkey.pem"
         x-ui start
         sleep 3
 
@@ -2095,19 +2097,19 @@ update_domain_sni() {
     echo "更新域名 / SNI"
     echo "----------------------------------------------------------------"
 
-    # 1. 从数据库读取当前域名 (reality 入站的 serverNames[0])
     local old_domain=""
     if command -v sqlite3 >/dev/null 2>&1 && [[ -f "$XUIDB" ]]; then
         old_domain=$(sqlite3 "$XUIDB" "
             SELECT json_extract(stream_settings, '\$.realitySettings.serverNames[0]')
             FROM inbounds
-            WHERE protocol='vless' AND json_extract(stream_settings, '\$.security')='reality'
+            WHERE protocol='vless'
+              AND json_extract(stream_settings, '\$.security')='reality'
             LIMIT 1;
         " 2>/dev/null | tr -d '\n')
     fi
 
     if [[ -z "$old_domain" ]]; then
-        msg_err "无法从数据库读取当前域名，请确认 x-ui 已安装且 reality 节点存在。"
+        msg_err "无法从数据库读取当前域名，请确认 x-ui 已安装且 Reality 节点存在。"
         pause
         return 1
     fi
@@ -2115,7 +2117,6 @@ update_domain_sni() {
     echo "当前域名/SNI: ${old_domain}"
     echo
 
-    # 2. 输入新域名
     local new_domain=""
     while [[ -z "$new_domain" ]]; do
         read -rp "请输入新域名 (如 example.com): " new_domain
@@ -2128,89 +2129,104 @@ update_domain_sni() {
         return 0
     fi
 
-    # 3. 可选：提示解析检测
     get_server_ips
+
     echo "当前服务器 IPv4: ${IP4}"
     echo "请确保新域名 ${new_domain} 已解析到本机 IP，否则证书申请可能失败。"
+
     read -rp "确认解析已完成？(y/N): " dns_ok
+
     if [[ ! "$dns_ok" =~ ^[Yy]$ ]]; then
         msg_err "用户取消操作。"
         pause
         return 0
     fi
 
-    # 4. 处理证书
     if ! prepare_cert_for_domain "$new_domain"; then
         msg_err "证书处理失败，域名更新中止。"
         pause
         return 1
     fi
 
-    # 获取新证书路径
     local cert_info cert_name cert_file key_file
+
     cert_info=$(get_cert_paths "$new_domain" 2>/dev/null || true)
+
     if [[ -z "$cert_info" ]]; then
         msg_err "无法定位新域名证书文件。"
         pause
         return 1
     fi
+
     cert_name=$(echo "$cert_info" | cut -d'|' -f1)
     cert_file=$(echo "$cert_info" | cut -d'|' -f2)
     key_file=$(echo "$cert_info" | cut -d'|' -f3)
 
-    # 创建新的证书软链接目录
     mkdir -p "/root/cert/${new_domain}"
+
     ln -sf "$cert_file" "/root/cert/${new_domain}/fullchain.pem"
     ln -sf "$key_file" "/root/cert/${new_domain}/privkey.pem"
 
-    # 5. 更新 nginx 配置
     echo "----------------------------------------------------------------"
     echo "更新 nginx 配置..."
+
     local nginx_conf="/etc/nginx/sites-available/${old_domain}"
     local nginx_conf_new="/etc/nginx/sites-available/${new_domain}"
     local nginx_enabled="/etc/nginx/sites-enabled"
 
     if [[ -f "$nginx_conf" ]]; then
-        # 复制旧配置为新域名配置，修改其中内容
+
         cp -a "$nginx_conf" "$nginx_conf_new"
+
         sed -i "s/server_name ${old_domain};/server_name ${new_domain};/g" "$nginx_conf_new"
+
         sed -i "s|ssl_certificate .*;|ssl_certificate ${cert_file};|g" "$nginx_conf_new"
+
         sed -i "s|ssl_certificate_key .*;|ssl_certificate_key ${key_file};|g" "$nginx_conf_new"
-        # 移除旧符号链接，添加新链接
+
         rm -f "$nginx_enabled/${old_domain}"
+
         ln -sf "$nginx_conf_new" "$nginx_enabled/${new_domain}"
+
     else
         msg_err "未找到 nginx 配置文件: ${nginx_conf}"
         pause
         return 1
     fi
 
-    # 更新 80.conf 中的 server_name
     local http_conf="/etc/nginx/sites-available/80.conf"
+
     if [[ -f "$http_conf" ]]; then
         sed -i "s/server_name ${old_domain};/server_name ${new_domain};/g" "$http_conf"
     fi
 
-    # 测试并重载 nginx
+    #
+    # 删除 ACME 临时配置
+    #
+    rm -f /etc/nginx/sites-enabled/acme-bootstrap.conf 2>/dev/null
+
     if ! nginx -t; then
         msg_err "nginx 配置测试失败，请检查配置文件。"
         pause
         return 1
     fi
+
     systemctl reload nginx || {
         msg_err "nginx 重载失败"
         pause
         return 1
     }
+
     msg_ok "nginx 配置更新完成"
 
-    # 6. 更新 x-ui 数据库
     echo "----------------------------------------------------------------"
     echo "更新 x-ui 数据库中的域名/SNI 字段..."
-    local backup_db="${XUIDB}.backup.$(date +%Y%m%d_%H%M%S)"
-    cp -a "$XUIDB" "$backup_db" && msg_inf "数据库已备份至 $backup_db"
 
-    # 更新 reality 入站的 serverNames 和 serverName
+    local backup_db="${XUIDB}.backup.$(date +%Y%m%d_%H%M%S)"
+
+    cp -a "$XUIDB" "$backup_db" \
+        && msg_inf "数据库已备份至 $backup_db"
+
     sqlite3 "$XUIDB" <<EOF
 UPDATE inbounds
 SET stream_settings = json_set(
@@ -2218,7 +2234,8 @@ SET stream_settings = json_set(
     '$.realitySettings.serverNames', json_array('${new_domain}'),
     '$.realitySettings.settings.serverName', '${new_domain}'
 )
-WHERE protocol='vless' AND json_extract(stream_settings, '\$.security')='reality';
+WHERE protocol='vless'
+  AND json_extract(stream_settings, '\$.security')='reality';
 
 UPDATE inbounds
 SET stream_settings = json_set(
@@ -2227,32 +2244,69 @@ SET stream_settings = json_set(
     '$.tlsSettings.certificates[0].certificateFile', '/root/cert/${new_domain}/fullchain.pem',
     '$.tlsSettings.certificates[0].keyFile', '/root/cert/${new_domain}/privkey.pem'
 )
-WHERE protocol='vless' AND json_extract(stream_settings, '\$.security')='tls';
+WHERE protocol='vless'
+  AND json_extract(stream_settings, '\$.security')='tls';
 EOF
 
-    # 更新 settings 表中的 webDomain
-    sqlite3 "$XUIDB" "UPDATE settings SET value='${new_domain}' WHERE key='webDomain';" 2>/dev/null || true
-    sqlite3 "$XUIDB" "UPDATE settings SET value='${new_domain}' WHERE key='subDomain';" 2>/dev/null || true
+    sqlite3 "$XUIDB" \
+        "UPDATE settings SET value='${new_domain}' WHERE key='webDomain';" \
+        2>/dev/null || true
 
-    # 更新 x-ui 面板使用的证书
-    /usr/local/x-ui/x-ui cert -webCert "/root/cert/${new_domain}/fullchain.pem" -webCertKey "/root/cert/${new_domain}/privkey.pem" >/dev/null 2>&1
+    sqlite3 "$XUIDB" \
+        "UPDATE settings SET value='${new_domain}' WHERE key='subDomain';" \
+        2>/dev/null || true
+
+    #
+    # 修复 webCertFile / webKeyFile
+    #
+    sqlite3 "$XUIDB" \
+        "UPDATE settings SET value='/root/cert/${new_domain}/fullchain.pem' WHERE key='webCertFile';" \
+        2>/dev/null || true
+
+    sqlite3 "$XUIDB" \
+        "UPDATE settings SET value='/root/cert/${new_domain}/privkey.pem' WHERE key='webKeyFile';" \
+        2>/dev/null || true
+
+    /usr/local/x-ui/x-ui cert \
+        -webCert "/root/cert/${new_domain}/fullchain.pem" \
+        -webCertKey "/root/cert/${new_domain}/privkey.pem" \
+        >/dev/null 2>&1
+
     msg_ok "数据库更新完成"
 
-    # 7. 重启 x-ui 服务
     systemctl restart x-ui
+
     sleep 2
+
     if systemctl is-active --quiet x-ui; then
         msg_ok "x-ui 服务已重启"
     else
         msg_err "x-ui 服务启动失败，请检查日志"
     fi
 
+    local panel_path
+
+    panel_path=$(sqlite3 "$XUIDB" \
+        "select value from settings where key='webBasePath';" \
+        2>/dev/null)
+
+    [[ -z "$panel_path" ]] && panel_path="/"
+
     echo "----------------------------------------------------------------"
     msg_ok "域名/SNI 更新成功！"
+
     echo "原域名: ${old_domain}"
     echo "新域名: ${new_domain}"
     echo "证书路径: ${cert_file}"
-    echo "请使用新域名访问面板: https://${new_domain}:${PANEL_PORT_FIXED}/... (面板路径不变)"
+
+    echo
+    echo "Reality SNI:"
+    echo "${new_domain}"
+
+    echo
+    echo "x-ui 面板地址:"
+    echo "https://${new_domain}:${PANEL_PORT_FIXED}${panel_path}"
+
     pause
 }
 
