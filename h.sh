@@ -2370,12 +2370,12 @@ EOF
   cat > "$HY2_CORE_WEEKLY_CRON" <<EOF
 SHELL=/bin/bash
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-# 每周日 04:20 自动检测 Hysteria 内核版本，只有发现新版才更新。
-20 4 * * 0 root "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1
+# 每月 1 日 02:00 自动检测 Hysteria 内核版本，只有发现新版才更新。
+0 2 1 * * root "$HY2_CORE_UPDATE_BIN" >/dev/null 2>&1
 EOF
   chmod 644 "$HY2_CORE_WEEKLY_CRON" >/dev/null 2>&1 || true
 
-  green "已安装每周一次内核检测更新任务：$HY2_CORE_WEEKLY_CRON"
+  green "已安装每月一次内核检测更新任务：$HY2_CORE_WEEKLY_CRON"
   yellow "日志文件：$HY2_CORE_UPDATE_LOG"
 }
 

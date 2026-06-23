@@ -86,6 +86,13 @@ clean_old_logs() {
   find /var/log -type f \( -name "*.log" -o -name "*.log.*" \) -exec truncate -s 0 {} \; >/dev/null 2>&1 || true
 }
 
+clean_backup_files() {
+  log "清理更新备份文件（xray、hysteria 更新时备份的 .bak.*）..."
+  find /usr/local/x-ui/bin -name "*.bak.*" -type f -delete 2>/dev/null || true
+  find /usr/local/bin -name "*.bak.*" -type f -delete 2>/dev/null || true
+  find /usr/bin -name "*.bak.*" -type f -delete 2>/dev/null || true
+}
+
 check_disk_usage() {
   local usage
   usage=$(df -h / 2>/dev/null | awk 'NR==2 {print $3 " / " $2 "  (used: " $5 ")"}')
@@ -106,6 +113,7 @@ main_cleanup() {
   clean_other_caches
   clean_user_cache
   clean_old_logs
+  clean_backup_files
   check_disk_usage
   limit_log_size
   log "系统清理完成。"
