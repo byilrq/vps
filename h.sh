@@ -331,32 +331,19 @@ cert_not_expiring_soon() {
 }
 
 # -----------------------------
-# 函数：复用本地正式证书
+# 函数：检查已有 Let's Encrypt 证书是否可用
 # -----------------------------
 existing_official_cert_usable() {
   local expect_domain="$1"
-  local cert_file="/etc/hysteria/cert.crt"
-  local key_file="/etc/hysteria/private.key"
-  local stored_domain=""
+  local cert_file="/etc/letsencrypt/live/${expect_domain}/fullchain.pem"
+  local key_file="/etc/letsencrypt/live/${expect_domain}/privkey.pem"
 
   [[ -s "$cert_file" && -s "$key_file" ]] || return 1
 
-  if [[ -f "$ACME_DOMAIN_LOG" ]]; then
-    stored_domain=$(tr -d '\r\n' < "$ACME_DOMAIN_LOG" 2>/dev/null)
-  fi
-  [[ -z "$stored_domain" ]] && stored_domain=$(get_cert_primary_domain "$cert_file" 2>/dev/null || true)
-
-  [[ -n "$stored_domain" ]] || return 1
-
-  if [[ -n "$expect_domain" && "$stored_domain" != "$expect_domain" ]]; then
-    cert_matches_domain "$cert_file" "$expect_domain" || return 1
-    stored_domain="$expect_domain"
-  fi
-
-  cert_matches_domain "$cert_file" "$stored_domain" || return 1
+  cert_matches_domain "$cert_file" "$expect_domain" || return 1
   cert_not_expiring_soon "$cert_file" 14 || return 1
 
-  echo "$stored_domain"
+  echo "$expect_domain"
   return 0
 }
 
@@ -648,60 +635,27 @@ generate_hy2_link() {
   echo "hysteria2://$auth_enc@$link_host:$port/?$query#H"
 }
 # -----------------------------
-# 函数：安装证书自动续签任务
+# 函数：安装证书自动续签任务（使用 certbot）
 # -----------------------------
 install_hy2_cert_renew_job() {
-  local cert_file="/etc/hysteria/cert.crt"
-  local key_file="/etc/hysteria/private.key"
+  # certbot 自带自动续签（systemd timer），无需额外 cron
+  # deploy hook: 续签后重启 hysteria 加载新证书
+  local hy_service
+  hy_service=$(get_hysteria_service_name)
 
-  cat > "$HY2_CERT_RENEW_BIN" <<EOF
+  mkdir -p /etc/letsencrypt/renewal-hooks/deploy >/dev/null 2>&1 || true
+  cat > "/etc/letsencrypt/renewal-hooks/deploy/hysteria-restart.sh" <<EOF
 #!/usr/bin/env bash
-set -euo pipefail
-
-CERT_FILE="$cert_file"
-KEY_FILE="$key_file"
-DOMAIN_LOG="$ACME_DOMAIN_LOG"
-ACME_BIN="/root/.acme.sh/acme.sh"
-
-[[ -x "\$ACME_BIN" ]] || exit 0
-[[ -s "\$CERT_FILE" && -s "\$KEY_FILE" && -f "\$DOMAIN_LOG" ]] || exit 0
-
-domain=\$(tr -d '\r\n' < "\$DOMAIN_LOG" 2>/dev/null || true)
-[[ -n "\$domain" ]] || exit 0
-
-if openssl x509 -checkend \$((7 * 24 * 3600)) -noout -in "\$CERT_FILE" >/dev/null 2>&1; then
-  exit 0
-fi
-
-service_name="hysteria-server"
-if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
-  service_name="hysteria-server"
-elif systemctl list-unit-files 2>/dev/null | grep -q '^hysteria\.service'; then
-  service_name="hysteria"
-fi
-
-"\$ACME_BIN" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-"\$ACME_BIN" --renew -d "\$domain" --ecc --force >/dev/null 2>&1
-"\$ACME_BIN" --install-cert -d "\$domain" \
-  --key-file "\$KEY_FILE" \
-  --fullchain-file "\$CERT_FILE" \
-  --ecc \
-  --reloadcmd "systemctl restart \$service_name" >/dev/null 2>&1
+systemctl restart ${hy_service} 2>/dev/null || true
 EOF
+  chmod 755 /etc/letsencrypt/renewal-hooks/deploy/hysteria-restart.sh 2>/dev/null || true
 
-  chmod 700 "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
-
-  cat > "$HY2_CERT_WEEKLY_CRON" <<EOF
-#!/usr/bin/env bash
-"$HY2_CERT_RENEW_BIN"
-EOF
-  chmod 755 "$HY2_CERT_WEEKLY_CRON" >/dev/null 2>&1 || true
-
+  # 移除老旧的 acme.sh 相关任务
+  rm -f "$HY2_CERT_RENEW_BIN" "$HY2_CERT_WEEKLY_CRON" >/dev/null 2>&1 || true
   if [[ -f /etc/crontab ]]; then
     sed -i '/acme\.sh --cron/d' /etc/crontab >/dev/null 2>&1 || true
     sed -i '/hysteria-cert-renew/d' /etc/crontab >/dev/null 2>&1 || true
   fi
-
   crontab -l 2>/dev/null | grep -v 'acme\.sh' | grep -v 'hysteria-cert-renew' | crontab - >/dev/null 2>&1 || true
   systemctl disable --now acme.timer >/dev/null 2>&1 || true
   systemctl disable --now acme-sh.timer >/dev/null 2>&1 || true
@@ -776,6 +730,20 @@ elif command -v service >/dev/null 2>&1; then
 fi
 
 systemctl restart "$service_name" >/dev/null 2>&1 || true
+
+# 若 cert.crt 是符号链接(旧安装残留)，拷贝一份确保 hysteria 用户可读
+if [[ -L /etc/hysteria/cert.crt ]]; then
+  cp -f /etc/hysteria/cert.crt /etc/hysteria/cert.crt.tmp 2>/dev/null && mv /etc/hysteria/cert.crt.tmp /etc/hysteria/cert.crt
+fi
+if [[ -L /etc/hysteria/private.key ]]; then
+  cp -f /etc/hysteria/private.key /etc/hysteria/private.key.tmp 2>/dev/null && mv /etc/hysteria/private.key.tmp /etc/hysteria/private.key
+fi
+if [[ -f /etc/hysteria/cert.crt ]]; then
+  chmod 644 /etc/hysteria/cert.crt 2>/dev/null || true
+fi
+if [[ -f /etc/hysteria/private.key ]]; then
+  chmod 640 /etc/hysteria/private.key 2>/dev/null || true
+fi
 EOF
 
   chmod 700 "$HY2_FIREWALL_RESTORE_BIN" >/dev/null 2>&1 || true
@@ -906,8 +874,13 @@ fix_hysteria_file_perms() {
 
   mkdir -p "$dir" >/dev/null 2>&1 || true
 
+  chdir="/etc/hysteria"
+  if [[ -d "$chdir" ]]; then
+    chmod 755 "$chdir" 2>/dev/null || true
+  fi
+
   chown root:"$g" "$dir" 2>/dev/null || chown root:root "$dir"
-  chmod 750 "$dir" 2>/dev/null || true
+  chmod 755 "$dir" 2>/dev/null || true
 
   if [[ -f "$cfg" ]]; then
     chown root:"$g" "$cfg" 2>/dev/null || chown root:root "$cfg"
@@ -920,7 +893,7 @@ fix_hysteria_file_perms() {
   fi
 
   if [[ -f "$crt" ]]; then
-    chown root:root "$crt" 2>/dev/null || true
+    chown root:"$g" "$crt" 2>/dev/null || chown root:root "$crt"
     chmod 644 "$crt" 2>/dev/null || true
   fi
 
@@ -946,26 +919,26 @@ fix_hysteria_file_perms() {
 inst_cert() {
   green "Hysteria 2 协议证书申请方式如下："
   echo ""
-  echo -e " ${GREEN}1.${PLAIN} Acme 脚本自动申请${YELLOW}（默认，强制校验证书）${PLAIN}"
-  echo -e " ${GREEN}2.${PLAIN} 必应自签证书${YELLOW}（客户端将跳过证书校验）${PLAIN}"
-  echo -e " ${GREEN}3.${PLAIN} 自定义证书路径${YELLOW}（默认强制校验）${PLAIN}"
+  echo -e " ${GREEN}1.${PLAIN} Let's Encrypt 申请${YELLOW}（certbot，默认）${PLAIN}"
+  echo -e " ${GREEN}2.${PLAIN} 必应自签证书${YELLOW}（客户端跳过证书校验）${PLAIN}"
+  echo -e " ${GREEN}3.${PLAIN} 自定义证书路径${YELLOW}（强制校验）${PLAIN}"
+  echo -e " ${GREEN}4.${PLAIN} Acme 脚本申请${YELLOW}（原 acme.sh 方式，路径统一到 LE）${PLAIN}"
   echo ""
 
   while true; do
-    read_confirmed certInput "请输入选项 [1-3]（回车默认 1）: " "1" || return 1
-    [[ "$certInput" =~ ^[1-3]$ ]] && break
-    red "选项无效，请输入 1、2 或 3。"
+    read_confirmed certInput "请输入选项 [1-4]（回车默认 1）: " "1" || return 1
+    [[ "$certInput" =~ ^[1-4]$ ]] && break
+    red "选项无效，请输入 1、2、3 或 4。"
   done
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
   tls_insecure="false"
   cert_mode="official"
+  local le_domain=""
 
   if [[ $certInput == 1 ]]; then
-    cert_path="/etc/hysteria/cert.crt"
-    key_path="/etc/hysteria/private.key"
-
+    # === 1) Let's Encrypt（certbot + webroot，直接引用 LE 路径）===
     realip || return 1
     while true; do
       read_confirmed domain "请输入需要申请或复用证书的域名: " "" || return 1
@@ -976,12 +949,14 @@ inst_cert() {
       red "域名格式无效：$domain"
     done
 
-    local reusable_domain=""
-    reusable_domain=$(existing_official_cert_usable "$domain" 2>/dev/null || true)
-    if [[ -n "$reusable_domain" ]]; then
-      green "检测到域名 $reusable_domain 的本地正式证书已存在且有效，跳过重复申请"
-      echo "$reusable_domain" > "$ACME_DOMAIN_LOG"
-      hy_domain="$reusable_domain"
+    cert_path="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    key_path="/etc/letsencrypt/live/${domain}/privkey.pem"
+
+    le_domain=$(existing_official_cert_usable "$domain" 2>/dev/null || true)
+    if [[ -n "$le_domain" ]]; then
+      green "检测到域名 $le_domain 的本地 Let's Encrypt 证书已存在且有效，跳过重复申请"
+      echo "$le_domain" > "$ACME_DOMAIN_LOG"
+      hy_domain="$le_domain"
       tls_insecure="false"
       cert_mode="official"
       install_hy2_cert_renew_job
@@ -996,60 +971,83 @@ inst_cert() {
       return 1
     }
 
-    green "检查 80 端口..."
-    check_port_80_free || {
-      red "80 端口被占用，acme standalone 模式会失败或长时间卡住"
-      yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
-      return 1
+    green "安装 certbot 和 nginx..."
+    pkg_install certbot nginx openssl >/dev/null 2>&1 || true
+
+    mkdir -p /var/www/acme /etc/nginx/sites-available /etc/nginx/sites-enabled
+    cat > /etc/nginx/sites-available/acme-hy.conf <<EOF
+server {
+    listen 80;
+    server_name ${domain};
+    location ^~ /.well-known/acme-challenge/ {
+        root /var/www/acme;
+        default_type "text/plain";
     }
+    location / { return 404; }
+}
+EOF
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true
+    ln -sf /etc/nginx/sites-available/acme-hy.conf /etc/nginx/sites-enabled/acme-hy.conf
+    systemctl start nginx 2>/dev/null || true
+    sleep 1
 
-    green "安装申请证书所需依赖..."
-    pkg_install curl wget sudo socat openssl >/dev/null 2>&1 || true
-
-    green "安装 acme.sh ..."
-    curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
-      red "安装 acme.sh 失败"
-      return 1
-    }
-
-    source ~/.bashrc >/dev/null 2>&1 || true
-    bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
-    bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
-
-    green "开始签发证书，这一步可能需要几十秒..."
-    if [[ -n $(echo "$ip" | grep ":") ]]; then
-      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
-        red "签发失败"
-        return 1
-      }
-    else
-      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
-        red "签发失败"
-        return 1
-      }
-    fi
-
-    bash ~/.acme.sh/acme.sh --install-cert -d "${domain}"       --key-file "$key_path"       --fullchain-file "$cert_path"       --ecc       --reloadcmd "systemctl restart $(get_hysteria_service_name)" || {
-      red "安装证书失败"
-      return 1
-    }
-
-    if [[ -s "$cert_path" && -s "$key_path" ]]; then
-      echo "$domain" > "$ACME_DOMAIN_LOG"
-      install_hy2_cert_renew_job
-      green "证书申请成功，已保存到 /etc/hysteria/"
-      yellow "证书路径：$cert_path"
-      yellow "私钥路径：$key_path"
-      yellow "已创建每周检测任务：证书若已过期或 7 天内到期，将自动续签并重启 Hysteria"
-      hy_domain="$domain"
-      tls_insecure="false"
-      cert_mode="official"
-    else
-      red "证书文件生成异常，请检查 acme.sh 输出"
+    if ! nginx -t 2>/dev/null; then
+      red "nginx 配置错误"
+      rm -f /etc/nginx/sites-enabled/acme-hy.conf /etc/nginx/sites-available/acme-hy.conf
       return 1
     fi
+    systemctl reload nginx
+
+    green "开始签发证书..."
+    if certbot certonly --webroot -w /var/www/acme --non-interactive --agree-tos --register-unsafely-without-email -d "$domain"; then
+      rm -f /etc/nginx/sites-enabled/acme-hy.conf /etc/nginx/sites-available/acme-hy.conf
+      systemctl reload nginx 2>/dev/null || true
+      if [[ -s "$cert_path" && -s "$key_path" ]]; then
+        echo "$domain" > "$ACME_DOMAIN_LOG"
+        install_hy2_cert_renew_job
+        green "证书申请成功：$cert_path"
+        yellow "自动续签：certbot renew（无需额外配置）"
+        hy_domain="$domain"
+        tls_insecure="false"
+        cert_mode="official"
+      else
+        red "证书文件生成异常"
+        return 1
+      fi
+    else
+      rm -f /etc/nginx/sites-enabled/acme-hy.conf /etc/nginx/sites-available/acme-hy.conf
+      systemctl reload nginx 2>/dev/null || true
+      red "证书签发失败"
+      return 1
+    fi
+
+  elif [[ $certInput == 2 ]]; then
+    # === 2) 必应自签证书 ===
+    green "将使用必应自签证书作为 Hysteria 2 的节点证书"
+    cert_path="/etc/letsencrypt/live/selfsigned/fullchain.pem"
+    key_path="/etc/letsencrypt/live/selfsigned/privkey.pem"
+    mkdir -p /etc/letsencrypt/live/selfsigned >/dev/null 2>&1 || true
+
+    openssl ecparam -genkey -name prime256v1 -out "$key_path" || {
+      red "生成私钥失败"
+      return 1
+    }
+    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com" || {
+      red "生成证书失败"
+      return 1
+    }
+
+    hy_domain="www.bing.com"
+    domain="www.bing.com"
+    tls_insecure="true"
+    cert_mode="selfsigned"
+
+    rm -f "$HY2_CERT_WEEKLY_CRON" "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/hysteria-restart.sh 2>/dev/null || true
+    yellow "当前为自签证书模式，客户端将跳过证书校验"
 
   elif [[ $certInput == 3 ]]; then
+    # === 3) 自定义证书路径 ===
     while true; do
       read_confirmed cert_path "请输入公钥文件 crt 的路径: " "" || return 1
       [[ -s "$cert_path" ]] && break
@@ -1068,33 +1066,97 @@ inst_cert() {
       fi
       red "域名格式无效：$domain"
     done
-
     hy_domain="$domain"
     tls_insecure="false"
     cert_mode="custom"
 
   else
-    green "将使用必应自签证书作为 Hysteria 2 的节点证书"
-    cert_path="/etc/hysteria/cert.crt"
-    key_path="/etc/hysteria/private.key"
+    # === 4) Acme 脚本申请（acme.sh，路径统一到 /etc/letsencrypt/live/）===
 
-    openssl ecparam -genkey -name prime256v1 -out "$key_path" || {
-      red "生成私钥失败"
+    realip || return 1
+    while true; do
+      read_confirmed domain "请输入需要申请证书的域名: " "" || return 1
+      domain="$(normalize_host_input "$domain")"
+      if is_valid_domain "$domain"; then
+        break
+      fi
+      red "域名格式无效：$domain"
+    done
+
+    cert_path="/etc/letsencrypt/live/${domain}/fullchain.pem"
+    key_path="/etc/letsencrypt/live/${domain}/privkey.pem"
+
+    le_domain=$(existing_official_cert_usable "$domain" 2>/dev/null || true)
+    if [[ -n "$le_domain" ]]; then
+      green "检测到域名 $le_domain 的本地证书已存在，跳过申请"
+      echo "$le_domain" > "$ACME_DOMAIN_LOG"
+      hy_domain="$le_domain"
+      tls_insecure="false"
+      cert_mode="official"
+      install_hy2_cert_renew_job
+      return 0
+    fi
+
+    green "已输入的域名：$domain"
+    green "检查域名解析..."
+    check_domain_ready "$domain" || {
+      red "当前域名解析的 IP 与当前 VPS 真实 IP 不匹配"
       return 1
     }
 
-    openssl req -new -x509 -days 36500 -key "$key_path" -out "$cert_path" -subj "/CN=www.bing.com" || {
-      red "生成证书失败"
+    green "检查 80 端口..."
+    check_port_80_free || {
+      red "80 端口被占用，acme standalone 模式会失败"
+      yellow "请先停止占用 80 端口的服务（如 nginx/apache/caddy）后重试"
       return 1
     }
 
-    hy_domain="www.bing.com"
-    domain="www.bing.com"
-    tls_insecure="true"
-    cert_mode="selfsigned"
+    green "安装 acme.sh 依赖..."
+    pkg_install curl wget sudo socat openssl >/dev/null 2>&1 || true
 
-    rm -f "$HY2_CERT_WEEKLY_CRON" "$HY2_CERT_RENEW_BIN" >/dev/null 2>&1 || true
-    yellow "当前为自签证书模式，客户端将跳过证书校验"
+    green "安装 acme.sh ..."
+    curl -fsSL https://get.acme.sh | sh -s email="$(date +%s%N | md5sum | cut -c 1-16)@gmail.com" || {
+      red "安装 acme.sh 失败"
+      return 1
+    }
+
+    source ~/.bashrc >/dev/null 2>&1 || true
+    bash ~/.acme.sh/acme.sh --upgrade --auto-upgrade >/dev/null 2>&1 || true
+    bash ~/.acme.sh/acme.sh --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+
+    green "开始签发证书..."
+    if [[ -n $(echo "$ip" | grep ":") ]]; then
+      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 --listen-v6 || {
+        red "签发失败"
+        return 1
+      }
+    else
+      timeout 300 bash ~/.acme.sh/acme.sh --issue -d "${domain}" --standalone -k ec-256 || {
+        red "签发失败"
+        return 1
+      }
+    fi
+
+    bash ~/.acme.sh/acme.sh --install-cert -d "${domain}" \
+      --key-file "$key_path" \
+      --fullchain-file "$cert_path" \
+      --ecc \
+      --reloadcmd "systemctl restart $(get_hysteria_service_name)" || {
+        red "安装证书失败"
+        return 1
+    }
+
+    if [[ -s "$cert_path" && -s "$key_path" ]]; then
+      echo "$domain" > "$ACME_DOMAIN_LOG"
+      install_hy2_cert_renew_job
+      green "证书申请成功：$cert_path"
+      hy_domain="$domain"
+      tls_insecure="false"
+      cert_mode="official"
+    else
+      red "证书文件生成异常"
+      return 1
+    fi
   fi
 }
 
@@ -1474,6 +1536,18 @@ install_hy_core() {
 # 函数：安装并初始化 Hysteria 2
 # -----------------------------
 insthysteria() {
+  # 检测端口 443 冲突：x-ui 也默认监听 443
+  if ss -lntp 2>/dev/null | grep -q ':443 '; then
+    local proc_443
+    proc_443=$(ss -lntp 2>/dev/null | grep ':443 ' | head -1)
+    if echo "$proc_443" | grep -qi "x-ui\|xray"; then
+      red "检测到 x-ui/xray 正在占用端口 443。h.sh 和 x.sh 不能同时安装（均默认监听 443）。"
+      red "请先卸载 x.sh（x-ui）后再安装 h.sh。"
+      read -erp "回车返回菜单..." _
+      return 1
+    fi
+  fi
+
   green "开始安装 Hysteria 2"
 
   realip || return 1
@@ -1525,7 +1599,7 @@ insthysteria() {
     last_ip="$ip"
   fi
 
-  if [[ -n "$hy_domain" ]]; then
+  if [[ -n "$hy_domain" && "$cert_mode" != "selfsigned" ]]; then
     share_host="$hy_domain"
   else
     share_host="$last_ip"
@@ -1570,7 +1644,7 @@ masquerade:
 EOF
 
   cat > /root/hy/hy-client.yaml <<EOF
-server: $last_ip:$port
+server: $share_host:$port
 
 auth: $auth_pwd
 
@@ -1607,6 +1681,19 @@ EOF
 
   systemctl daemon-reload
   hy_service=$(get_hysteria_service_name)
+
+  # 修改 systemd service 以 root 运行（避免证书权限问题）
+  local svc_path=""
+  if systemctl list-unit-files 2>/dev/null | grep -q '^hysteria-server\.service'; then
+    svc_path="/etc/systemd/system/hysteria-server.service"
+  else
+    svc_path="/etc/systemd/system/hysteria.service"
+  fi
+  if [[ -f "$svc_path" ]]; then
+    sed -i 's/^User=.*/User=root/' "$svc_path"
+    sed -i 's/^Group=.*/Group=root/' "$svc_path"
+    systemctl daemon-reload
+  fi
 
   systemctl enable "$hy_service" >/dev/null 2>&1 || true
   systemctl restart "$hy_service"
@@ -1660,7 +1747,7 @@ EOF
 unsthysteria() {
   local keep_cert="false"
 
-  if [[ -f /etc/hysteria/ca.log && -f /etc/hysteria/cert.crt && -f /etc/hysteria/private.key ]]; then
+  if [[ -f /etc/letsencrypt/live/*/fullchain.pem ]] 2>/dev/null || [[ -f /etc/hysteria/ca.log ]]; then
     keep_cert="true"
   fi
 
@@ -1685,8 +1772,8 @@ unsthysteria() {
 
   if [[ "$keep_cert" == "true" ]]; then
     mkdir -p /etc/hysteria >/dev/null 2>&1 || true
-    rm -f /etc/hysteria/config.yaml >/dev/null 2>&1 || true
-    green "Hysteria 2 已卸载完成，已保留正式证书与域名记录，重装时可自动复用。"
+    rm -f /etc/hysteria/config.yaml /etc/hysteria/ca.log /etc/hysteria/cert.crt /etc/hysteria/private.key >/dev/null 2>&1 || true
+    green "Hysteria 2 已卸载完成，已保留 Let's Encrypt 证书与域名记录（/etc/letsencrypt/live/），重装时可自动复用。"
   else
     rm -rf /etc/hysteria >/dev/null 2>&1 || true
     green "Hysteria 2 已彻底卸载完成。"
@@ -2383,12 +2470,13 @@ ipquality() {
 linux_ps() {
   clear
 
-  local cpu_info cpu_arch hostname kernel_version hy2_core_version os_info current_time timezone
+  local cpu_info cpu_arch hostname kernel_version hy2_core_version hy2_latest_version os_info current_time timezone
   cpu_info=$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')
   cpu_arch=$(uname -m)
   hostname=$(uname -n)
   kernel_version=$(uname -r)
   hy2_core_version=$(get_hysteria_current_version 2>/dev/null || echo "未安装")
+  hy2_latest_version=$(get_hysteria_latest_version 2>/dev/null || echo "")
   os_info=$(grep PRETTY_NAME /etc/os-release 2>/dev/null | cut -d '=' -f2 | tr -d '"')
   timezone=$(timedatectl 2>/dev/null | awk -F': ' '/Time zone/ {print $2}' | awk '{print $1}')
   [[ -z "$timezone" ]] && timezone="unknown"
@@ -2503,7 +2591,7 @@ linux_ps() {
   echo -e "${tianlan}主机名:       ${hui}$hostname"
   echo -e "${tianlan}系统版本:     ${hui}$os_info"
   echo -e "${tianlan}Linux内核版本: ${hui}$kernel_version"
-  echo -e "${tianlan}Hy2内核版本:   ${hui}$hy2_core_version"
+  echo -e "${tianlan}Hy2内核版本:   ${hui}当前 $hy2_core_version${hy2_latest_version:+，最新 $hy2_latest_version}"
   echo -e "${tianlan}-------------"
   echo -e "${tianlan}CPU架构:      ${hui}$cpu_arch"
   echo -e "${tianlan}CPU型号:      ${hui}$cpu_info"
@@ -2582,15 +2670,14 @@ menu() {
     echo -e " ${GREEN}5.${tianlan} 修改系统配置"
     echo -e " ${GREEN}6.${tianlan} 打印协议链接"
     echo -e " ${GREEN}7.${tianlan} 协议运行状态"
-    echo -e " ${GREEN}8.${tianlan} 内核更新 / 每周cron"
-    echo -e " ${GREEN}9.${tianlan} 回程测试"
-    echo -e " ${GREEN}10.${tianlan} IP质量检测"
-    echo -e " ${GREEN}11.${tianlan} 系统查询"
-    echo -e " ${GREEN}12.${tianlan} 系统更新"
+    echo -e " ${GREEN}8.${tianlan} 回程测试"
+    echo -e " ${GREEN}9.${tianlan} IP质量检测"
+    echo -e " ${GREEN}10.${tianlan} 系统查询"
+    echo -e " ${GREEN}11.${tianlan} 系统更新"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
-    read -erp "请输入选项 [0-12]: " menuInput
+    read -erp "请输入选项 [0-11]: " menuInput
 
     case $menuInput in
       1) insthysteria ;;
@@ -2600,11 +2687,10 @@ menu() {
       5) run_sys_conf ;;
       6) showconf ;;
       7) showstatus ;;
-      8) update_core ;;
-      9) besttrace ;;
-      10) ipquality ;;
-      11) linux_ps ;;
-      12) linux_update ;;
+      8) besttrace ;;
+      9) ipquality ;;
+      10) linux_ps ;;
+      11) linux_update ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac

@@ -112,17 +112,11 @@ download_with_retry() {
 # -----------------------------
 cleanup_services() {
     systemctl stop x-ui 2>/dev/null || true
-    systemctl stop nginx 2>/dev/null || true
-    systemctl stop apache2 2>/dev/null || true
-    systemctl stop caddy 2>/dev/null || true
-
     pkill -f '/usr/local/x-ui/bin/xray' 2>/dev/null || true
     pkill -f 'xray-linux' 2>/dev/null || true
     pkill -x xray 2>/dev/null || true
-    pkill -f nginx 2>/dev/null || true
-    pkill -f apache2 2>/dev/null || true
-    pkill -f caddy 2>/dev/null || true
 
+    # 不停止 nginx/apache2/caddy — 避免影响已有业务
     sleep 2
 }
 
@@ -178,7 +172,7 @@ init_runtime_vars() {
     config_username=$(gen_random_string 10)
     config_password=$(gen_random_string 10)
     AUTODOMAIN="n"
-    fallback_port=$(make_port)
+    fallback_port=8080
     short_id=$(openssl rand -hex 4)
 
     # 双协议默认参数
@@ -208,28 +202,22 @@ parse_args() {
 UNINSTALL_XUI() {
     systemctl stop x-ui 2>/dev/null || true
     systemctl disable x-ui 2>/dev/null || true
-    systemctl stop nginx 2>/dev/null || true
-    systemctl disable nginx 2>/dev/null || true
 
     pkill -f '/usr/local/x-ui/bin/xray' 2>/dev/null || true
     pkill -f 'xray-linux' 2>/dev/null || true
     pkill -x xray 2>/dev/null || true
-    pkill -f nginx 2>/dev/null || true
 
     printf 'y\n' | x-ui uninstall 2>/dev/null || true
 
     rm -rf "/etc/x-ui/" "/usr/local/x-ui/" "/usr/bin/x-ui/"
     rm -rf /etc/systemd/system/x-ui.service
 
-    $Pak -y remove nginx nginx-common nginx-core nginx-full || true
-    $Pak -y purge nginx nginx-common nginx-core nginx-full || true
+    # 清理 x-ui 自己添加的 nginx 配置（不影响已有业务）
+    rm -f "/etc/nginx/sites-available/${domain}" 2>/dev/null || true
+    rm -f "/etc/nginx/sites-enabled/${domain}" 2>/dev/null || true
+    rm -f /etc/nginx/sites-available/80.conf /etc/nginx/sites-enabled/80.conf 2>/dev/null || true
 
-    rm -rf "/var/www/html/" "/usr/share/nginx/"
-    rm -rf "/var/www/subpage/" 2>/dev/null || true
-    rm -rf "/etc/nginx/" 2>/dev/null || true
-
-    msg_ok "已卸载 x-ui / xray / nginx / 网页内容，但已保留证书与依赖。"
-    msg_inf "保留目录：/etc/letsencrypt /var/lib/letsencrypt /var/log/letsencrypt /var/www/acme"
+    msg_ok "已卸载 x-ui / xray，已保留 nginx 与证书。"
 }
 
 # -----------------------------
@@ -241,7 +229,7 @@ uninstall_xui_menu() {
     echo "----------------------------------------------------------------"
     echo "卸载确认"
     echo "----------------------------------------------------------------"
-    echo "即将卸载 x-ui / xray / nginx / 网页内容，但不会删除已申请的证书和依赖。"
+    echo "即将卸载 x-ui / xray 与相关 nginx 配置，但不会删除 nginx、已申请的证书和依赖。"
     read -rp "确认继续卸载？(y/N): " confirm_uninstall
     if [[ ! "$confirm_uninstall" =~ ^[Yy]$ ]]; then
         msg_err "已取消卸载。"
@@ -355,18 +343,24 @@ install_packages() {
         fix_dpkg_interrupt
 
         if command -v apt-get >/dev/null 2>&1; then
-            if ! env DEBIAN_FRONTEND=noninteractive \
-                DEBCONF_NONINTERACTIVE_SEEN=true \
-                DEBIAN_PRIORITY=critical \
-                NEEDRESTART_MODE=a \
-                APT_LISTCHANGES_FRONTEND=none \
-                timeout 300 apt-get install -y --no-install-recommends \
-                -o Dpkg::Use-Pty=0 \
-                -o Dpkg::Options::="--force-confdef" \
-                -o Dpkg::Options::="--force-confnew" \
-                -o DPkg::Pre-Install-Pkgs::= \
-                curl wget jq bash sudo nginx-full certbot sqlite3 ufw cron \
-                netcat-traditional uuid-runtime openssl </dev/null; then
+        # 检测 nginx 是否已安装，不重复安装
+        local install_nginx=""
+        if ! command -v nginx >/dev/null 2>&1; then
+            install_nginx="nginx-full"
+        fi
+
+        if ! env DEBIAN_FRONTEND=noninteractive \
+            DEBCONF_NONINTERACTIVE_SEEN=true \
+            DEBIAN_PRIORITY=critical \
+            NEEDRESTART_MODE=a \
+            APT_LISTCHANGES_FRONTEND=none \
+            timeout 300 apt-get install -y --no-install-recommends \
+            -o Dpkg::Use-Pty=0 \
+            -o Dpkg::Options::="--force-confdef" \
+            -o Dpkg::Options::="--force-confnew" \
+            -o DPkg::Pre-Install-Pkgs::= \
+            curl wget jq bash sudo $install_nginx certbot sqlite3 ufw cron \
+            netcat-traditional uuid-runtime openssl </dev/null; then
 
                 msg_err "基础依赖安装失败，尝试刷新软件源并自动修复后重试..."
                 fix_dpkg_interrupt
@@ -1305,7 +1299,7 @@ EOF
         proxy_set_header Host \$host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
-        proxy_pass http://127.0.0.1:8080/;
+        proxy_pass http://127.0.0.1:8090/;
     }
 
     location ~ ^/${web_path}/clashmeta/(.+)\$ {
@@ -1358,7 +1352,11 @@ EOF
     }
 
     location / {
-        try_files \$uri \$uri/ /index.html =404;
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
     }
 EOF
 
@@ -1481,7 +1479,9 @@ EOF
             exit 1
         }
 
-        rm -f /etc/nginx/sites-enabled/*
+        # 只移除以 domain 命名的 x-ui 站点配置，不碰其他站点
+        rm -f "/etc/nginx/sites-enabled/${domain}" 2>/dev/null || true
+        rm -f /etc/nginx/sites-enabled/80.conf 2>/dev/null || true
         ln -sf "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
         ln -sf "/etc/nginx/sites-available/80.conf" "/etc/nginx/sites-enabled/80.conf"
     }
@@ -1567,7 +1567,7 @@ install_sub2sing_box() {
     echo "----------------------------------------------------------------"
     echo "安装 sub2sing-box（将订阅/节点连接转换为 sing-box 配置的工具）"
     echo "----------------------------------------------------------------"
-    echo "即将安装本地 sub2sing-box 服务（127.0.0.1:8080）。"
+    echo "即将安装本地 sub2sing-box 服务（127.0.0.1:8090）。"
     read -rp "确认继续安装 sub2sing-box？(Y/n): " confirm_sub2sing
     if [[ ! "$confirm_sub2sing" =~ ^[Nn]$ ]]; then
         if pgrep -x "sub2sing-box" > /dev/null; then
@@ -1583,7 +1583,7 @@ install_sub2sing_box() {
         mv /root/sub2sing-box /usr/bin/
         chmod +x /usr/bin/sub2sing-box
         rm /root/sub2sing-box_0.0.9_linux_amd64.tar.gz
-        su -c "/usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1 &" root
+        su -c "/usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8090 > /dev/null 2>&1 &" root
     else
         msg_err "已跳过 sub2sing-box 安装。"
     fi
@@ -1667,7 +1667,7 @@ setup_cronjob() {
     else
         {
             crontab -l 2>/dev/null | grep -v "certbot\|x-ui\|cloudflareips\|sub2sing-box" || true
-            echo '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8080 > /dev/null 2>&1'
+            echo '@reboot /usr/bin/sub2sing-box server --bind 127.0.0.1 --port 8090 > /dev/null 2>&1'
             echo '@daily x-ui restart > /dev/null 2>&1 && nginx -s reload > /dev/null 2>&1'
             echo '@monthly certbot renew --webroot -w /var/www/acme --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1'
         } | crontab -
@@ -2456,886 +2456,14 @@ detect_target_site() {
     fi
 }
 
-# -----------------------------
-#  修改时区
-# -----------------------------
-change_tz() {
-    local tz=""
-    read -rp "请输入时区（回车默认 Asia/Shanghai，例如 Asia/Shanghai）: " tz
-    [[ -z "$tz" ]] && tz="Asia/Shanghai"
-    timedatectl set-timezone "$tz" && msg_ok "系统时区已设置为：$tz" || msg_err "设置失败，请检查 timedatectl / 时区名是否存在"
-}
 
-# -----------------------------
-#  修改 DNS
-# -----------------------------
-set_dns_ui() {
-    echo -e "${yellow}正在配置 DNS（8.8.8.8 / 1.1.1.1）并锁定 /etc/resolv.conf ...${none}"
 
-    if [[ -L /etc/resolv.conf ]]; then
-        rm -f /etc/resolv.conf
-        touch /etc/resolv.conf
-    fi
 
-    chattr -i /etc/resolv.conf 2>/dev/null || true
 
-    cat >/etc/resolv.conf <<'EOF'
-nameserver 8.8.8.8
-nameserver 1.1.1.1
-EOF
 
-    chattr +i /etc/resolv.conf 2>/dev/null || true
-    msg_ok "resolv.conf 已写入并尝试加锁（chattr +i）"
 
-    if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-resolved\.service'; then
-        systemctl disable --now systemd-resolved >/dev/null 2>&1 || true
-    fi
-}
 
-# -----------------------------
-#  设置 Swap
-# -----------------------------
-swap_cache() {
-    local size_mb confirm fs_type
 
-    echo "当前 Swap："
-    free -h | awk 'NR==1 || /Swap:/ {print}'
-    echo
-
-    read -rp "请输入 Swap 大小（MB，建议 >=512）: " size_mb
-    [[ "$size_mb" =~ ^[0-9]+$ ]] || { msg_err "请输入有效数字"; return 1; }
-
-    read -rp "确认创建/重建 Swap=${size_mb}MB ? (y/n): " confirm
-    [[ "$confirm" =~ ^[Yy]$ ]] || { msg_err "已取消"; return 0; }
-
-    swapoff /swapfile >/dev/null 2>&1 || true
-    rm -f /swapfile >/dev/null 2>&1 || true
-
-    fs_type="$(stat -f -c %T / 2>/dev/null || true)"
-    touch /swapfile || { msg_err "无法创建 /swapfile"; return 1; }
-
-    if [[ "$fs_type" == "btrfs" ]] && command -v chattr >/dev/null 2>&1; then
-        chattr +C /swapfile >/dev/null 2>&1 || true
-    fi
-
-    if command -v fallocate >/dev/null 2>&1; then
-        fallocate -l "${size_mb}M" /swapfile 2>/dev/null || dd if=/dev/zero of=/swapfile bs=1M count="${size_mb}" conv=fsync status=progress
-    else
-        dd if=/dev/zero of=/swapfile bs=1M count="${size_mb}" conv=fsync status=progress
-    fi
-
-    chmod 600 /swapfile || { msg_err "chmod 600 失败"; rm -f /swapfile; return 1; }
-    mkswap /swapfile >/dev/null 2>&1 || { msg_err "mkswap 失败"; rm -f /swapfile; return 1; }
-    swapon /swapfile >/dev/null 2>&1 || { msg_err "swapon 失败"; rm -f /swapfile; return 1; }
-
-    grep -qE '^\s*/swapfile\s' /etc/fstab 2>/dev/null || echo "/swapfile none swap sw 0 0" >> /etc/fstab
-
-    msg_ok "Swap 已启用："
-    swapon --show
-    free -h | awk 'NR==1 || /Swap:/ {print}'
-}
-
-# -----------------------------
-#  修改 SSH 端口
-# -----------------------------
-ssh_port_change() {
-    local new_port="$1"
-    local SSH_CONFIG="/etc/ssh/sshd_config"
-
-    # 检查 root 权限
-    if [[ $EUID -ne 0 ]]; then
-        msg_err "请使用 root 权限执行"
-        return 1
-    fi
-
-    # 参数校验
-    [[ -z "$new_port" ]] && { msg_err "请提供新的端口号"; return 1; }
-    [[ "$new_port" =~ ^[0-9]+$ ]] || { msg_err "端口必须是数字"; return 1; }
-    (( new_port >= 1 && new_port <= 65535 )) || { msg_err "端口范围必须 1-65535"; return 1; }
-
-    # 修改 SSH 配置文件
-    if grep -qE '^[[:space:]]*Port[[:space:]]+' "$SSH_CONFIG"; then
-        sed -i "s/^[[:space:]]*Port[[:space:]]\+[0-9]\+/Port ${new_port}/" "$SSH_CONFIG"
-    elif grep -q "^#Port 22" "$SSH_CONFIG"; then
-        sed -i "s/^#Port 22/Port ${new_port}/" "$SSH_CONFIG"
-    else
-        echo "Port ${new_port}" >> "$SSH_CONFIG"
-    fi
-
-    # 重启 SSH 服务
-    systemctl restart ssh >/dev/null 2>&1 || systemctl restart sshd >/dev/null 2>&1
-    if [[ $? -ne 0 ]]; then
-        msg_err "重启 SSH 服务失败，请检查配置文件"
-        return 1
-    fi
-
-    # 自动放行新端口（防火墙）
-    local fw_opened=false
-    # firewalld
-    if command -v firewall-cmd &>/dev/null && systemctl is-active --quiet firewalld 2>/dev/null; then
-        if firewall-cmd --add-port=${new_port}/tcp --permanent &>/dev/null && firewall-cmd --reload &>/dev/null; then
-            msg_ok "已通过 firewalld 放行端口 ${new_port}/tcp"
-            fw_opened=true
-        else
-            msg_err "firewalld 放行端口失败，请手动检查"
-        fi
-    # ufw
-    elif command -v ufw &>/dev/null; then
-        if ufw allow ${new_port}/tcp &>/dev/null; then
-            msg_ok "已通过 ufw 放行端口 ${new_port}/tcp"
-            fw_opened=true
-        else
-            msg_err "ufw 放行端口失败，请手动检查"
-        fi
-    # iptables
-    elif command -v iptables &>/dev/null; then
-        if iptables -A INPUT -p tcp --dport ${new_port} -j ACCEPT; then
-            # 尝试持久化
-            if command -v iptables-save &>/dev/null; then
-                if command -v netfilter-persistent &>/dev/null; then
-                    netfilter-persistent save &>/dev/null
-                elif command -v iptables-save >/dev/null && [ -f /etc/iptables/rules.v4 ]; then
-                    iptables-save > /etc/iptables/rules.v4
-                elif command -v service iptables save &>/dev/null; then
-                    service iptables save &>/dev/null
-                else
-                    msg_warn "无法自动持久化 iptables 规则，重启后可能失效"
-                fi
-            fi
-            msg_ok "已通过 iptables 放行端口 ${new_port}/tcp"
-            fw_opened=true
-        else
-            msg_err "iptables 放行端口失败，请手动检查"
-        fi
-    else
-        msg_warn "未检测到常见防火墙（firewalld/ufw/iptables），请手动放行端口 ${new_port}"
-    fi
-
-    # 最终提示
-    msg_ok "SSH 端口已修改为 ${new_port}"
-    if [[ "$fw_opened" == true ]]; then
-        msg_warn "防火墙已自动放行端口 ${new_port}，请确认 SSH 服务可用后再断开当前连接。"
-    else
-        msg_warn "请手动确保防火墙放行端口 ${new_port}，否则可能导致断连。"
-    fi
-}
-# -----------------------------
-#  设置BBR
-# -----------------------------
-bbr() {
-  set -Eeuo pipefail
-
-  local SYSCTL_FILE="/etc/sysctl.d/99-bbr.conf"
-
-  local G Y R C N
-  if [ -t 1 ]; then
-    G='\033[32m'
-    Y='\033[33m'
-    R='\033[31m'
-    C='\033[36m'
-    N='\033[0m'
-  else
-    G=''; Y=''; R=''; C=''; N=''
-  fi
-
-  info()  { echo -e "${C}[信息]${N} $*"; }
-  warn()  { echo -e "${Y}[警告]${N} $*"; }
-  error() { echo -e "${R}[错误]${N} $*" >&2; }
-  ok()    { echo -e "${G}[完成]${N} $*"; }
-
-  require_root() {
-    if [ "${EUID:-$(id -u)}" -ne 0 ]; then
-      error "请使用 root 运行"
-      return 1
-    fi
-  }
-
-  pause() {
-    echo
-    read -r -p "按回车继续..." _
-  }
-
-  backup_if_exists() {
-    local f="$1"
-    if [ -f "$f" ]; then
-      cp -a "$f" "${f}.bak.$(date +%Y%m%d_%H%M%S)"
-    fi
-  }
-
-  get_os_id() {
-    local id=""
-    if [ -r /etc/os-release ]; then
-      . /etc/os-release
-      id="${ID:-}"
-    fi
-    echo "$id"
-  }
-
-  is_debian_like() {
-    local id
-    id="$(get_os_id)"
-    [[ "$id" == "debian" || "$id" == "ubuntu" ]]
-  }
-
-  is_x86_64() {
-    [[ "$(uname -m)" == "x86_64" ]]
-  }
-
-  bbr_supported() {
-    local available
-    available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || true)"
-    echo "$available" | grep -qw bbr
-  }
-
-  show_status() {
-    local kern cc qdisc headers_status="unknown" available="unknown"
-
-    kern="$(uname -r)"
-    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
-    available="$(sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null || echo unknown)"
-
-    if command -v dpkg-query >/dev/null 2>&1; then
-      if dpkg-query -W -f='${Status}\n' "linux-headers-$(uname -r)" 2>/dev/null | grep -q '^install ok installed$'; then
-        headers_status="installed"
-      else
-        headers_status="not installed"
-      fi
-    elif command -v rpm >/dev/null 2>&1; then
-      if rpm -q "kernel-headers-$(uname -r)" >/dev/null 2>&1 || rpm -qa | grep -q '^kernel-headers'; then
-        headers_status="installed"
-      else
-        headers_status="not installed"
-      fi
-    fi
-
-    echo
-    echo "内核版本: $kern"
-    echo "当前拥塞控制算法: $cc"
-    echo "当前队列算法: $qdisc"
-    echo "可用拥塞控制算法: $available"
-    echo "headers: $headers_status"
-    echo
-  }
-
-  install_base_packages() {
-    if command -v apt-get >/dev/null 2>&1; then
-      apt-get update -y
-      apt-get install -y wget gnupg ca-certificates apt-transport-https
-    else
-      error "当前系统不支持自动安装依赖"
-      return 1
-    fi
-  }
-
-  setup_xanmod_repo() {
-    install_base_packages || return 1
-
-    mkdir -p /usr/share/keyrings /etc/apt/sources.list.d
-    local keyring="/usr/share/keyrings/xanmod-archive-keyring.gpg"
-    local repo_file="/etc/apt/sources.list.d/xanmod-release.list"
-    local tmp
-    tmp="$(mktemp)"
-
-    if ! wget -qO "$tmp" https://dl.xanmod.org/archive.key; then
-      rm -f "$tmp"
-      error "下载 XanMod GPG 密钥失败"
-      return 1
-    fi
-
-    if ! gpg --dearmor -o "$keyring" --yes < "$tmp"; then
-      rm -f "$tmp"
-      error "导入 XanMod GPG 密钥失败"
-      return 1
-    fi
-    rm -f "$tmp"
-
-    echo "deb [signed-by=${keyring}] https://deb.xanmod.org releases main" > "$repo_file"
-    apt-get update -y
-  }
-
-  cpu_level_to_flavor() {
-    local level="2"
-    if grep -qiE 'avx512f|avx512bw|avx512dq|avx512vl' /proc/cpuinfo 2>/dev/null; then
-      level="4"
-    elif grep -qiE 'avx2|bmi1|bmi2|fma|movbe' /proc/cpuinfo 2>/dev/null; then
-      level="3"
-    elif grep -qiE 'sse4_2|cx16|popcnt' /proc/cpuinfo 2>/dev/null; then
-      level="2"
-    else
-      level="1"
-    fi
-    echo "x64v${level}"
-  }
-
-  install_bbr_kernel_if_needed() {
-    if bbr_supported; then
-      info "当前内核已支持 bbr，跳过内核安装"
-      return 0
-    fi
-
-    warn "当前内核不支持 bbr，需要安装支持 BBR 的内核"
-
-    if ! is_debian_like; then
-      error "自动安装仅支持 Debian/Ubuntu"
-      return 1
-    fi
-
-    if ! is_x86_64; then
-      error "自动安装仅支持 x86_64"
-      return 1
-    fi
-
-    setup_xanmod_repo || return 1
-
-    local flavor pkg
-    flavor="$(cpu_level_to_flavor)"
-    pkg="linux-xanmod-${flavor}"
-
-    info "准备安装支持 BBR 的 XanMod 内核: ${pkg}"
-    if apt-get install -y "$pkg"; then
-      update-grub >/dev/null 2>&1 || true
-      ok "XanMod 内核安装完成"
-    else
-      error "XanMod 内核安装失败"
-      return 1
-    fi
-
-    if bbr_supported; then
-      info "当前会话已检测到 bbr 支持"
-      return 0
-    fi
-
-    warn "新内核已安装，但当前系统可能仍在运行旧内核"
-    warn "请先 reboot 重启系统，然后再次执行 bbr"
-    return 2
-  }
-
-  disable_conflicts() {
-    local ts f
-    ts="$(date +%Y%m%d_%H%M%S)"
-
-    for f in /etc/sysctl.conf /etc/sysctl.d/*.conf; do
-      [ -f "$f" ] || continue
-      [ "$f" = "$SYSCTL_FILE" ] && continue
-
-      if grep -Eq '^[[:space:]]*net\.core\.default_qdisc[[:space:]]*=' "$f" 2>/dev/null ||
-         grep -Eq '^[[:space:]]*net\.ipv4\.tcp_congestion_control[[:space:]]*=' "$f" 2>/dev/null; then
-        backup_if_exists "$f"
-        sed -ri \
-          -e 's@^[[:space:]]*(net\.core\.default_qdisc[[:space:]]*=.*)$@# disabled by bbr '"$ts"': \1@' \
-          -e 's@^[[:space:]]*(net\.ipv4\.tcp_congestion_control[[:space:]]*=.*)$@# disabled by bbr '"$ts"': \1@' \
-          "$f"
-        warn "已处理可能冲突的配置: $f"
-      fi
-    done
-  }
-
-  write_bbr_config() {
-    mkdir -p /etc/sysctl.d
-    backup_if_exists "$SYSCTL_FILE"
-
-    cat > "$SYSCTL_FILE" <<'EOF'
-# Minimal stable BBR config
-net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-EOF
-  }
-
-  apply_bbr_config() {
-    if ! bbr_supported; then
-      error "当前内核还不支持 bbr，无法启用"
-      return 1
-    fi
-
-    disable_conflicts
-    write_bbr_config
-
-    if ! sysctl --system >/dev/null; then
-      error "sysctl 应用失败"
-      return 1
-    fi
-
-    local cc qdisc
-    cc="$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
-    qdisc="$(sysctl -n net.core.default_qdisc 2>/dev/null || echo unknown)"
-
-    echo
-    echo "最终结果:"
-    echo "拥塞控制算法: $cc"
-    echo "队列算法: $qdisc"
-    echo
-
-    if [ "$cc" = "bbr" ] && [ "$qdisc" = "fq" ]; then
-      ok "已成功启用 bbr + fq"
-      return 0
-    else
-      error "结果不符合预期，请检查是否有其他配置覆盖"
-      return 1
-    fi
-  }
-
-  remove_bbr_config() {
-    if [ -f "$SYSCTL_FILE" ]; then
-      backup_if_exists "$SYSCTL_FILE"
-      rm -f "$SYSCTL_FILE"
-      sysctl --system >/dev/null 2>&1 || true
-      ok "已删除本脚本写入的 BBR 配置: $SYSCTL_FILE"
-    else
-      warn "未发现本脚本写入的配置文件"
-    fi
-  }
-
-  install_and_enable_bbr() {
-    install_bbr_kernel_if_needed
-    local rc=$?
-    if [ "$rc" -eq 2 ]; then
-      return 0
-    elif [ "$rc" -ne 0 ]; then
-      return "$rc"
-    fi
-
-    apply_bbr_config
-  }
-
-  menu() {
-    while true; do
-      clear
-      echo -e "${C}========== BBR 管理菜单 ========== ${N}"
-      show_status
-      echo "1. 查看当前状态"
-      echo "2. 安装支持 BBR 的内核"
-      echo "3. 启用 BBR + FQ"
-      echo "4. 安装并启用 BBR"
-      echo "5. 删除本脚本写入的 BBR 配置"
-      echo "0. 退出"
-      echo
-
-      local choice
-      read -r -p "请输入选择: " choice
-      echo
-
-      case "$choice" in
-        1)
-          show_status
-          pause
-          ;;
-        2)
-          install_bbr_kernel_if_needed || true
-          pause
-          ;;
-        3)
-          apply_bbr_config || true
-          pause
-          ;;
-        4)
-          install_and_enable_bbr || true
-          pause
-          ;;
-        5)
-          remove_bbr_config || true
-          pause
-          ;;
-        0)
-          return 0
-          ;;
-        *)
-          warn "无效选择"
-          sleep 1
-          ;;
-      esac
-    done
-  }
-
-  require_root || return 1
-
-  if [ $# -gt 0 ]; then
-    case "${1:-}" in
-      status)
-        show_status
-        ;;
-      install)
-        install_bbr_kernel_if_needed
-        ;;
-      enable)
-        apply_bbr_config
-        ;;
-      all)
-        install_and_enable_bbr
-        ;;
-      remove)
-        remove_bbr_config
-        ;;
-      menu)
-        menu
-        ;;
-      *)
-        echo "用法:"
-        echo "  bbr menu     打开菜单"
-        echo "  bbr status   查看状态"
-        echo "  bbr install  安装支持 BBR 的内核"
-        echo "  bbr enable   启用 bbr + fq"
-        echo "  bbr all      安装并启用"
-        echo "  bbr remove   删除本脚本写入的配置"
-        return 1
-        ;;
-    esac
-  else
-    menu
-  fi
-}
-
-# -----------------------------
-# 设置 IPv4 / IPv6 priority
-# -----------------------------
-set_ip_priority() {
-  while true; do
-    clear
-    echo "设置 v4/v6 优先级"
-    echo "------------------------"
-    local ipv6_disabled
-    ipv6_disabled=$(sysctl -n net.ipv6.conf.all.disable_ipv6 2>/dev/null || echo 0)
-    if [[ "$ipv6_disabled" -eq 1 ]]; then
-      echo -e "当前网络优先级: ${YELLOW}IPv4${PLAIN} 优先"
-    else
-      echo -e "当前网络优先级: ${YELLOW}IPv6${PLAIN} 优先"
-    fi
-    echo ""
-    echo "1. IPv4 优先"
-    echo "2. IPv6 优先"
-    echo "3. IPv6 修复工具（外部脚本）"
-    echo "0. 返回"
-    read -rp "选择: " choice
-    case "$choice" in
-      1) sysctl -w net.ipv6.conf.all.disable_ipv6=1 >/dev/null 2>&1 || true; echo -e "\033[32m已切换为 IPv4 优先\033[0m"; sleep 1 ;;
-      2) sysctl -w net.ipv6.conf.all.disable_ipv6=0 >/dev/null 2>&1 || true; echo -e "\033[32m已切换为 IPv6 优先\033[0m"; sleep 1 ;;
-      3) yellow "将运行外部 IPv6 修复脚本（jhb.ovh/jb/v6.sh）"; bash <(curl -fsSL jhb.ovh/jb/v6.sh) || red "脚本执行失败"; read -rp "回车返回..." _ ;;
-      0) break ;;
-      *) yellow "无效选择"; sleep 1 ;;
-    esac
-  done
-}
-# -----------------------------
-#  设置 SSH 登录方式
-# -----------------------------
-auth_key() {
-    local target_user="${1:-root}"
-    local target_group user_home ssh_dir ak pubkey cfg bak choice new_pass
-    local sshd_bin cloud_cfg cloud_bak
-
-    if [[ $EUID -ne 0 ]]; then
-        msg_err "请使用 root 权限执行此函数。"
-        return 1
-    fi
-
-    user_home="$(getent passwd "$target_user" | cut -d: -f6)"
-    target_group="$(id -gn "$target_user" 2>/dev/null)"
-    target_group="${target_group:-$target_user}"
-
-    cfg="/etc/ssh/sshd_config"
-    cloud_cfg="/etc/ssh/sshd_config.d/50-cloud-init.conf"
-    sshd_bin="$(command -v sshd 2>/dev/null)"
-
-    if [[ -z "$user_home" || ! -d "$user_home" ]]; then
-        msg_err "找不到用户或家目录：$target_user"
-        return 1
-    fi
-
-    if [[ ! -f "$cfg" ]]; then
-        msg_err "找不到 SSH 配置文件：$cfg"
-        return 1
-    fi
-
-    _auth_key_backup_cfg() {
-        bak="${cfg}.bak.$(date +%Y%m%d-%H%M%S)"
-        cp -a "$cfg" "$bak" || return 1
-    }
-
-    _auth_key_backup_cloud_cfg() {
-        if [[ -f "$cloud_cfg" ]]; then
-            cloud_bak="${cloud_cfg}.bak.$(date +%Y%m%d-%H%M%S)"
-            cp -a "$cloud_cfg" "$cloud_bak" || return 1
-        fi
-    }
-
-    _auth_key_set_cfg() {
-        local key="$1"
-        local value="$2"
-
-        if grep -qE "^[#[:space:]]*${key}[[:space:]]+" "$cfg"; then
-            sed -i -E "s#^[#[:space:]]*${key}[[:space:]].*#${key} ${value}#g" "$cfg"
-        else
-            echo "${key} ${value}" >> "$cfg"
-        fi
-    }
-
-    _auth_key_set_cloud_password_auth() {
-        local value="$1"
-
-        mkdir -p /etc/ssh/sshd_config.d || return 1
-
-        if [[ -f "$cloud_cfg" ]]; then
-            _auth_key_backup_cloud_cfg || return 1
-        fi
-
-        cat > "$cloud_cfg" <<EOF
-PasswordAuthentication ${value}
-EOF
-    }
-
-    _auth_key_restore_on_fail() {
-        [[ -n "$bak" && -f "$bak" ]] && cp -a "$bak" "$cfg"
-        [[ -n "$cloud_bak" && -f "$cloud_bak" ]] && cp -a "$cloud_bak" "$cloud_cfg"
-    }
-
-    _auth_key_check_and_restart() {
-        if [[ -n "$sshd_bin" ]]; then
-            if ! "$sshd_bin" -t -f "$cfg" >/dev/null 2>&1; then
-                _auth_key_restore_on_fail
-                msg_err "sshd_config 校验失败，已恢复备份。"
-                return 1
-            fi
-        fi
-
-        if systemctl restart ssh >/dev/null 2>&1 \
-            || systemctl restart sshd >/dev/null 2>&1 \
-            || service ssh restart >/dev/null 2>&1 \
-            || service sshd restart >/dev/null 2>&1; then
-            return 0
-        fi
-
-        _auth_key_restore_on_fail
-        msg_err "SSH 服务重启失败，已恢复备份。"
-        return 1
-    }
-
-    _auth_key_gen_password() {
-        local upper lower digit special all result
-
-        upper='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
-        lower='abcdefghijklmnopqrstuvwxyz'
-        digit='0123456789'
-        special='$%*&#'
-        all="${upper}${lower}${digit}${special}"
-
-        _pick_one() {
-            local chars="$1"
-            printf '%s' "$chars" | fold -w1 | shuf -n1
-        }
-
-        result="$(_pick_one "$upper")"
-        result+="$(_pick_one "$lower")"
-        result+="$(_pick_one "$digit")"
-        result+="$(_pick_one "$special")"
-
-        while [[ ${#result} -lt 16 ]]; do
-            result+="$(_pick_one "$all")"
-        done
-
-        printf '%s\n' "$result" | fold -w1 | shuf | tr -d '\n'
-    }
-
-    while true; do
-        echo "=============================="
-        echo " SSH 管理用户：$target_user"
-        echo " 1. 仅 SSH 密钥登录"
-        echo " 2. 仅 SSH 密码登录"
-        echo " 3. 重置 SSH 密码"
-        echo " 0. 返回上一级"
-        echo "=============================="
-        read -rp "请选择 [0-3]： " choice
-
-        bak=""
-        cloud_bak=""
-
-        case "$choice" in
-            1)
-                echo "请输入公钥字符串（一整行，以 ssh-ed25519/ssh-rsa/ecdsa... 开头）："
-                read -r pubkey
-
-                if ! printf '%s\n' "$pubkey" | grep -Eq '^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com) [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
-                    msg_err "公钥格式不正确。"
-                    echo
-                    continue
-                fi
-
-                ssh_dir="$user_home/.ssh"
-                ak="$ssh_dir/authorized_keys"
-
-                mkdir -p "$ssh_dir" || { msg_err "创建 .ssh 目录失败。"; echo; continue; }
-                chmod 700 "$ssh_dir"
-                touch "$ak" || { msg_err "创建 authorized_keys 失败。"; echo; continue; }
-                chmod 600 "$ak"
-                chown -R "$target_user:$target_group" "$ssh_dir"
-
-                if ! awk '{print $1" "$2}' "$ak" | grep -Fxq "$(printf '%s\n' "$pubkey" | awk '{print $1" "$2}')"; then
-                    printf '%s\n' "$pubkey" >> "$ak"
-                fi
-
-                _auth_key_backup_cfg || {
-                    msg_err "备份 SSH 配置失败。"
-                    echo
-                    continue
-                }
-
-                _auth_key_set_cfg "PubkeyAuthentication" "yes"
-                _auth_key_set_cfg "PasswordAuthentication" "no"
-                _auth_key_set_cfg "KbdInteractiveAuthentication" "no"
-                _auth_key_set_cfg "ChallengeResponseAuthentication" "no"
-                _auth_key_set_cfg "UsePAM" "yes"
-                _auth_key_set_cfg "AuthorizedKeysFile" ".ssh/authorized_keys"
-
-                if [[ "$target_user" == "root" ]]; then
-                    _auth_key_set_cfg "PermitRootLogin" "yes"
-                fi
-
-                _auth_key_set_cloud_password_auth "no" || {
-                    msg_err "写入 cloud-init SSH 配置失败。"
-                    echo
-                    continue
-                }
-
-                if _auth_key_check_and_restart; then
-                    msg_ok "已切换为仅 SSH 密钥登录。建议保留当前会话，并新开终端先测试登录。"
-                fi
-                echo
-                ;;
-
-            2)
-                _auth_key_backup_cfg || {
-                    msg_err "备份 SSH 配置失败。"
-                    echo
-                    continue
-                }
-
-                _auth_key_set_cfg "PubkeyAuthentication" "no"
-                _auth_key_set_cfg "PasswordAuthentication" "yes"
-                _auth_key_set_cfg "KbdInteractiveAuthentication" "no"
-                _auth_key_set_cfg "ChallengeResponseAuthentication" "no"
-                _auth_key_set_cfg "UsePAM" "yes"
-
-                if [[ "$target_user" == "root" ]]; then
-                    _auth_key_set_cfg "PermitRootLogin" "yes"
-                fi
-
-                _auth_key_set_cloud_password_auth "yes" || {
-                    msg_err "写入 cloud-init SSH 配置失败。"
-                    echo
-                    continue
-                }
-
-                if _auth_key_check_and_restart; then
-                    msg_ok "已切换为仅 SSH 密码登录。测试示例：ssh -p 2222 -o PreferredAuthentications=password -o PubkeyAuthentication=no ${target_user}@IP"
-                fi
-                echo
-                ;;
-
-            3)
-                new_pass="$(_auth_key_gen_password)"
-
-                if [[ -z "$new_pass" || ${#new_pass} -ne 16 ]]; then
-                    msg_err "生成随机密码失败。"
-                    echo
-                    continue
-                fi
-
-                if ! printf '%s:%s\n' "$target_user" "$new_pass" | chpasswd; then
-                    msg_err "重置密码失败。"
-                    echo
-                    continue
-                fi
-
-                msg_ok "用户 [$target_user] 的 SSH 密码已重置。"
-                echo "新密码：$new_pass"
-
-                if grep -qiE '^[[:space:]]*PasswordAuthentication[[:space:]]+no\b' "$cfg" \
-                    || [[ -f "$cloud_cfg" && -n "$(grep -iE '^[[:space:]]*PasswordAuthentication[[:space:]]+no\b' "$cloud_cfg" 2>/dev/null)" ]]; then
-                    echo "注意：当前 SSH 可能未开启密码登录，如需使用密码登录，请执行菜单 2。"
-                fi
-                echo
-                ;;
-
-            0)
-                return 0
-                ;;
-
-            *)
-                msg_err "无效选项，请重新输入。"
-                echo
-                ;;
-        esac
-    done
-}
-
-# -----------------------------
-#  系统清理脚本
-# -----------------------------
-sys_cle() {
-    local url="https://raw.githubusercontent.com/byilrq/vps/main/sys_cle.sh"
-    local script="/root/sys_cle.sh"
-    local cron_line='0 0 * * * /bin/bash /root/sys_cle.sh >> /root/sys_cle.cron.log 2>&1'
-
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$url" -o "$script" || { msg_err "下载失败"; return 1; }
-    else
-        wget -qO "$script" "$url" || { msg_err "下载失败"; return 1; }
-    fi
-    chmod +x "$script" >/dev/null 2>&1 || true
-
-    echo
-    echo "=============================="
-    echo "sys_cle 管理菜单"
-    echo "1) 添加 cron：每天 00:00 执行"
-    echo "2) 删除 cron"
-    echo "3) 立即执行一次清理"
-    echo "4) 查看当前 cron 状态"
-    echo "0) 退出"
-    echo "=============================="
-
-    local choice
-    read -rp "请选择 [0-4]: " choice
-
-    case "$choice" in
-        1)
-            (crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh"; echo "$cron_line") | crontab -
-            msg_ok "已添加每日 00:00 cron"
-            ;;
-        2)
-            crontab -l 2>/dev/null | grep -Fv "/root/sys_cle.sh" | crontab -
-            msg_ok "已删除 sys_cle cron"
-            ;;
-        3)
-            /bin/bash "$script"
-            ;;
-        4)
-            crontab -l 2>/dev/null | grep -F "/root/sys_cle.sh" || echo "未设置"
-            ;;
-        0) return 0 ;;
-        *) msg_err "无效选择" ;;
-    esac
-}
-# -----------------------------
-# 系统重启(cron)
-# -----------------------------
-cron_reboot() {
-  green "将下载定时任务文件到 /etc/cron.d/mdadm，并重启系统。"
-  read -rp "确认继续？(y/n): " ans
-  [[ "$ans" =~ ^[Yy]$ ]] || { green "已取消"; return 0; }
-
-  if ! command -v wget >/dev/null 2>&1; then
-    pkg_update || true
-    pkg_install wget || return 1
-  fi
-
-  wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/mdadm -O /etc/cron.d/mdadm || {
-    red "文件下载失败"
-    return 1
-  }
-
-  green "文件下载成功：/etc/cron.d/mdadm"
-  green "即将重启..."
-  reboot
-}
 # -----------------------------
 #  系统参数配置菜单（独立脚本）
 # -----------------------------
@@ -3569,6 +2697,18 @@ view_status() {
 install_xui_pro() {
     clear >/dev/null 2>&1 || true
     show_banner
+
+    # 检测端口 443 冲突：hysteria 2 也默认监听 443
+    if ss -lntp 2>/dev/null | grep -q ':443 '; then
+        local proc_443
+        proc_443=$(ss -lntp 2>/dev/null | grep ':443 ' | head -1)
+        if echo "$proc_443" | grep -qi "hysteria"; then
+            msg_err "检测到 Hysteria 2 正在占用端口 443。x.sh 和 h.sh 不能同时安装（均默认监听 443）。"
+            msg_err "请先卸载 h.sh（Hysteria 2）后再安装 x.sh。"
+            pause
+            return 1
+        fi
+    fi
 
     cleanup_services
     init_runtime_vars
