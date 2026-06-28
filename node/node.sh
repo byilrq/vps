@@ -17,7 +17,6 @@ SCRIPT_PATH="/root/node.sh"
 SERVICE_NAME="node"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 GITHUB_NODE_PY_URL="https://raw.githubusercontent.com/byilrq/vps/main/node/node.py"
-https://github.com/byilrq/vps/blob/main/node/node.py
 
 CRON_LOG="$WORK_DIR/node_cron.log"
 BOOT_LOG="$WORK_DIR/node_boot.log"
@@ -427,9 +426,9 @@ WorkingDirectory=$WORK_DIR
 Environment=NODE_WORK_DIR=$WORK_DIR
 ExecStart=/usr/bin/python3 $PYTHON_SCRIPT run-all
 Restart=always
-RestartSec=5
+RestartSec=2
 KillSignal=SIGTERM
-TimeoutStopSec=20
+TimeoutStopSec=5
 
 [Install]
 WantedBy=multi-user.target
@@ -459,15 +458,34 @@ install_service() {
 }
 
 restart_service() {
-    install_service || return 1
-    systemctl restart "$SERVICE_NAME"
+    systemctl restart "$SERVICE_NAME" 2>/dev/null || {
+        install_service || return 1
+        systemctl restart "$SERVICE_NAME"
+    }
     sleep 1
     if systemctl is-active --quiet "$SERVICE_NAME"; then
-        echo -e "${GREEN}✔ node 服务已启动/重启，并已设置开机自启${PLAIN}"
+        echo -e "${GREEN}✔ node 服务已重启${PLAIN}"
         return 0
     fi
     echo -e "${RED}❌ node 服务启动失败，请查看：journalctl -u $SERVICE_NAME -n 100 --no-pager${PLAIN}"
     return 1
+}
+
+restart_web() {
+    local port
+    read_config 2>/dev/null || true
+    port="${WEB_PORT:-$DEFAULT_WEB_PORT}"
+    echo -e "${BLUE}正在重启 Web 管理端...${PLAIN}"
+    if command -v curl >/dev/null 2>&1; then
+        if curl -ksS --max-time 5 -X POST "http://127.0.0.1:${port}/api/restart-web" -d "" 2>/dev/null; then
+            echo -e "${GREEN}✅ Web 管理端已重启${PLAIN}"
+            return 0
+        fi
+    fi
+    echo "尝试通过 kill 重启 web 进程..."
+    pkill -f "python3 $PYTHON_SCRIPT keyword-web" 2>/dev/null || true
+    sleep 1
+    echo -e "${GREEN}✅ 已触发 Web 管理端重启${PLAIN}"
 }
 
 deploy_from_github() {
@@ -800,7 +818,7 @@ if [[ "${1:-}" == "-uninstall" || "${1:-}" == "-service-remove" ]]; then
     exit $?
 fi
 if [[ "${1:-}" == "-restart" || "${1:-}" == "-start" ]]; then
-    restart_service
+    restart_web
     exit $?
 fi
 if [[ "${1:-}" == "-test" ]]; then
@@ -820,7 +838,7 @@ main_menu() {
         echo -e "${GREEN}4.${PLAIN} 停止运行"
         echo -e "${GREEN}5.${PLAIN} 查看运行情况"
         echo -e "${GREEN}6.${PLAIN} 卸载服务"
-        echo -e "${GREEN}7.${PLAIN} 重启服务"
+        echo -e "${GREEN}7.${PLAIN} 重启 Web 管理端"
         echo -e "${GREEN}8.${PLAIN} 推送测试消息"
 		echo -e "${GREEN}9.${PLAIN} 更新域名/HTTPS"   # 新增
         echo -e "${WHITE}0.${PLAIN} 退出"
@@ -834,7 +852,7 @@ main_menu() {
             4) stop_running ;;
             5) show_status ;;
             6) uninstall_service ;;
-            7) restart_service ;;
+            7) restart_web ;;
             8) test_notification ;;
 			9) update_node_domain ;;   # 新增
             0) exit 0 ;;

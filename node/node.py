@@ -1185,7 +1185,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
             new_keywords = form.get("keywords", [""])[0].strip()
             try:
                 update_keywords(new_keywords)
-                self.respond_page(new_keywords, "保存成功", False)
+                self.send_response(303)
+                self.send_header("Location", "/")
+                self.end_headers()
             except Exception as exc:
                 self.respond_page(new_keywords, f"保存失败: {exc}", True, status=500)
 
@@ -1901,16 +1903,21 @@ def cmd_run_all() -> int:
             server = build_keyword_web_server(cfg)
             settings = keyword_web_settings(cfg)
             print(f"node run-all started; monitor interval={max(15, safe_int(cfg.get('INTERVAL_SEC', '15'), 15))}s; keyword web={settings['url']}", flush=True)
-            server.timeout = 1.0
-            while True:
-                server.handle_request()
-                if WEB_RESTART_FILE.exists():
-                    try:
-                        WEB_RESTART_FILE.unlink()
-                    except Exception:
-                        pass
-                    server.server_close()
-                    break
+
+            def watch_restart(svr):
+                while True:
+                    time.sleep(1)
+                    if WEB_RESTART_FILE.exists():
+                        try:
+                            WEB_RESTART_FILE.unlink()
+                        except Exception:
+                            pass
+                        svr.shutdown()
+                        break
+
+            threading.Thread(target=watch_restart, args=(server,), daemon=True).start()
+            server.serve_forever()
+            server.server_close()
         return 0
     finally:
         remove_pid_file(PID_FILE)
