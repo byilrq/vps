@@ -44,6 +44,7 @@ WEB_PID_FILE = WORK_DIR / ".node_keyword_web.pid"
 WEB_LOCK_FILE = WORK_DIR / ".node_keyword_web.lock"
 LOG_RESET_FILE = WORK_DIR / ".log_last_reset_day"
 RUN_ENABLED_FILE = WORK_DIR / ".node_run_enabled"
+WEB_RESTART_FILE = WORK_DIR / ".node_web_restart"
 
 DEFAULT_URL = "https://rss.nodeseek.com/?sortBy=postTime"
 DEFAULT_WEB_HOST = os.environ.get("NODE_WEB_HOST", "0.0.0.0")
@@ -1150,6 +1151,10 @@ def build_keyword_handler(cfg: Dict[str, str]):
                 set_run_enabled(enabled)
                 self._send_json({"ok": True, "enabled": enabled, "server_time": now_str()})
                 return
+            if parsed.path == "/api/restart-web":
+                WEB_RESTART_FILE.write_text(now_str(), encoding="utf-8")
+                self._send_json({"ok": True, "message": "网页服务正在重启", "server_time": now_str()})
+                return
             if parsed.path == "/api/rss-refresh":
                 if not is_run_enabled():
                     self._send_json({
@@ -1366,6 +1371,48 @@ def build_keyword_handler(cfg: Dict[str, str]):
       .log-actions button { min-width: 0; padding: 0 6px; font-size: 12px; }
       .log-head { align-items: flex-start; }
     }
+    /* 自定义确认弹窗 */
+    .modal-overlay {
+      position: fixed; inset: 0; z-index: 9999;
+      display: flex; align-items: center; justify-content: center;
+      background: rgba(0,0,0,0.55);
+      backdrop-filter: blur(4px);
+      -webkit-backdrop-filter: blur(4px);
+      animation: modalFadeIn .18s ease;
+    }
+    .modal-overlay.hidden { display: none; }
+    @keyframes modalFadeIn {
+      from { opacity: 0; }
+      to { opacity: 1; }
+    }
+    @keyframes modalScaleIn {
+      from { opacity: 0; transform: scale(.92) translateY(8px); }
+      to { opacity: 1; transform: scale(1) translateY(0); }
+    }
+    .modal-box {
+      background: linear-gradient(180deg, #132b40 0%, #0d2133 100%);
+      border: 1px solid rgba(126,232,216,0.25);
+      border-radius: 24px;
+      padding: 28px 32px 24px;
+      max-width: 420px;
+      width: 90%;
+      box-shadow: 0 30px 80px rgba(0,10,22,0.6);
+      animation: modalScaleIn .20s ease;
+    }
+    .modal-title {
+      font-size: 18px; font-weight: 850; color: #edf7ff;
+      margin-bottom: 12px;
+    }
+    .modal-body {
+      font-size: 15px; line-height: 1.6; color: rgba(224,241,252,0.82);
+      margin-bottom: 24px;
+    }
+    .modal-actions {
+      display: flex; gap: 12px; justify-content: flex-end;
+    }
+    .modal-actions button {
+      min-width: 80px; padding: 0 20px;
+    }
   </style>
 </head>
 <body>
@@ -1434,6 +1481,8 @@ def build_keyword_handler(cfg: Dict[str, str]):
     let logTimer = null;
     let runStatusTimer = null;
 
+    let pendingConfirmCallback = null;
+
     function handleAction() {
       const form = document.getElementById('keywordForm');
       const textarea = document.getElementById('keywords');
@@ -1448,10 +1497,22 @@ def build_keyword_handler(cfg: Dict[str, str]):
         }, 50);
         return;
       }
-      form.submit();
+      document.getElementById('confirmMessage').textContent = '确认修改关键词并保存吗？';
+      pendingConfirmCallback = () => form.submit();
+      document.getElementById('confirmModal').classList.remove('hidden');
     }
 
+    function submitKeywords() {
+      const cb = pendingConfirmCallback;
+      pendingConfirmCallback = null;
+      document.getElementById('confirmModal').classList.add('hidden');
+      if (cb) cb();
+    }
 
+    function closeConfirmModal() {
+      pendingConfirmCallback = null;
+      document.getElementById('confirmModal').classList.add('hidden');
+    }
     function escapeHtml(text) {
       return String(text || '')
         .replace(/&/g, '&amp;')
@@ -1604,10 +1665,25 @@ def build_keyword_handler(cfg: Dict[str, str]):
     });
 
     setMode(logMode);
-    setLogVisible(localStorage.getItem('nodeRssLogVisible') === 'true', true);
-    fetchRunStatus();
-    runStatusTimer = setInterval(fetchRunStatus, 15000);
+
+    document.getElementById('confirmModal').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) closeConfirmModal();
+    });
+    document.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') closeConfirmModal();
+    });
   </script>
+  <!-- 自定义确认弹窗 -->
+  <div id="confirmModal" class="modal-overlay hidden">
+    <div class="modal-box">
+      <div class="modal-title">确认操作</div>
+      <div class="modal-body" id="confirmMessage">确认修改关键词并保存吗？</div>
+      <div class="modal-actions">
+        <button class="secondary" onclick="closeConfirmModal()">取消</button>
+        <button onclick="submitKeywords()">确认</button>
+      </div>
+    </div>
+  </div>
 </body>
 </html>'''
             html_doc = (html_doc
@@ -1807,17 +1883,10 @@ def cmd_run_all() -> int:
         print("node keyword web already running，跳过重复启动")
         return 0
 
-    server = None
-
     def _cleanup(*_args):
-        try:
-            if server is not None:
-                server.shutdown()
-        except Exception:
-            pass
         remove_pid_file(PID_FILE)
         remove_pid_file(WEB_PID_FILE)
-        sys.exit(0)
+        os._exit(0)
 
     signal.signal(signal.SIGTERM, _cleanup)
     signal.signal(signal.SIGINT, _cleanup)
@@ -1827,10 +1896,21 @@ def cmd_run_all() -> int:
         thread = threading.Thread(target=monitor.monitor_loop, name="node-monitor", daemon=True)
         thread.start()
 
-        server = build_keyword_web_server(cfg)
-        settings = keyword_web_settings(cfg)
-        print(f"node run-all started; monitor interval={max(15, safe_int(cfg.get('INTERVAL_SEC', '15'), 15))}s; keyword web={settings['url']}", flush=True)
-        server.serve_forever()
+        while True:
+            cfg = load_runtime_config()
+            server = build_keyword_web_server(cfg)
+            settings = keyword_web_settings(cfg)
+            print(f"node run-all started; monitor interval={max(15, safe_int(cfg.get('INTERVAL_SEC', '15'), 15))}s; keyword web={settings['url']}", flush=True)
+            server.timeout = 1.0
+            while True:
+                server.handle_request()
+                if WEB_RESTART_FILE.exists():
+                    try:
+                        WEB_RESTART_FILE.unlink()
+                    except Exception:
+                        pass
+                    server.server_close()
+                    break
         return 0
     finally:
         remove_pid_file(PID_FILE)
