@@ -2511,6 +2511,7 @@ system_query() {
     local cc_algo qdisc_algo headers_status active_qdisc default_iface
     local ipinfo country city isp
     local TOOL_IPV4="${TOOL_IPV4:-}" TOOL_IPV6="${TOOL_IPV6:-}"
+    local xray_cur_ver xray_latest_ver xray_ver_str
 
     cpu_info="$(lscpu 2>/dev/null | awk -F': +' '/Model name:/ {print $2; exit}')"
     [ -z "${cpu_info:-}" ] && cpu_info="$(awk -F': ' '/model name/ {print $2; exit}' /proc/cpuinfo 2>/dev/null)"
@@ -2609,6 +2610,27 @@ system_query() {
 
     get_public_ips_tool
 
+    # 获取 Xray 当前版本和最新版本
+    xray_cur_ver=""
+    xray_latest_ver=""
+    if [[ -f /usr/local/x-ui/bin/xray-linux-$(arch) ]]; then
+        xray_cur_ver=$(/usr/local/x-ui/bin/xray-linux-$(arch) version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+    fi
+    if [[ -z "$xray_cur_ver" && -f "$XUIDB" ]]; then
+        xray_cur_ver=$(sqlite3 "$XUIDB" "SELECT value FROM settings WHERE key='xrayVersion';" 2>/dev/null | tr -d '\r\n' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+    fi
+    # 从 releases 列表取版本号最高的（与 xray_update.sh 一致）
+    xray_latest_ver=$(curl -fsSL --connect-timeout 10 --max-time 20 \
+      "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=50" 2>/dev/null \
+      | grep -oE '"tag_name"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"' \
+      | sed -E 's/.*"v([0-9]+\.[0-9]+\.[0-9]+)".*/\1/' \
+      | sort -V | tail -n1 || true)
+    xray_ver_str="未知"
+    if [[ -n "$xray_cur_ver" ]]; then
+        xray_ver_str="当前 ${xray_cur_ver}"
+        [[ -n "$xray_latest_ver" ]] && xray_ver_str+="，最新 ${xray_latest_ver}"
+    fi
+
     ipinfo="$(curl -fsS --max-time 3 ipinfo.io/json 2>/dev/null || true)"
     if [ -n "${ipinfo:-}" ]; then
         country="$(echo "$ipinfo" | awk -F'"' '/"country"/ {print $4; exit}')"
@@ -2638,6 +2660,7 @@ system_query() {
     echo -e "DNS地址:      ${dns_addresses}"
     [ -n "${country:-}${city:-}" ] && echo -e "地理位置:     ${country:-未知} ${city:-}"
     echo -e "${cyan}------------------------------${none}"
+    echo -e "Xray版本:      ${xray_ver_str}"
     echo -e "拥塞控制算法: ${cc_algo}"
     echo -e "默认队列算法: ${qdisc_algo}"
     [ -n "${default_iface:-}" ] && echo -e "主网卡:       ${default_iface}"
@@ -2768,6 +2791,8 @@ install_xui_pro() {
     install_sub2sing_box
     install_fake_site
     setup_cronjob
+    # 安装时静默写入 Xray 自动更新 cron，不依赖用户弹框确认
+    setup_xray_update_cron "n" 2>/dev/null || true
     show_final_details
     pause
 }
@@ -2792,19 +2817,19 @@ menu() {
         echo -e " ${red}${bold}2)${none} ${red}卸载${none}"
         echo -e "${gray}--------------------------------------------------${none}"
         echo -e " ${yellow}${bold}3)${none} ${yellow}更新 Xray-core${none}"
-        echo -e " ${yellow}${bold}4)${none} ${yellow}打印节点信息${none}"
-        echo -e " ${yellow}${bold}5)${none} ${yellow}目标网站检测${none}"
-        echo -e " ${yellow}${bold}6)${none} ${yellow}系统参数配置${none}"
-        echo -e " ${yellow}${bold}7)${none} ${yellow}回程路由测试${none}"
-        echo -e " ${yellow}${bold}8)${none} ${yellow}IP质量检测${none}"
-        echo -e " ${yellow}${bold}9)${none} ${yellow}系统查询${none}"
-        echo -e " ${yellow}${bold}10)${none} ${yellow}查看状态${none}"
+        echo -e " ${yellow}${bold}4)${none} ${yellow}查看状态${none}"
+        echo -e " ${yellow}${bold}5)${none} ${yellow}打印节点信息${none}"
+        echo -e " ${yellow}${bold}6)${none} ${yellow}目标网站检测${none}"
+        echo -e " ${yellow}${bold}7)${none} ${yellow}系统参数配置${none}"
+        echo -e " ${yellow}${bold}8)${none} ${yellow}回程路由测试${none}"
+        echo -e " ${yellow}${bold}9)${none} ${yellow}IP质量检测${none}"
+        echo -e " ${yellow}${bold}10)${none} ${yellow}系统查询${none}"
 		echo -e " ${green}${bold}11)${none} ${green}更新域名/SNI${none}"   # 新增行
         echo -e " ${red}${bold}0)${none} 退出"
 
         echo -e "${gray}--------------------------------------------------${none}"
         echo -e "${dim}${gray}提示：输入数字后回车${none}"
-        echo -ne "${green}${bold}请选择 [0-10]${none}${green}: ${none}"
+        echo -ne "${green}${bold}请选择 [0-11]${none}${green}: ${none}"
 
         local choice=""
 
@@ -2814,14 +2839,14 @@ menu() {
             1) INSTALL="y"; UNINSTALL="n"; install_xui_pro ;;
             2) uninstall_xui_menu ;;
             3) xray_updata ;;
-            4) print_node_info ;;
-            5) detect_target_site ;;
-            6) run_sys_conf ;;
-            7) besttrace_test ;;
-            8) ip_quality_check ;;
-            9) system_query ;;
-            10) view_status ;;
-			11) update_domain_sni ;;   # 新增调用
+            4) view_status ;;
+            5) print_node_info ;;
+            6) detect_target_site ;;
+            7) run_sys_conf ;;
+            8) besttrace_test ;;
+            9) ip_quality_check ;;
+            10) system_query ;;
+            11) update_domain_sni ;;
             0) exit 0 ;;
             *) msg_err "无效输入，请重新选择。"; pause ;;
         esac
