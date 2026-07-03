@@ -30,6 +30,7 @@ import xml.etree.ElementTree as ET
 
 WORK_DIR = Path(os.environ.get("NODE_WORK_DIR", "/root/node"))
 CONFIG_FILE = WORK_DIR / "node_config.txt"
+KEYWORDS_FILE = WORK_DIR / "node_keywords.txt"
 LOG_FILE = WORK_DIR / "node.log"
 CRON_LOG = WORK_DIR / "node_cron.log"
 BOOT_LOG = WORK_DIR / "node_boot.log"
@@ -140,7 +141,8 @@ def load_runtime_config() -> Dict[str, str]:
     cfg = parse_shell_config(CONFIG_FILE)
     cfg.setdefault("NS_URL", DEFAULT_URL)
     cfg.setdefault("INTERVAL_SEC", "15")
-    cfg.setdefault("KEYWORDS", "")
+    kw = read_keywords()
+    cfg["KEYWORDS"] = kw if kw else ""
     cfg.setdefault("DEBUG_LOG", "0")
     cfg.setdefault("WEB_HOST", DEFAULT_WEB_HOST)
     cfg.setdefault("WEB_PORT", str(DEFAULT_WEB_PORT))
@@ -212,44 +214,31 @@ def unescape_shell_value(value: str) -> str:
 
 
 def read_keywords() -> str:
-    if not CONFIG_FILE.exists():
-        return ""
-    with CONFIG_FILE.open("r", encoding="utf-8") as fh:
-        for raw in fh:
-            m = KEY_RE.match(raw.rstrip("\n"))
-            if m:
-                return unescape_shell_value(m.group(2))
+    if KEYWORDS_FILE.exists():
+        try:
+            return KEYWORDS_FILE.read_text(encoding="utf-8").strip()
+        except Exception:
+            pass
+    # fallback + 迁移: 从旧配置文件读取
+    if CONFIG_FILE.exists():
+        with CONFIG_FILE.open("r", encoding="utf-8") as fh:
+            for raw in fh:
+                m = KEY_RE.match(raw.rstrip("\n"))
+                if m:
+                    val = unescape_shell_value(m.group(2))
+                    if val:
+                        try:
+                            KEYWORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+                            KEYWORDS_FILE.write_text(val, encoding="utf-8")
+                        except Exception:
+                            pass
+                    return val
     return ""
 
 
 def update_keywords(new_value: str) -> None:
-    new_value = escape_shell_value(new_value)
-    lines: List[str] = []
-    found = False
-
-    if CONFIG_FILE.exists():
-        with CONFIG_FILE.open("r", encoding="utf-8") as fh:
-            for raw in fh:
-                line = raw.rstrip("\n")
-                m = KEY_RE.match(line)
-                if m and not found:
-                    lines.append(f'{m.group(1)}{new_value}{m.group(3)}')
-                    found = True
-                else:
-                    lines.append(line)
-
-    if not found:
-        lines.append(f'KEYWORDS="{new_value}"')
-
-    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_path = tempfile.mkstemp(prefix="node_config.", dir=str(CONFIG_FILE.parent))
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write("\n".join(lines) + "\n")
-        os.replace(tmp_path, CONFIG_FILE)
-    finally:
-        if os.path.exists(tmp_path):
-            os.remove(tmp_path)
+    KEYWORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    KEYWORDS_FILE.write_text(new_value, encoding="utf-8")
 
 
 def keyword_web_settings(cfg: Dict[str, str]) -> Dict[str, str]:

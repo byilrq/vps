@@ -312,13 +312,31 @@ init_default_vars() {
     NTFY_TOPIC="${NTFY_TOPIC:-node}"
     NTFY_PRIORITY="${NTFY_PRIORITY:-3}"
     NS_URL="${NS_URL:-$DEFAULT_NS_URL}"
-    KEYWORDS="${KEYWORDS:-}"
     INTERVAL_SEC="${INTERVAL_SEC:-$DEFAULT_INTERVAL_SEC}"
     DEBUG_LOG="${DEBUG_LOG:-0}"
     WEB_HOST="0.0.0.0"
     WEB_PORT="$DEFAULT_WEB_PORT"
     WEB_PIN="${WEB_PIN:-$DEFAULT_WEB_PIN}"
     WEB_DOMAIN="${WEB_DOMAIN:-}"
+}
+
+read_config() {
+    if [ ! -s "$CONFIG_FILE" ]; then
+        return 1
+    fi
+    # shellcheck disable=SC1090
+    source "$CONFIG_FILE"
+    TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
+    TG_PUSH_CHAT_ID="${TG_PUSH_CHAT_ID:-}"
+    PUSH_CHANNEL="${PUSH_CHANNEL:-tg}"
+    NTFY_URL="${NTFY_URL:-http://127.0.0.1:8083}"
+    NTFY_USERNAME="${NTFY_USERNAME:-}"
+    NTFY_PASSWORD="${NTFY_PASSWORD:-}"
+    NTFY_TOPIC="${NTFY_TOPIC:-node}"
+    NTFY_PRIORITY="${NTFY_PRIORITY:-3}"
+    NS_URL="${NS_URL:-$DEFAULT_NS_URL}"
+    INTERVAL_SEC="${INTERVAL_SEC:-$DEFAULT_INTERVAL_SEC}"
+    return 0
 }
 
 write_config() {
@@ -335,7 +353,6 @@ NTFY_PASSWORD="$(escape_config_value "${NTFY_PASSWORD:-}")"
 NTFY_TOPIC="$(escape_config_value "${NTFY_TOPIC:-node}")"
 NTFY_PRIORITY="$(escape_config_value "${NTFY_PRIORITY:-3}")"
 NS_URL="$(escape_config_value "${NS_URL:-$DEFAULT_NS_URL}")"
-KEYWORDS="$(escape_config_value "${KEYWORDS:-}")"
 INTERVAL_SEC="$(escape_config_value "${INTERVAL_SEC:-$DEFAULT_INTERVAL_SEC}")"
 DEBUG_LOG="$(escape_config_value "${DEBUG_LOG:-0}")"
 WEB_HOST="0.0.0.0"
@@ -620,17 +637,6 @@ configure_params() {
     [[ -z "$new_debug" ]] && new_debug="${DEBUG_LOG:-0}"
     [[ "$new_debug" != "1" ]] && new_debug="0"
     DEBUG_LOG="$new_debug"
-
-    echo
-    echo "当前关键词：${KEYWORDS:-未设置}"
-    echo "支持写法：单关键词（抽奖）或 AND（车&box / a&b&c）"
-    read -rp "是否需要重置关键词？(Y/N): " reset_kw
-    if [[ "$reset_kw" =~ ^[Yy]$ ]]; then
-        read -rp "输入关键词（多个可用空格或逗号，留空=清空）: " new_keywords
-        new_keywords=${new_keywords//,/ }
-        new_keywords=$(echo "$new_keywords" | xargs 2>/dev/null || true)
-        KEYWORDS="$new_keywords"
-    fi
 
     read -rp "关键词网页 PIN [当前: ${WEB_PIN:-$DEFAULT_WEB_PIN}]（4位数字）: " new_web_pin
     [[ -z "$new_web_pin" ]] && new_web_pin="${WEB_PIN:-$DEFAULT_WEB_PIN}"
