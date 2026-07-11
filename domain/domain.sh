@@ -76,15 +76,57 @@ fix_dpkg_interrupt() {
 install_tool_deps() {
     export DEBIAN_FRONTEND=noninteractive
 
+    local tools=("curl" "wget" "openssl" "ca-certificates" "nginx" "certbot" "python3-certbot-dns-cloudflare")
+    local missing_tools=()
+
+    for tool in "${tools[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1 && ! dpkg -l | grep -q "^ii  $tool"; then
+            missing_tools+=("$tool")
+        fi
+    done
+
+    if [[ ${#missing_tools[@]} -eq 0 ]]; then
+        msg_ok "所有依赖已安装，跳过安装。"
+        return 0
+    fi
+
+    echo "检测到缺失依赖，开始安装..."
+
     if command -v apt-get >/dev/null 2>&1; then
         fix_dpkg_interrupt
+        echo -ne "正在更新软件包列表 "
+        for i in {1..5}; do
+            echo -n "→"
+            sleep 0.2
+        done
+        echo
         apt-get update -y -q >/dev/null 2>&1 || true
+
+        echo -ne "正在安装依赖 "
+        for i in {1..10}; do
+            echo -n "→"
+            sleep 0.2
+        done
+        echo
         apt-get install -y -q --no-install-recommends \
             curl wget openssl ca-certificates \
             nginx certbot python3-certbot-dns-cloudflare \
             >/dev/null 2>&1 || true
     elif command -v yum >/dev/null 2>&1; then
+        echo -ne "正在安装 epel-release "
+        for i in {1..3}; do
+            echo -n "→"
+            sleep 0.2
+        done
+        echo
         yum install -y epel-release >/dev/null 2>&1 || true
+
+        echo -ne "正在安装依赖 "
+        for i in {1..10}; do
+            echo -n "→"
+            sleep 0.2
+        done
+        echo
         yum install -y curl wget openssl ca-certificates \
             nginx certbot python3-certbot-dns-cloudflare \
             >/dev/null 2>&1 || true
@@ -567,9 +609,8 @@ menu() {
 #  程序入口
 # -----------------------------
 main() {
-    echo "正在安装必要软件（nginx, certbot, certbot-dns-cloudflare）..."
     install_tool_deps
-    msg_ok "依赖安装完成。"
+    echo
 
     # 入口不再清理服务；HTTP 验证时按需临时 reload nginx，DNS 验证完全不碰 nginx
     menu
