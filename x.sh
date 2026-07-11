@@ -46,7 +46,7 @@ PANEL_PORT_FIXED=8443
 fallback_port=""
 reality_listen_port=443
 reality_port=443
-ws_port=2083
+ws_port=2053
 ws_path="xian"
 
 # -----------------------------
@@ -176,7 +176,7 @@ init_runtime_vars() {
     short_id=$(openssl rand -hex 4)
 
     # 双协议默认参数
-    ws_port=2083
+    ws_port=2053
     ws_path="xian"
     ws_email=$(gen_random_string 8)
 }
@@ -1778,7 +1778,7 @@ setup_ufw() {
   while true; do
     clear
     echo "---------------- 防火墙设置 (ufw) ----------------"
-    echo " 1) 开启防火墙并设置放行端口（默认放行 SSH/80/443/8443/2083）"
+    echo " 1) 开启防火墙并设置放行端口（默认放行 SSH/80/443/8443/2053）"
     echo " 2) 关闭防火墙"
     echo " 3) 查看当前防火墙状态/规则（并检查监听）"
     echo " 4) 清除除 SSH 以外的所有放行规则"
@@ -1800,7 +1800,7 @@ setup_ufw() {
 
         local sshp ports default_ports all_ports p start end
         sshp="$(get_ssh_port)"
-        default_ports="80 443 8443 2083"
+        default_ports="80 443 8443 2053"
 
         yellow "当前 SSH 端口：$sshp，将自动放行 tcp/udp 防止失联。"
         yellow "默认还将放行端口：$default_ports"
@@ -1876,8 +1876,8 @@ setup_ufw() {
         yellow "当前系统监听端口（节选）："
         ss -lntu | head -n 30
         echo ""
-        yellow "默认关注端口监听情况：SSH/80/443/8443/2083"
-        _check_listen_ports "$(get_ssh_port) 80 443 8443 2083"
+        yellow "默认关注端口监听情况：SSH/80/443/8443/2053"
+        _check_listen_ports "$(get_ssh_port) 80 443 8443 2053"
         echo ""
         read -rp "回车返回菜单..." _
         ;;
