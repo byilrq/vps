@@ -129,15 +129,24 @@ change_tz() {
       ;;
   esac
 
-  if ! timedatectl list-timezones | grep -qx "$tz"; then
-    red "时区无效：$tz"
-    yellow "提示：timedatectl list-timezones 查看可用时区"
-    return 1
+  if command -v timedatectl >/dev/null 2>&1 && timedatectl list-timezones >/dev/null 2>&1; then
+    if ! timedatectl list-timezones | grep -qx "$tz"; then
+      red "时区无效：$tz"
+      yellow "提示：timedatectl list-timezones 查看可用时区"
+      return 1
+    fi
+    timedatectl set-timezone "$tz"
+  else
+    if [[ ! -f "/usr/share/zoneinfo/$tz" ]]; then
+      red "时区无效：$tz"
+      yellow "提示：ls /usr/share/zoneinfo/ 查看可用时区"
+      return 1
+    fi
+    ln -sf "/usr/share/zoneinfo/$tz" /etc/localtime
   fi
 
-  timedatectl set-timezone "$tz"
   green "系统时区已经改为：$tz"
-  timedatectl
+  [[ -x "$(command -v timedatectl)" ]] && timedatectl || date '+%Z'
 
   read -rp "回车返回菜单..." _
 }
