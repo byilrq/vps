@@ -2507,7 +2507,7 @@ system_query() {
     install_tool_deps
     clear >/dev/null 2>&1 || true
 
-    local cpu_info cpu_cores cpu_freq mem_info disk_info load os_info kernel_version cpu_arch hostname now runtime dns_addresses
+    local cpu_info cpu_cores cpu_freq mem_info disk_info load os_info kernel_version cpu_arch hostname now timezone runtime dns_addresses
     local cc_algo qdisc_algo headers_status active_qdisc default_iface
     local ipinfo country city isp
     local TOOL_IPV4="${TOOL_IPV4:-}" TOOL_IPV6="${TOOL_IPV6:-}"
@@ -2555,6 +2555,7 @@ system_query() {
     cpu_arch="$(uname -m 2>/dev/null || echo 未知)"
     hostname="$(hostname 2>/dev/null || uname -n 2>/dev/null || echo 未知)"
     now="$(date '+%Y-%m-%d %H:%M:%S' 2>/dev/null || echo 未知)"
+    timezone="$(timedatectl show -p Timezone --value 2>/dev/null || cat /etc/timezone 2>/dev/null || echo '未知')"
 
     runtime="$(awk '{
       d=int($1/86400);
@@ -2665,8 +2666,8 @@ system_query() {
     echo -e "默认队列算法: ${qdisc_algo}"
     [ -n "${default_iface:-}" ] && echo -e "主网卡:       ${default_iface}"
     [ -n "${active_qdisc:-}" ] && echo -e "网卡队列算法: ${active_qdisc}"
-    echo -e "内核headers:  ${headers_status}"
     echo -e "系统时间:     ${now}"
+    echo -e "系统时区:     ${timezone}"
     echo -e "运行时长:     ${runtime}"
     echo
 }
