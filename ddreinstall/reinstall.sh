@@ -98,36 +98,42 @@ show_interactive_menu() {
     1)
         echo ""
         echo "可用版本:"
-        echo "  1. Debian 9  (Stretch)"
-        echo "  2. Debian 10 (Buster)"
+        echo "  1. Debian 9  (Stretch) - ELTS"
+        echo "  2. Debian 10 (Buster) - ELTS"
         echo "  3. Debian 11 (Bullseye)"
-        echo "  4. Debian 12 (Bookworm)"
+        echo "  4. Debian 12 (Bookworm) - LTS"
         echo "  5. Debian 13 (Trixie)"
+        echo "  6. Debian 14 (Forky)"
+        echo "  7. Debian 15 (Duke)"
         echo ""
-        read -p "请选择版本 [1-5]: " ver_choice
+        read -p "请选择版本 [1-7]: " ver_choice
         case "$ver_choice" in
         1) distro=debian; releasever=9 ;;
         2) distro=debian; releasever=10 ;;
         3) distro=debian; releasever=11 ;;
         4) distro=debian; releasever=12 ;;
         5) distro=debian; releasever=13 ;;
+        6) distro=debian; releasever=14 ;;
+        7) distro=debian; releasever=15 ;;
         *) echo "无效选择"; exit 1 ;;
         esac
         ;;
     2)
         echo ""
         echo "可用版本:"
-        echo "  1. Ubuntu 18.04 (Bionic)"
-        echo "  2. Ubuntu 20.04 (Focal)"
-        echo "  3. Ubuntu 22.04 (Jammy)"
-        echo "  4. Ubuntu 24.04 (Noble)"
+        echo "  1. Ubuntu 18.04 (Bionic) - LTS"
+        echo "  2. Ubuntu 20.04 (Focal) - LTS"
+        echo "  3. Ubuntu 22.04 (Jammy) - LTS"
+        echo "  4. Ubuntu 24.04 (Noble) - LTS"
+        echo "  5. Ubuntu 26.04 (Resolute) - LTS"
         echo ""
-        read -p "请选择版本 [1-4]: " ver_choice
+        read -p "请选择版本 [1-5]: " ver_choice
         case "$ver_choice" in
         1) distro=ubuntu; releasever=18.04 ;;
         2) distro=ubuntu; releasever=20.04 ;;
         3) distro=ubuntu; releasever=22.04 ;;
         4) distro=ubuntu; releasever=24.04 ;;
+        5) distro=ubuntu; releasever=26.04 ;;
         *) echo "无效选择"; exit 1 ;;
         esac
         ;;
