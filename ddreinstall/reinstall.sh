@@ -207,12 +207,43 @@ show_interactive_menu() {
     fi
     echo "检测到架构: $basearch ($basearch_alt)" >&2
 
-    # 直接生成镜像URL（版本选择时已确定codename）
-    if [ "$distro" = "debian" ]; then
-        img="https://cloud.debian.org/images/cloud/$codename/latest/debian-$releasever-genericcloud-$basearch_alt.qcow2"
-    else
-        img="https://cloud-images.ubuntu.com/releases/$codename/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img"
-    fi
+    # 选择镜像源
+    echo ""
+    echo "镜像源选择:"
+    echo "  1. 使用本地挂载路径"
+    echo "  2. 使用官方云镜像（自动生成）"
+    echo ""
+    read -p "请选择 [1-2]: " mirror_choice
+
+    case "$mirror_choice" in
+    1)
+        echo ""
+        read -p "请输入本地镜像路径（如 /mnt/rclone/soft/debian-13-generic-amd64.qcow2）: " img
+        while [ -z "$img" ]; do
+            echo "路径不能为空" >&2
+            read -p "请输入本地镜像路径: " img
+        done
+
+        # 验证文件存在
+        if [ ! -f "$img" ]; then
+            echo "错误: 文件不存在: $img" >&2
+            exit 1
+        fi
+        echo "✓ 镜像文件已找到: $img" >&2
+        ;;
+    2)
+        # 直接生成镜像URL（版本选择时已确定codename）
+        if [ "$distro" = "debian" ]; then
+            img="https://cloud.debian.org/images/cloud/$codename/latest/debian-$releasever-genericcloud-$basearch_alt.qcow2"
+        else
+            img="https://cloud-images.ubuntu.com/releases/$codename/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img"
+        fi
+        ;;
+    *)
+        echo "无效选择"
+        exit 1
+        ;;
+    esac
 
     echo "已选择镜像:" >&2
     echo "$img" >&2
@@ -554,6 +585,18 @@ test_url_real() {
     }
 
     tmp_file=$tmp/img-test
+
+    # 检测是本地路径还是 URL
+    if [ "${url#/}" != "$url" ]; then
+        # 本地路径（以 / 开头）
+        if [ ! -f "$url" ]; then
+            msg="Local file not found: $url"
+            failed "$msg"
+            return 1
+        fi
+        echo "✓ Local file found: $url"
+        return 0
+    fi
 
     # TODO: 好像无法识别 nixos 官方源的跳转
     # 有的服务器不支持 range，curl会下载整个文件
@@ -4049,7 +4092,16 @@ mod_initrd_alpine() {
             mkdir -p $ipv6_dir
             modloop_file=$tmp/modloop_file
             modloop_dir=$tmp/modloop_dir
-            curl -Lo $modloop_file $nextos_modloop
+            # 下载 modloop 带重试
+            local retry_count=0
+            while ! curl -fsSL --max-time 120 --connect-timeout 30 -L "$nextos_modloop" -o "$modloop_file"; do
+                retry_count=$((retry_count + 1))
+                if [ $retry_count -ge 3 ]; then
+                    error_and_exit "Failed to download modloop: $nextos_modloop"
+                fi
+                sleep 5
+            done
+
             if is_in_windows; then
                 # cygwin 没有 unsquashfs
                 7z e $modloop_file ipv6.ko -r -y -o$ipv6_dir
@@ -5051,12 +5103,33 @@ if is_netboot_xyz; then
         curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
     fi
 else
-    # 下载 nextos 内核
+    # 下载 nextos 内核 (带重试和超时)
     info download vmlnuz and initrd
-    curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
-    curl -Lo /reinstall-initrd $nextos_initrd
+    download_with_retry() {
+        local url=$1
+        local output=$2
+        local max_tries=5
+        local timeout=120
+
+        for i in $(seq 1 $max_tries); do
+            echo "下载尝试 $i/$max_tries: $url" >&2
+            if curl -fsSL --max-time $timeout --connect-timeout 30 -L "$url" -o "$output"; then
+                echo "✓ 下载成功: $output" >&2
+                return 0
+            fi
+            if [ $i -lt $max_tries ]; then
+                sleep 5
+            fi
+        done
+
+        error_and_exit "下载失败: $url (在 $max_tries 次尝试后)"
+    }
+
+    download_with_retry "$nextos_vmlinuz" "/reinstall-vmlinuz"
+    download_with_retry "$nextos_initrd" "/reinstall-initrd"
+
     if is_use_firmware; then
-        curl -Lo /reinstall-firmware $nextos_firmware
+        download_with_retry "$nextos_firmware" "/reinstall-firmware"
     fi
 fi
 
@@ -5065,7 +5138,33 @@ if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
     mod_initrd
 fi
 
-# 将内核/netboot.xyz.lkrn 放到正确的位置
+# 如果使用本地镜像，复制到 /tmp 作为新的本地位置
+if [ "${img#/}" != "$img" ]; then
+    # 本地路径（以 / 开头）
+    if [ -f "$img" ]; then
+        echo "检测到本地镜像，复制到临时位置..." >&2
+
+        # 计算文件大小
+        img_size=$(stat -c%s "$img" 2>/dev/null || stat -f%z "$img" 2>/dev/null)
+
+        # 复制到 /tmp
+        tmp_img="/tmp/local_image.qcow2"
+        echo "正在复制镜像文件（约 $((img_size/1024/1024))MB）..." >&2
+        cp -v "$img" "$tmp_img" || error_and_exit "复制镜像失败"
+
+        # 验证复制完整性
+        if [ "$(stat -c%s "$tmp_img" 2>/dev/null || stat -f%z "$tmp_img" 2>/dev/null)" -ne "$img_size" ]; then
+            error_and_exit "镜像复制不完整"
+        fi
+
+        echo "✓ 镜像已复制到: $tmp_img" >&2
+        img="$tmp_img"
+    else
+        error_and_exit "本地镜像文件不存在: $img"
+    fi
+fi
+
+
 if false && is_need_boot_vmlinuz; then
     if is_in_windows; then
         cp -f /reinstall-vmlinuz /cygdrive/$c/

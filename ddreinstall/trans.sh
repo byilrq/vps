@@ -4762,20 +4762,33 @@ disable_kdump() {
 
 download_qcow() {
     apk add qemu-img
-    info "Download qcow2 image"
 
     mkdir -p /installer
     mount /dev/disk/by-label/installer /installer
 
     qcow_file=/installer/cloud_image.qcow2
-    if [ -n "$img_type_warp" ]; then
-        # 边下载边解压，单线程下载
-        # 用官方 wget ，带进度条
-        apk add wget
-        wget $img -O- | pipe_extract >$qcow_file
+
+    # 检测是本地路径还是 URL
+    if [ "${img#/}" != "$img" ]; then
+        # 本地路径（以 / 开头）
+        info "Copy local image"
+        if [ ! -f "$img" ]; then
+            error "Local image not found: $img"
+            exit 1
+        fi
+        cp "$img" "$qcow_file"
+        echo "✓ Image copied from: $img" >&2
     else
-        # 多线程下载
-        download "$img" "$qcow_file"
+        # URL 下载
+        info "Download qcow2 image"
+        if [ -n "$img_type_warp" ]; then
+            # 边下载边解压，单线程下载
+            apk add wget
+            wget --timeout=60 $img -O- | pipe_extract >$qcow_file
+        else
+            # 多线程下载
+            download "$img" "$qcow_file"
+        fi
     fi
 }
 
