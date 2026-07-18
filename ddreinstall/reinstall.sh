@@ -151,20 +151,84 @@ show_interactive_menu() {
     read -p "SSH 用户名 [root]: " username
     username=${username:-root}
 
-    read -p "SSH 密码: " password
-    while [ -z "$password" ]; do
-        echo "密码不能为空"
-        read -p "SSH 密码: " password
-    done
+    read -p "SSH 密码 [16位随机]: " password
+    if [ -z "$password" ]; then
+        password=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' ')
+        echo "已生成随机密码: $password"
+    fi
 
     read -p "SSH 端口 [2222]: " ssh_port
     ssh_port=${ssh_port:-2222}
 
-    read -p "镜像 URL: " img
-    while [ -z "$img" ]; do
-        echo "镜像 URL 不能为空"
+    echo ""
+    echo "镜像源选择:"
+    echo "  1. 使用官方镜像源（自动检测）"
+    echo "  2. 输入自定义 URL"
+    echo ""
+    read -p "请选择 [1-2]: " img_choice
+
+    case "$img_choice" in
+    1)
+        echo ""
+        echo "正在检测官方镜像源..." >&2
+
+        if [ "$distro" = "debian" ]; then
+            echo "检测 Debian 镜像源..." >&2
+            mirrors=(
+                "https://deb.debian.org/debian"
+                "https://mirrors.aliyun.com/debian"
+                "https://mirror.nju.edu.cn/debian"
+            )
+        else
+            echo "检测 Ubuntu 镜像源..." >&2
+            mirrors=(
+                "https://cloud-images.ubuntu.com"
+                "https://mirrors.aliyun.com/ubuntu-cloud-images"
+                "https://mirror.nju.edu.cn/ubuntu-cloud-images"
+            )
+        fi
+
+        best_mirror=""
+        for mirror in "${mirrors[@]}"; do
+            if timeout 3 curl -s -o /dev/null -w "%{http_code}" "$mirror" 2>/dev/null | grep -q '^[23]'; then
+                echo "  ✓ $mirror" >&2
+                if [ -z "$best_mirror" ]; then
+                    best_mirror="$mirror"
+                fi
+            else
+                echo "  ✗ $mirror" >&2
+            fi
+        done
+
+        if [ -z "$best_mirror" ]; then
+            best_mirror="${mirrors[0]}"
+            echo "已选择默认源: $best_mirror" >&2
+        else
+            echo "已选择最快源: $best_mirror" >&2
+        fi
+
+        echo ""
+        echo "请提供完整镜像文件名（例如: debian-12-genericcloud-amd64.qcow2）" >&2
+        read -p "镜像文件名: " img_filename
+        while [ -z "$img_filename" ]; do
+            echo "镜像文件名不能为空" >&2
+            read -p "镜像文件名: " img_filename
+        done
+
+        img="$best_mirror/$img_filename"
+        ;;
+    2)
         read -p "镜像 URL: " img
-    done
+        while [ -z "$img" ]; do
+            echo "镜像 URL 不能为空" >&2
+            read -p "镜像 URL: " img
+        done
+        ;;
+    *)
+        echo "无效选择"
+        exit 1
+        ;;
+    esac
 
     echo ""
     echo "安装配置:"
