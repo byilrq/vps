@@ -2228,7 +2228,7 @@ basic_init() {
     clear_machine_id $os_dir
 
     # sshd
-    chroot $os_dir ssh-keygen -A
+    chroot $os_dir ssh-keygen -A || true
 
     sshd_enabled=false
     sshs="sshd.service ssh.service sshd.socket ssh.socket"
