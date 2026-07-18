@@ -12,6 +12,12 @@ set -eE
 # shellcheck disable=SC2034
 SCRIPT_VERSION=4BACD833-A585-23BA-6CBB-9AA4E08E0004
 
+# 美国服务器：使用国际 CDN 镜像源
+# 优先级：Fastly CDN > Archive > 官方源
+# 同时增加超时时间到 60 秒
+export CURL_TIMEOUT=60
+MIRROR_SOURCES="https://fastly.cdn.debian.org https://archive.debian.org https://cloud.debian.org"
+
 TRUE=0
 FALSE=1
 EFI_UUID=C12A7328-F81F-11D2-BA4B-00A0C93EC93B
@@ -2718,6 +2724,8 @@ aria2c() {
         --allow-overwrite=true \
         --summary-interval=0 \
         --max-tries 1 \
+        --connect-timeout=60 \
+        --timeout=60 \
         --bt-tracker="$([ -f "/tmp/trackers" ] && cat /tmp/trackers)" \
         "$@"
 }
@@ -4769,14 +4777,30 @@ download_qcow() {
     mount /dev/disk/by-label/installer /installer
 
     qcow_file=/installer/cloud_image.qcow2
+
+    # 美国服务器镜像源自动转换和重试
+    img_url="$img"
+    if echo "$img_url" | grep -q "cloud.debian.org"; then
+        # 尝试 Fastly CDN -> Archive -> 官方源
+        for mirror in "https://fastly.cdn.debian.org" "https://archive.debian.org" "https://cloud.debian.org"; do
+            img_try=$(echo "$img_url" | sed "s|https://cloud.debian.org|$mirror|g")
+            echo "尝试下载: $img_try" >&2
+            if wget --timeout=60 -q -O- "$img_try" 2>/dev/null | head -c 1 >/dev/null; then
+                img_url="$img_try"
+                echo "✓ 镜像源可用: $mirror" >&2
+                break
+            fi
+        done
+    fi
+
     if [ -n "$img_type_warp" ]; then
         # 边下载边解压，单线程下载
         # 用官方 wget ，带进度条
         apk add wget
-        wget $img -O- | pipe_extract >$qcow_file
+        wget --timeout=60 $img_url -O- | pipe_extract >$qcow_file
     else
-        # 多线程下载
-        download "$img" "$qcow_file"
+        # 多线程下载 (增加超时时间)
+        download "$img_url" "$qcow_file"
     fi
 }
 
