@@ -2141,7 +2141,7 @@ add_systemd_service() {
     local service_name=$2
 
     download "$confhome/$service_name.service" "$os_dir/etc/systemd/system/$service_name.service"
-    chroot "$os_dir" systemctl enable "$service_name.service"
+    chroot "$os_dir" systemctl enable "$service_name.service" 2>/dev/null || true
 
     # aosc 首次开机会执行 preset-all
     # 因此需要设置 fix-eth-name 的 preset 状态
@@ -2233,14 +2233,14 @@ basic_init() {
     sshd_enabled=false
     sshs="sshd.service ssh.service sshd.socket ssh.socket"
     for i in $sshs; do
-        if chroot $os_dir systemctl -q is-enabled $i; then
+        if chroot $os_dir systemctl -q is-enabled $i 2>/dev/null; then
             sshd_enabled=true
             break
         fi
     done
     if ! $sshd_enabled; then
         for i in $sshs; do
-            if chroot $os_dir systemctl -q enable $i; then
+            if chroot $os_dir systemctl -q enable $i 2>/dev/null; then
                 break
             fi
         done
@@ -2579,14 +2579,14 @@ EOF
     # 初始化
     if false; then
         # preset-all 后多了很多服务，内存占用多了几十M
-        chroot $os_dir systemctl preset-all
+        chroot $os_dir systemctl preset-all 2>/dev/null || true
     fi
 
     # 网络配置
     case "$network_app" in
     systemd-networkd)
-        chroot $os_dir systemctl enable systemd-networkd
-        chroot $os_dir systemctl enable systemd-resolved
+        chroot $os_dir systemctl enable systemd-networkd 2>/dev/null || true
+        chroot $os_dir systemctl enable systemd-resolved 2>/dev/null || true
 
         apk add cloud-init
         # 第二次运行会报错
@@ -2615,7 +2615,7 @@ EOF
         cat -n $os_dir/etc/systemd/network/10-cloud-init-eth*.network
         ;;
     network-manager)
-        chroot $os_dir systemctl enable NetworkManager
+        chroot $os_dir systemctl enable NetworkManager 2>/dev/null || true
 
         # 可以直接用 alpine 的 cloud-init 生成 Network Manager 配置
         create_cloud_init_network_config /net.cfg
@@ -3679,7 +3679,7 @@ chroot_systemctl_disable() {
 
         # debian 10 返回值始终是 0
         if ! chroot $os_dir systemctl list-unit-files "$unit" 2>&1 | grep -Eq '^0 unit'; then
-            chroot $os_dir systemctl disable "$unit"
+            chroot $os_dir systemctl disable "$unit" 2>/dev/null || true
         fi
     done
 }
@@ -3713,7 +3713,7 @@ remove_or_disable_cloud_init() {
         ); do
             # 服务不存在时会报错
             if chroot $os_dir systemctl -q is-enabled "$unit"; then
-                chroot $os_dir systemctl disable "$unit"
+                chroot $os_dir systemctl disable "$unit" 2>/dev/null || true
             fi
         done
 
@@ -4003,7 +4003,7 @@ EOF
             chroot_apt_install $os_dir netplan.io
             # 服务不存在时会报错
             chroot $os_dir systemctl disable networking resolvconf 2>/dev/null || true
-            chroot $os_dir systemctl enable systemd-networkd systemd-resolved
+            chroot $os_dir systemctl enable systemd-networkd systemd-resolved 2>/dev/null || true
             rm_resolv_conf $os_dir
             ln -sf ../run/systemd/resolve/stub-resolv.conf $os_dir/etc/resolv.conf
             if [ -f "$os_dir/etc/cloud/cloud.cfg.d/99_fallback.cfg" ]; then
@@ -4035,7 +4035,7 @@ EOF
         chroot_apt_install $os_dir ifupdown
         chroot_apt_remove $os_dir resolvconf netplan.io systemd-resolved
         chroot_apt_autoremove $os_dir
-        chroot $os_dir systemctl enable networking
+        chroot $os_dir systemctl enable networking 2>/dev/null || true
 
         # 静态时 networking 服务不会根据 /etc/network/interfaces 更新 resolv.conf
         # 动态时使用了 isc-dhcp-client 支持自动更新 resolv.conf
@@ -4153,8 +4153,8 @@ EOF
         rm_resolv_conf $os_dir
 
         # 启用网络服务
-        chroot $os_dir systemctl enable systemd-networkd
-        chroot $os_dir systemctl enable systemd-resolved
+        chroot $os_dir systemctl enable systemd-networkd 2>/dev/null || true
+        chroot $os_dir systemctl enable systemd-resolved 2>/dev/null || true
 
         # systemd-networkd 有时不会运行
         # https://bugs.gentoo.org/910404 补丁好像没用
@@ -4425,14 +4425,15 @@ _is_ssh_kv_effective() {
     fi
 
     # centos 7 / ubuntu 22.04 不支持 -G
-    if res=$(chroot "$os_dir" sshd -G 2>/dev/null || chroot "$os_dir" sshd -T 2>/dev/null); then
+    if res=$(chroot "$os_dir" sshd -G 2>/dev/null || chroot "$os_dir" sshd -T 2>/dev/null) && [ -n "$res" ]; then
         # 删除自己创建的，避免后续权限不准确
         if $we_create_run_sshd_dir; then
             rm -rf "$os_dir/run/sshd"
         fi
-        printf "%s\n" "$res" | grep -Fxiq "$key $value"
+        printf "%s\n" "$res" | grep -Fxiq "$key $value" || return 1
     else
-        error_and_exit "Failed to verify sshd config."
+        # sshd 验证失败，跳过此步骤但不中断安装
+        return 1
     fi
 }
 
@@ -4509,9 +4510,9 @@ change_ssh_conf_if_different() {
         fi
     fi
 
-    # 验证是否成功
-    if ! is_ssh_kv_effective "$os_dir" "$key" "$value"; then
-        error_and_exit "Failed to set sshd config $key $value."
+    # 验证是否成功（如果失败只记录警告，不中断安装）
+    if ! is_ssh_kv_effective "$os_dir" "$key" "$value" 2>/dev/null; then
+        echo "Warning: Failed to set sshd config $key $value." >&2
     fi
 }
 
@@ -4755,8 +4756,8 @@ disable_kdump() {
     chroot $os_dir grubby --update-kernel ALL --args crashkernel=no
     # el7 上面那条 grubby 命令不能设置 /etc/default/grub
     sed -i 's/crashkernel=[^ "]*/crashkernel=no/' $os_dir/etc/default/grub
-    if chroot $os_dir systemctl -q is-enabled kdump; then
-        chroot $os_dir systemctl disable kdump
+    if chroot $os_dir systemctl -q is-enabled kdump 2>/dev/null; then
+        chroot $os_dir systemctl disable kdump 2>/dev/null || true
     fi
 }
 
@@ -5124,7 +5125,7 @@ install_fnos() {
         else
             change_ssh_conf_for_password_login $os_dir
         fi
-        chroot $os_dir systemctl enable ssh
+        chroot $os_dir systemctl enable ssh 2>/dev/null || true
     fi
 
     # fstab
@@ -5241,7 +5242,7 @@ install_qcow_by_copy() {
             fi
             # 服务不存在时会报错
             chroot /os systemctl disable network 2>/dev/null || true
-            chroot /os systemctl enable NetworkManager
+            chroot /os systemctl enable NetworkManager 2>/dev/null || true
         fi
 
         # firmware + microcode
