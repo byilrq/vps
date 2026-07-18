@@ -153,7 +153,12 @@ show_interactive_menu() {
 
     read -p "SSH 密码 [16位随机]: " password
     if [ -z "$password" ]; then
-        password=$(head -c 8 /dev/urandom | od -An -tx1 | tr -d ' ')
+        local chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\$%*&"
+        password=""
+        for i in {1..16}; do
+            idx=$((RANDOM % ${#chars}))
+            password="${password}${chars:$idx:1}"
+        done
         echo "已生成随机密码: $password"
     fi
 
@@ -207,15 +212,41 @@ show_interactive_menu() {
             echo "已选择最快源: $best_mirror" >&2
         fi
 
-        echo ""
-        echo "请提供完整镜像文件名（例如: debian-12-genericcloud-amd64.qcow2）" >&2
-        read -p "镜像文件名: " img_filename
-        while [ -z "$img_filename" ]; do
-            echo "镜像文件名不能为空" >&2
-            read -p "镜像文件名: " img_filename
-        done
+        echo "正在检测系统架构..." >&2
+        basearch=$(uname -m)
+        if [ "$basearch" = x86_64 ]; then
+            basearch_alt=amd64
+        elif [ "$basearch" = aarch64 ]; then
+            basearch_alt=arm64
+        else
+            basearch_alt=$basearch
+        fi
+        echo "检测到架构: $basearch ($basearch_alt)" >&2
 
-        img="$best_mirror/$img_filename"
+        if [ "$distro" = "debian" ]; then
+            case "$releasever" in
+            9) codename=stretch ;;
+            10) codename=buster ;;
+            11) codename=bullseye ;;
+            12) codename=bookworm ;;
+            13) codename=trixie ;;
+            14) codename=forky ;;
+            15) codename=duke ;;
+            esac
+            img="$best_mirror/cloud/$codename/latest/debian-$releasever-genericcloud-$basearch_alt.qcow2"
+        else
+            case "$releasever" in
+            18.04) codename=bionic ;;
+            20.04) codename=focal ;;
+            22.04) codename=jammy ;;
+            24.04) codename=noble ;;
+            26.04) codename=resolute ;;
+            esac
+            img="$best_mirror/releases/$codename/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img"
+        fi
+
+        echo "已自动生成镜像URL:" >&2
+        echo "$img" >&2
         ;;
     2)
         read -p "镜像 URL: " img
