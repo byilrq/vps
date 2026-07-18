@@ -2218,9 +2218,9 @@ basic_init() {
     # debian 11 没有 systemd-firstboot
     if is_have_cmd_on_disk $os_dir systemd-firstboot; then
         if chroot $os_dir systemd-firstboot --help | grep -wq '\--force'; then
-            chroot $os_dir systemd-firstboot --timezone=Asia/Shanghai --force
+            chroot $os_dir systemd-firstboot --timezone=Asia/Shanghai --force || true
         else
-            chroot $os_dir systemd-firstboot --timezone=Asia/Shanghai
+            chroot $os_dir systemd-firstboot --timezone=Asia/Shanghai || true
         fi
     fi
 

@@ -54,7 +54,22 @@ fi
 # 记录日志，过滤含有 password 的行
 # exec > >(tee >(grep -iv password >>/reinstall.log)) 2>&1
 THIS_SCRIPT=$(readlink -f "$0")
+SCRIPT_DIR="$(cd "$(dirname "$THIS_SCRIPT")" && pwd)"
+GITHUB_REPO="https://github.com/byilrq/vps/raw/main/ddreinstall"
 trap 'trap_err $LINENO $?' ERR
+
+ensure_file() {
+    local file=$1
+    local url=$2
+    if [ ! -f "$file" ]; then
+        echo "正在下载 $(basename "$file")..." >&2
+        curl -fsSL "$url" -o "$file" || {
+            echo "ERROR: 无法下载 $(basename "$file")" >&2
+            return 1
+        }
+        chmod +x "$file" 2>/dev/null || true
+    fi
+}
 
 trap_err() {
     line_no=$1
@@ -101,20 +116,20 @@ show_interactive_menu() {
         echo "  1. Debian 9  (Stretch) - ELTS"
         echo "  2. Debian 10 (Buster) - ELTS"
         echo "  3. Debian 11 (Bullseye)"
-        echo "  4. Debian 12 (Bookworm) - LTS"
-        echo "  5. Debian 13 (Trixie)"
-        echo "  6. Debian 14 (Forky)"
-        echo "  7. Debian 15 (Duke)"
+        echo "  4. Debian 12 (Bookworm) - LTS ✓ 有云镜像"
+        echo "  5. Debian 13 (Trixie) - 无官方云镜像"
+        echo "  6. Debian 14 (Forky) - 无官方云镜像"
+        echo "  7. Debian 15 (Duke) - 无官方云镜像"
         echo ""
         read -p "请选择版本 [1-7]: " ver_choice
         case "$ver_choice" in
-        1) distro=debian; releasever=9 ;;
-        2) distro=debian; releasever=10 ;;
-        3) distro=debian; releasever=11 ;;
-        4) distro=debian; releasever=12 ;;
-        5) distro=debian; releasever=13 ;;
-        6) distro=debian; releasever=14 ;;
-        7) distro=debian; releasever=15 ;;
+        1) distro=debian; releasever=9; codename=stretch ;;
+        2) distro=debian; releasever=10; codename=buster ;;
+        3) distro=debian; releasever=11; codename=bullseye ;;
+        4) distro=debian; releasever=12; codename=bookworm ;;
+        5) distro=debian; releasever=13; codename=trixie ;;
+        6) distro=debian; releasever=14; codename=forky ;;
+        7) distro=debian; releasever=15; codename=duke ;;
         *) echo "无效选择"; exit 1 ;;
         esac
         ;;
@@ -129,11 +144,11 @@ show_interactive_menu() {
         echo ""
         read -p "请选择版本 [1-5]: " ver_choice
         case "$ver_choice" in
-        1) distro=ubuntu; releasever=18.04 ;;
-        2) distro=ubuntu; releasever=20.04 ;;
-        3) distro=ubuntu; releasever=22.04 ;;
-        4) distro=ubuntu; releasever=24.04 ;;
-        5) distro=ubuntu; releasever=26.04 ;;
+        1) distro=ubuntu; releasever=18.04; codename=bionic ;;
+        2) distro=ubuntu; releasever=20.04; codename=focal ;;
+        3) distro=ubuntu; releasever=22.04; codename=jammy ;;
+        4) distro=ubuntu; releasever=24.04; codename=noble ;;
+        5) distro=ubuntu; releasever=26.04; codename=resolute ;;
         *) echo "无效选择"; exit 1 ;;
         esac
         ;;
@@ -153,113 +168,55 @@ show_interactive_menu() {
 
     read -p "SSH 密码 [16位随机]: " password
     if [ -z "$password" ]; then
-        local chars="ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789\$%*&"
-        password=""
-        for i in {1..16}; do
+        # 确保包含所有字符类型
+        uppercase='ABCDEFGHIJKLMNOPQRSTUVWXYZ'
+        lowercase='abcdefghijklmnopqrstuvwxyz'
+        numbers='0123456789'
+        specials='$%*&'
+
+        # 从每个字符集中各取一个
+        password+="${uppercase:$((RANDOM % 26)):1}"
+        password+="${lowercase:$((RANDOM % 26)):1}"
+        password+="${numbers:$((RANDOM % 10)):1}"
+        password+="${specials:$((RANDOM % 4)):1}"
+
+        # 填充剩余12位
+        local chars='ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$%*&'
+        for i in {1..12}; do
             idx=$((RANDOM % ${#chars}))
             password="${password}${chars:$idx:1}"
         done
+
+        # 打乱顺序
+        password=$(echo "$password" | fold -w1 | shuf 2>/dev/null | tr -d '\n')
+
         echo "已生成随机密码: $password"
     fi
 
     read -p "SSH 端口 [2222]: " ssh_port
     ssh_port=${ssh_port:-2222}
 
-    echo ""
-    echo "镜像源选择:"
-    echo "  1. 使用官方镜像源（自动检测）"
-    echo "  2. 输入自定义 URL"
-    echo ""
-    read -p "请选择 [1-2]: " img_choice
+    # 检测系统架构
+    basearch=$(uname -m)
+    if [ "$basearch" = x86_64 ]; then
+        basearch_alt=amd64
+    elif [ "$basearch" = aarch64 ]; then
+        basearch_alt=arm64
+    else
+        basearch_alt=$basearch
+    fi
+    echo "检测到架构: $basearch ($basearch_alt)" >&2
 
-    case "$img_choice" in
-    1)
-        echo ""
-        echo "正在检测官方镜像源..." >&2
+    # 直接生成镜像URL（版本选择时已确定codename）
+    if [ "$distro" = "debian" ]; then
+        img="https://cloud.debian.org/images/cloud/$codename/latest/debian-$releasever-genericcloud-$basearch_alt.qcow2"
+    else
+        img="https://cloud-images.ubuntu.com/releases/$codename/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img"
+    fi
 
-        if [ "$distro" = "debian" ]; then
-            echo "检测 Debian 镜像源..." >&2
-            mirrors=(
-                "https://deb.debian.org/debian"
-                "https://mirrors.aliyun.com/debian"
-                "https://mirror.nju.edu.cn/debian"
-            )
-        else
-            echo "检测 Ubuntu 镜像源..." >&2
-            mirrors=(
-                "https://cloud-images.ubuntu.com"
-                "https://mirrors.aliyun.com/ubuntu-cloud-images"
-                "https://mirror.nju.edu.cn/ubuntu-cloud-images"
-            )
-        fi
+    echo "已选择镜像:" >&2
+    echo "$img" >&2
 
-        best_mirror=""
-        for mirror in "${mirrors[@]}"; do
-            if timeout 3 curl -s -o /dev/null -w "%{http_code}" "$mirror" 2>/dev/null | grep -q '^[23]'; then
-                echo "  ✓ $mirror" >&2
-                if [ -z "$best_mirror" ]; then
-                    best_mirror="$mirror"
-                fi
-            else
-                echo "  ✗ $mirror" >&2
-            fi
-        done
-
-        if [ -z "$best_mirror" ]; then
-            best_mirror="${mirrors[0]}"
-            echo "已选择默认源: $best_mirror" >&2
-        else
-            echo "已选择最快源: $best_mirror" >&2
-        fi
-
-        echo "正在检测系统架构..." >&2
-        basearch=$(uname -m)
-        if [ "$basearch" = x86_64 ]; then
-            basearch_alt=amd64
-        elif [ "$basearch" = aarch64 ]; then
-            basearch_alt=arm64
-        else
-            basearch_alt=$basearch
-        fi
-        echo "检测到架构: $basearch ($basearch_alt)" >&2
-
-        if [ "$distro" = "debian" ]; then
-            case "$releasever" in
-            9) codename=stretch ;;
-            10) codename=buster ;;
-            11) codename=bullseye ;;
-            12) codename=bookworm ;;
-            13) codename=trixie ;;
-            14) codename=forky ;;
-            15) codename=duke ;;
-            esac
-            img="$best_mirror/cloud/$codename/latest/debian-$releasever-genericcloud-$basearch_alt.qcow2"
-        else
-            case "$releasever" in
-            18.04) codename=bionic ;;
-            20.04) codename=focal ;;
-            22.04) codename=jammy ;;
-            24.04) codename=noble ;;
-            26.04) codename=resolute ;;
-            esac
-            img="$best_mirror/releases/$codename/release/ubuntu-$releasever-server-cloudimg-$basearch_alt.img"
-        fi
-
-        echo "已自动生成镜像URL:" >&2
-        echo "$img" >&2
-        ;;
-    2)
-        read -p "镜像 URL: " img
-        while [ -z "$img" ]; do
-            echo "镜像 URL 不能为空" >&2
-            read -p "镜像 URL: " img
-        done
-        ;;
-    *)
-        echo "无效选择"
-        exit 1
-        ;;
-    esac
 
     echo ""
     echo "安装配置:"
@@ -274,12 +231,15 @@ show_interactive_menu() {
         exit 0
     fi
 
-    set -- "$distro" "$releasever"
+    # 菜单确认完成，用完整参数重新执行脚本进行安装
+    exec bash "$0" dd --username "$username" --password "$password" --ssh-port "$ssh_port" --img "$img"
 }
 
 usage_and_exit() {
-    cat <<EOF
-Usage: $reinstall_____ anolis      7|8|23
+    # 菜单模式下不显示帮助信息
+    if [ -z "$MENU_DONE" ]; then
+        cat <<EOF
+Usage: $reinstall_____ dd --img="http://xxx.com/yyy.zzz"
                        opencloudos 8|9|23
                        rocky       8|9|10
                        oracle      8|9|10
@@ -321,6 +281,7 @@ Usage: $reinstall_____ anolis      7|8|23
 Manual: https://github.com/bin456789/reinstall
 
 EOF
+    fi
     exit 1
 }
 
@@ -1484,7 +1445,7 @@ Continue?
             set_osvar udeb_mirror "$udeb_mirror"
             set_osvar vmlinuz "https://$initrd_mirror/$initrd_dir/linux"
             set_osvar initrd "https://$initrd_mirror/$initrd_dir/initrd.gz"
-            set_osvar ks "$confhome/debian.cfg"
+            set_osvar ks "$SCRIPT_DIR/debian.cfg"
             set_osvar firmware "$cdimage_mirror/unofficial/non-free/firmware/$codename/current/firmware.cpio.gz"
             set_osvar codename "$codename"
         fi
@@ -1517,7 +1478,7 @@ Continue?
 
             set_osvar vmlinuz "$mirror/linux"
             set_osvar initrd "$mirror/initrd.gz"
-            set_osvar ks "$confhome/debian.cfg"
+            set_osvar ks "$SCRIPT_DIR/debian.cfg"
             set_osvar deb_mirror "$hostname/kali"
             set_osvar udeb_mirror "$hostname/kali"
             set_osvar codename "$codename"
@@ -1791,8 +1752,13 @@ The current machine is $basearch, but it seems the ISO is for $iso_arch. Continu
 
     # shellcheck disable=SC2154
     setos_dd() {
-        # raw 包含 vhd
-        test_url $img 'raw raw.gzip raw.xz raw.zstd raw.tar.gzip raw.tar.xz raw.tar.zstd' img_type
+        # 确保必要的配置文件存在（如果本地没有则从GitHub下载）
+        ensure_file "$SCRIPT_DIR/debian.cfg" "$GITHUB_REPO/debian.cfg"
+        ensure_file "$SCRIPT_DIR/trans.sh" "$GITHUB_REPO/trans.sh"
+        ensure_file "$SCRIPT_DIR/initrd-network.sh" "$GITHUB_REPO/initrd-network.sh"
+
+        # raw 包含 vhd, qcow2 用于 debian/ubuntu 云镜像
+        test_url $img 'raw raw.gzip raw.xz raw.zstd raw.tar.gzip raw.tar.xz raw.tar.zstd qcow2 qemu' img_type
 
         if is_efi; then
             install_pkg hexdump
@@ -4198,14 +4164,14 @@ mod_initrd() {
     zcat /reinstall-initrd | cpio -idm \
         $(is_in_windows && echo --nonmatching 'dev/console' --nonmatching 'dev/null')
 
-    curl -Lo $initrd_dir/trans.sh $confhome/trans.sh
+    cp "$SCRIPT_DIR/trans.sh" $initrd_dir/trans.sh
     if ! grep -iq "$SCRIPT_VERSION" $initrd_dir/trans.sh; then
         error_and_exit "
 This script is outdated, please download reinstall.sh again.
 脚本有更新，请重新下载 reinstall.sh"
     fi
 
-    curl -Lo $initrd_dir/initrd-network.sh $confhome/initrd-network.sh
+    cp "$SCRIPT_DIR/initrd-network.sh" $initrd_dir/initrd-network.sh
     chmod a+x $initrd_dir/trans.sh $initrd_dir/initrd-network.sh
 
     # 保存配置
