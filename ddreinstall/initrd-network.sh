@@ -327,7 +327,7 @@ if [ -f /usr/share/debconf/confmodule ]; then
     # dhcpv4
     # 无需等待写入 dns，在 dhcpv6 等待
     db_progress INFO netcfg/dhcp_progress
-    udhcpc -i "$ethx" -f -q -n || true
+    timeout $DHCP_TIMEOUT udhcpc -i "$ethx" -f -q -n || true
     db_progress STEP 1
 
     # slaac + dhcpv6
@@ -344,10 +344,10 @@ interface $ethx {
 id-assoc na 0 {
 };
 EOF
-    dhcp6c -c /var/lib/netcfg/dhcp6c.conf "$ethx" || true
-    sleep $DHCP_TIMEOUT # 等待获取 ip 和写入 dns
+    timeout $DHCP_TIMEOUT dhcp6c -c /var/lib/netcfg/dhcp6c.conf "$ethx" || true
+    sleep $DNS_FILE_TIMEOUT # 等待获取 ip 和写入 dns
     # kill-all-dhcp
-    kill -9 "$(cat /var/run/dhcp6c.pid)" || true
+    kill -9 "$(cat /var/run/dhcp6c.pid 2>/dev/null)" 2>/dev/null || true
     db_progress STEP 1
 
     # 静态 + 检测网络提示
