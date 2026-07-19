@@ -1387,7 +1387,6 @@ setos() {
         fi
         set_osvar vmlinuz "$mirror/releases/$basearch/netboot/vmlinuz-$flavour"
         set_osvar initrd "$mirror/releases/$basearch/netboot/initramfs-$flavour"
-        set_osvar modloop "$mirror/releases/$basearch/netboot/modloop-$flavour"
         set_osvar repo "$mirror/main"
     }
 
