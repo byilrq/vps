@@ -2553,7 +2553,6 @@ is_secure_boot_enabled() {
 }
 
 is_need_boot_vmlinuz() {
-    [ "$is_dd_mode" = true ] && return 1
     ! { is_netboot_xyz && is_efi; }
 }
 
@@ -5123,8 +5122,7 @@ check_ram
 # el7 x86_64 >=1g
 # el7 aarch64 >=1.5g
 # el8/9/fedora 任何架构 >=2g
-# DD 模式始终是直接安装，不需要两步
-if [ "$distro" = "dd" ] || is_netboot_xyz ||
+if is_netboot_xyz ||
     { ! is_use_cloud_image && {
         [ "$distro" = "alpine" ] || is_distro_like_debian ||
             { is_distro_like_redhat && [ $releasever -eq 7 ] && [ $ram_size -ge 1024 ] && [ $basearch = "x86_64" ]; } ||
@@ -5196,9 +5194,19 @@ else
     fi
 fi
 
-# 修改 alpine debian kali initrd（仅当不是 DD 模式且需要 initrd 时）
-if [ "$is_dd_mode" != true ] && [ -n "$nextos_distro" ] && { [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; }; then
-    mod_initrd
+# 修改 alpine debian kali initrd（DD 模式仅修改 alpine，不修改 debian/kali）
+if [ -n "$nextos_distro" ]; then
+    if [ "$is_dd_mode" = true ]; then
+        # DD 模式：仅允许 Alpine initrd 修改
+        if [ "$nextos_distro" = alpine ]; then
+            mod_initrd
+        fi
+    else
+        # 非 DD 模式：修改所有支持的 initrd
+        if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
+            mod_initrd
+        fi
+    fi
 fi
 
 # 如果使用本地镜像，复制到 /tmp 作为新的本地位置
