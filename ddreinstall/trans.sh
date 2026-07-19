@@ -555,6 +555,13 @@ ensure_service_started() {
             fi
             sleep 5
         done
+
+        # modloop 启动失败时不中断，继续运行
+        if [ "$service" = modloop ]; then
+            warn "Failed to start modloop, but continuing anyway"
+            return
+        fi
+
         error_and_exit "Failed to start $service."
     fi
 }
