@@ -4764,7 +4764,30 @@ download_qcow() {
     apk add qemu-img
 
     mkdir -p /installer
-    mount /dev/disk/by-label/installer /installer
+
+    # 尝试挂载存储镜像的分区
+    # 如果 finalos_img 是本地路径，尝试从原系统分区找到它
+    if [ "${img#/}" = "${img}" ] || [ ! -f "$img" ]; then
+        # URL 或本地文件不存在，尝试从原系统分区读取
+        if echo "$img" | grep -q "^/"; then
+            # 本地路径，尝试挂载原系统分区
+            for part in /dev/sda1 /dev/sda2 /dev/vda1 /dev/vda2; do
+                if mount "$part" /installer 2>/dev/null; then
+                    if [ -f "/installer$(echo $img | sed 's|^/||')" ]; then
+                        echo "✓ 找到镜像文件在分区：$img" >&2
+                        break
+                    else
+                        umount /installer
+                    fi
+                fi
+            done
+        fi
+    else
+        # 直接挂载 installer 分区
+        mount /dev/disk/by-label/installer /installer 2>/dev/null || \
+        mount /dev/sda2 /installer 2>/dev/null || \
+        mount /dev/vda2 /installer 2>/dev/null || true
+    fi
 
     qcow_file=/installer/cloud_image.qcow2
 

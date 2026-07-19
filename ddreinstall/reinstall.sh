@@ -3518,7 +3518,7 @@ get_entry_name() {
 # shellcheck disable=SC2154
 build_nextos_cmdline() {
     if [ $nextos_distro = alpine ]; then
-        nextos_cmdline="alpine_repo=$nextos_repo modloop=$nextos_modloop"
+        nextos_cmdline="alpine_repo=$nextos_repo nomodloop"
     elif is_distro_like_debian $nextos_distro; then
         # 设置分辨率为800*600，防止分辨率过高 ssh screen attach 后无法全部显示
         # iso 默认有 vga=788
@@ -3566,6 +3566,56 @@ build_cmdline() {
 
     # finalos
     # trans 需要 finalos_distro 识别是安装 alpine 还是其他系统
+
+    # 在生成 GRUB 前，先处理本地镜像
+    if [ "${img#/}" != "$img" ]; then
+        # 本地路径（以 / 开头）
+        if [ -f "$img" ]; then
+            tmp_img="/tmp/local_image.qcow2"
+
+            # 如果已经是临时位置，跳过复制
+            if [ "$img" != "$tmp_img" ]; then
+                # 计算源文件大小
+                img_size=$(stat -c%s "$img" 2>/dev/null || stat -f%z "$img" 2>/dev/null)
+
+                # 检查目标文件是否已存在且大小正确
+                if [ -f "$tmp_img" ]; then
+                    tmp_size=$(stat -c%s "$tmp_img" 2>/dev/null || stat -f%z "$tmp_img" 2>/dev/null)
+                    if [ "$img_size" -eq "$tmp_size" ]; then
+                        echo "✓ 镜像文件已存在且完整: $tmp_img" >&2
+                    else
+                        # 大小不匹配，删除重新复制
+                        echo "镜像文件大小不匹配，重新复制..." >&2
+                        rm -f "$tmp_img"
+                        echo "正在复制镜像文件（约 $((img_size/1024/1024))MB）..." >&2
+                        cp -v "$img" "$tmp_img" || error_and_exit "复制镜像失败"
+                    fi
+                else
+                    # 目标文件不存在，进行复制
+                    echo "检测到本地镜像，复制到临时位置..." >&2
+                    echo "正在复制镜像文件（约 $((img_size/1024/1024))MB）..." >&2
+                    cp -v "$img" "$tmp_img" || error_and_exit "复制镜像失败"
+
+                    # 验证复制完整性
+                    if [ "$(stat -c%s "$tmp_img" 2>/dev/null || stat -f%z "$tmp_img" 2>/dev/null)" -ne "$img_size" ]; then
+                        error_and_exit "镜像复制不完整"
+                    fi
+
+                    echo "✓ 镜像已复制到: $tmp_img" >&2
+                fi
+            else
+                echo "✓ 镜像已在临时位置: $tmp_img" >&2
+            fi
+
+            img="$tmp_img"
+            finalos_img="$tmp_img"
+            # 也要更新对应的 set_var（因为 set_osvar 是通过 set_var 设置的）
+            set_var "finalos_img" "$tmp_img"
+        else
+            error_and_exit "本地镜像文件不存在: $img"
+        fi
+    fi
+
     if [ "$distro" = alpine ]; then
         finalos_distro=alpine
     fi
