@@ -346,13 +346,6 @@ EOF
 trans() {
     info "Starting system installation"
 
-    mod_motd() {
-        :
-    }
-    mod_motd
-
-    ensure_service_started modloop 2>/dev/null || true
-
     clear_previous
     add_community_repo
 
