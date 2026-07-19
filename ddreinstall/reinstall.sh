@@ -3456,7 +3456,7 @@ build_finalos_cmdline() {
         for key in $vars; do
             value=${!key}
             key=${key#finalos_}
-            if [ -n "$value" ] && [ $key != "mirrorlist" ]; then
+            if [ -n "$value" ] && [ $key != "mirrorlist" ] && [ $key != "modloop" ]; then
                 is_need_quote "$value" &&
                     finalos_cmdline+=" finalos_$key='$value'" ||
                     finalos_cmdline+=" finalos_$key=$value"
