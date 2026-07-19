@@ -5154,33 +5154,36 @@ if is_netboot_xyz; then
         curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
     fi
 else
-    # 下载 nextos 内核 (带重试和超时)
-    info download vmlnuz and initrd
-    download_with_retry() {
-        local url=$1
-        local output=$2
-        local max_tries=5
-        local timeout=120
+    # DD 模式 qcow2 不需要下载 vmlinuz/initrd
+    if ! ([ "$distro" = "dd" ] && [ "$img_type" = "qemu" ]); then
+        # 下载 nextos 内核 (带重试和超时)
+        info download vmlnuz and initrd
+        download_with_retry() {
+            local url=$1
+            local output=$2
+            local max_tries=5
+            local timeout=120
 
-        for i in $(seq 1 $max_tries); do
-            echo "下载尝试 $i/$max_tries: $url" >&2
-            if curl -fsSL --max-time $timeout --connect-timeout 30 -L "$url" -o "$output"; then
-                echo "✓ 下载成功: $output" >&2
-                return 0
-            fi
-            if [ $i -lt $max_tries ]; then
-                sleep 5
-            fi
-        done
+            for i in $(seq 1 $max_tries); do
+                echo "下载尝试 $i/$max_tries: $url" >&2
+                if curl -fsSL --max-time $timeout --connect-timeout 30 -L "$url" -o "$output"; then
+                    echo "✓ 下载成功: $output" >&2
+                    return 0
+                fi
+                if [ $i -lt $max_tries ]; then
+                    sleep 5
+                fi
+            done
 
-        error_and_exit "下载失败: $url (在 $max_tries 次尝试后)"
-    }
+            error_and_exit "下载失败: $url (在 $max_tries 次尝试后)"
+        }
 
-    download_with_retry "$nextos_vmlinuz" "/reinstall-vmlinuz"
-    download_with_retry "$nextos_initrd" "/reinstall-initrd"
+        download_with_retry "$nextos_vmlinuz" "/reinstall-vmlinuz"
+        download_with_retry "$nextos_initrd" "/reinstall-initrd"
 
-    if is_use_firmware; then
-        download_with_retry "$nextos_firmware" "/reinstall-firmware"
+        if is_use_firmware; then
+            download_with_retry "$nextos_firmware" "/reinstall-firmware"
+        fi
     fi
 fi
 
