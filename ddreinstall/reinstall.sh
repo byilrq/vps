@@ -27,6 +27,9 @@ tmp=/reinstall-tmp
 # https://www.gnu.org/software/gettext/manual/html_node/The-LANGUAGE-variable.html
 export LC_ALL=C
 
+# DD 模式标志初始化
+is_dd_mode=false
+
 # 处理部分用户用 su 切换成 root 导致环境变量没 sbin 目录
 # 也能处理 cygwin bash 没有添加 -l 运行 reinstall.sh
 # 不要漏了最后的 $PATH，否则会找不到 windows 系统程序例如 diskpart
@@ -501,6 +504,7 @@ is_alpine_live() {
 }
 
 is_have_initrd() {
+    [ "$is_dd_mode" = true ] && return 1
     ! is_netboot_xyz
 }
 
@@ -5119,7 +5123,8 @@ check_ram
 # el7 x86_64 >=1g
 # el7 aarch64 >=1.5g
 # el8/9/fedora 任何架构 >=2g
-if is_netboot_xyz ||
+# DD 模式始终是直接安装，不需要两步
+if [ "$distro" = "dd" ] || is_netboot_xyz ||
     { ! is_use_cloud_image && {
         [ "$distro" = "alpine" ] || is_distro_like_debian ||
             { is_distro_like_redhat && [ $releasever -eq 7 ] && [ $ram_size -ge 1024 ] && [ $basearch = "x86_64" ]; } ||
