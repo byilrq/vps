@@ -2549,6 +2549,7 @@ is_secure_boot_enabled() {
 }
 
 is_need_boot_vmlinuz() {
+    [ "$is_dd_mode" = true ] && return 1
     ! { is_netboot_xyz && is_efi; }
 }
 
