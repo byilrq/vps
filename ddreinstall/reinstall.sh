@@ -1802,6 +1802,9 @@ The current machine is $basearch, but it seems the ISO is for $iso_arch. Continu
         # raw 包含 vhd, qcow2 用于 debian/ubuntu 云镜像
         test_url $img 'raw raw.gzip raw.xz raw.zstd raw.tar.gzip raw.tar.xz raw.tar.zstd qcow2 qemu' img_type
 
+        # DD 模式标志：禁用 initrd 相关操作
+        is_dd_mode=true
+
         if is_efi; then
             install_pkg hexdump
 
@@ -5154,8 +5157,8 @@ if is_netboot_xyz; then
         curl -Lo /reinstall-vmlinuz $nextos_vmlinuz
     fi
 else
-    # DD 模式 qcow2 不需要下载 vmlinuz/initrd
-    if ! ([ "$distro" = "dd" ] && [ "$img_type" = "qemu" ]); then
+    # DD 模式不需要下载/修改 initrd
+    if [ "$is_dd_mode" != true ]; then
         # 下载 nextos 内核 (带重试和超时)
         info download vmlnuz and initrd
         download_with_retry() {
@@ -5187,12 +5190,9 @@ else
     fi
 fi
 
-# 修改 alpine debian kali initrd（仅当需要 initrd 且非 DD qcow2 时）
-if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
-    # DD 模式使用 qcow2 不需要修改 initrd
-    if ! ([ "$distro" = "dd" ] && [ "$img_type" = "qemu" ]); then
-        mod_initrd
-    fi
+# 修改 alpine debian kali initrd（仅当不是 DD 模式且需要 initrd 时）
+if [ "$is_dd_mode" != true ] && [ -n "$nextos_distro" ] && { [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; }; then
+    mod_initrd
 fi
 
 # 如果使用本地镜像，复制到 /tmp 作为新的本地位置
