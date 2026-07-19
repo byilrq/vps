@@ -332,8 +332,11 @@ if [ -f /usr/share/debconf/confmodule ]; then
 
     # slaac + dhcpv6
     db_progress INFO netcfg/slaac_wait_title
-    # https://salsa.debian.org/installer-team/netcfg/-/blob/master/autoconfig.c#L148
-    cat <<EOF >/var/lib/netcfg/dhcp6c.conf
+
+    # 检查是否有 IPv6 网络接口（仅当有 IPv6 地址时才尝试）
+    if is_have_ipv6_addr; then
+        # https://salsa.debian.org/installer-team/netcfg/-/blob/master/autoconfig.c#L148
+        cat <<EOF >/var/lib/netcfg/dhcp6c.conf
 interface $ethx {
     send ia-na 0;
     request domain-name-servers;
@@ -344,10 +347,13 @@ interface $ethx {
 id-assoc na 0 {
 };
 EOF
-    timeout $DHCP_TIMEOUT dhcp6c -c /var/lib/netcfg/dhcp6c.conf "$ethx" || true
-    sleep $DNS_FILE_TIMEOUT # 等待获取 ip 和写入 dns
-    # kill-all-dhcp
-    kill -9 "$(cat /var/run/dhcp6c.pid 2>/dev/null)" 2>/dev/null || true
+        timeout $DHCP_TIMEOUT dhcp6c -c /var/lib/netcfg/dhcp6c.conf "$ethx" || true
+        sleep $DNS_FILE_TIMEOUT # 等待获取 ip 和写入 dns
+        # kill-all-dhcp
+        kill -9 "$(cat /var/run/dhcp6c.pid 2>/dev/null)" 2>/dev/null || true
+    else
+        echo "IPv6 not available, skipping DHCPv6"
+    fi
     db_progress STEP 1
 
     # 静态 + 检测网络提示
@@ -362,47 +368,36 @@ else
     case "$method" in
     udhcpc)
         timeout $DHCP_TIMEOUT udhcpc -i "$ethx" -f -q -n || true
-        timeout $DHCP_TIMEOUT udhcpc6 -i "$ethx" -f -q -n || true
-        sleep $DNS_FILE_TIMEOUT # 好像不用等待写入 dns，但是以防万一
-        ;;
-    dhcpcd)
-        # https://gitlab.alpinelinux.org/alpine/aports/-/blob/master/main/dhcpcd/dhcpcd.pre-install
-        grep -q dhcpcd /etc/group || addgroup -S dhcpcd
-        grep -q dhcpcd /etc/passwd || adduser -S -D -H \
-            -h /var/lib/dhcpcd \
-            -s /sbin/nologin \
-            -G dhcpcd \
-            -g dhcpcd \
-            dhcpcd
-
-        # --noipv4ll 禁止生成 169.254.x.x
-        if false; then
-            # 等待 DHCP 全过程
-            timeout $DHCP_TIMEOUT \
-                dhcpcd --persistent --noipv4ll --nobackground "$ethx"
-        else
-            # 等待 DNS
-            dhcpcd --persistent --noipv4ll "$ethx" # 获取到 IP 后立即切换到后台
-            sleep $DNS_FILE_TIMEOUT                # 需要等待写入 dns
-            dhcpcd -x "$ethx"                      # 终止
+        # IPv6 only if address is available
+        if is_have_ipv6_addr; then
+            timeout $DHCP_TIMEOUT udhcpc6 -i "$ethx" -f -q -n || true
         fi
-        # autoconf 和 accept_ra 会被 dhcpcd 自动关闭，因此需要重新打开
-        # 如果没重新打开，重新运行 dhcpcd 命令依然可以正常生成 slaac 地址和路由
-        sysctl -w "net.ipv6.conf.$ethx.autoconf=1"
-        sysctl -w "net.ipv6.conf.$ethx.accept_ra=1"
+        sleep $DNS_FILE_TIMEOUT # 好像不用等待写入 dns，但是以防万一
         ;;
     esac
 fi
 
-# 等待slaac
+# 等待slaac（仅在有 IPv6 网络时）
 # 有ipv6地址就跳过，不管是slaac或者dhcpv6
 # 因为会在trans里判断
 # 这里等待5秒就够了，因为之前尝试获取dhcp6也用了一段时间
-for i in $(seq 5 -1 0); do
-    is_have_ipv6 && break
-    echo "waiting slaac for ${i}s"
-    sleep 1
-done
+if is_have_ipv4_addr; then
+    # 已有 IPv4，可继续
+    for i in $(seq 3 -1 0); do
+        is_have_ipv6 && break
+        if [ $i -gt 0 ]; then
+            echo "waiting slaac for ${i}s (IPv6 optional)"
+            sleep 1
+        fi
+    done
+else
+    # 无 IPv4，等待更长时间
+    for i in $(seq 5 -1 0); do
+        is_have_ipv6 && break
+        echo "waiting for network..."
+        sleep 1
+    done
+fi
 
 # 记录是否有动态地址
 # 由于还没设置静态ip，所以有条目表示有动态地址
@@ -484,6 +479,21 @@ if ! $ipv6_has_internet; then
         should_disable_autoconf=true
     fi
     flush_ipv6_config
+fi
+
+# 如果没有任何网络，使用 DHCP 重试（关键修复）
+if ! $ipv4_has_internet && ! $ipv6_has_internet; then
+    echo "No IPv4 or IPv6 internet found, retrying DHCP..."
+    for retry in 1 2 3; do
+        echo "DHCP retry attempt $retry..."
+        timeout $DHCP_TIMEOUT udhcpc -i "$ethx" -f -q -n || true
+        sleep 2
+        if is_have_ipv4; then
+            echo "IPv4 obtained on retry"
+            ipv4_has_internet=true
+            break
+        fi
+    done
 fi
 
 # 如果联网了，但没获取到默认 DNS，则添加我们的 DNS

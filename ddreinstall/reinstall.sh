@@ -4126,9 +4126,11 @@ get_ip_conf_cmd() {
     else
         if is_found_ipv4_netconf; then
             echo "'$sh' '$ipv4_mac' '$ipv4_addr' '$ipv4_gateway' '' '' '$is_in_china' ''"
-        fi
-        if is_found_ipv6_netconf; then
+        elif is_found_ipv6_netconf; then
             echo "'$sh' '$ipv6_mac' '' '' '$ipv6_addr' '$ipv6_gateway' '$is_in_china' '$ipv6_extra_addrs'"
+        else
+            # 网络未检测到，使用 DHCP（空参数）
+            echo "'$sh' '' '' '' '' '' '$is_in_china' ''"
         fi
     fi
 }
@@ -5182,9 +5184,12 @@ else
     fi
 fi
 
-# 修改 alpine debian kali initrd
+# 修改 alpine debian kali initrd（仅当需要 initrd 且非 DD qcow2 时）
 if [ "$nextos_distro" = alpine ] || is_distro_like_debian "$nextos_distro"; then
-    mod_initrd
+    # DD 模式使用 qcow2 不需要修改 initrd
+    if ! ([ "$distro" = "dd" ] && [ "$img_type" = "qemu" ]); then
+        mod_initrd
+    fi
 fi
 
 # 如果使用本地镜像，复制到 /tmp 作为新的本地位置
