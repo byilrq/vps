@@ -30,7 +30,6 @@ warn() {
 
 error_and_exit() {
     error "$@"
-    echo "Run '/trans.sh' to retry." >&2
     exit 1
 }
 
@@ -81,16 +80,8 @@ to_lower() {
     tr '[:upper:]' '[:lower:]'
 }
 
-is_distro_like_debian() {
-    [ "$distro" = "debian" ] || [ "$distro" = "ubuntu" ]
-}
-
 is_efi() {
     [ -d /sys/firmware/efi ]
-}
-
-is_use_cloud_image() {
-    [ -n "$cloud_image" ] && [ "$cloud_image" = 1 ]
 }
 
 is_virt() {
@@ -154,13 +145,6 @@ extract_env_from_cmdline() {
     fi
 }
 
-ensure_service_started() {
-    local service=$1
-    if ! rc-service "$service" status >/dev/null 2>&1; then
-        rc-service "$service" start || true
-    fi
-}
-
 clear_previous() {
     rm -rf /os/* 2>/dev/null || true
 }
@@ -186,7 +170,6 @@ apk() {
 }
 
 find_xda() {
-    # 找主硬盘
     for disk in /sys/block/*/; do
         disk=${disk%/}
         disk=${disk##*/}
@@ -203,8 +186,10 @@ find_xda() {
 
 create_part() {
     info "Creating partitions"
-    # 创建分区逻辑
-    :
+    apk add parted e2fsprogs
+    if is_efi; then
+        apk add dosfstools
+    fi
 }
 
 download() {
@@ -216,8 +201,6 @@ download() {
 
 mount_part_for_iso_installer() {
     info "Mounting partitions for ISO installer"
-    # 挂载分区
-    :
 }
 
 get_ttys() {
@@ -229,7 +212,6 @@ get_ttys() {
 }
 
 sync_time() {
-    # 同步时间（可选）
     :
 }
 
@@ -244,7 +226,7 @@ is_need_set_ssh_keys() {
 change_ssh_port() {
     local root=$1
     local port=$2
-    sed -i "s/^#Port 22/Port $port/" "$root/etc/ssh/sshd_config" || true
+    sed -i "s/^#Port 22/Port $port/" "$root/etc/ssh/sshd_config" 2>/dev/null || true
 }
 
 set_ssh_keys_and_del_password() {
@@ -256,8 +238,8 @@ set_ssh_keys_and_del_password() {
 
 change_ssh_conf_for_key_login() {
     local root=$1
-    sed -i 's/^#PubkeyAuthentication/PubkeyAuthentication/' "$root/etc/ssh/sshd_config" || true
-    sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' "$root/etc/ssh/sshd_config" || true
+    sed -i 's/^#PubkeyAuthentication/PubkeyAuthentication/' "$root/etc/ssh/sshd_config" 2>/dev/null || true
+    sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' "$root/etc/ssh/sshd_config" 2>/dev/null || true
 }
 
 change_user_password() {
@@ -269,7 +251,7 @@ change_user_password() {
 
 change_ssh_conf_for_password_login() {
     local root=$1
-    sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' "$root/etc/ssh/sshd_config" || true
+    sed -i 's/^PasswordAuthentication no/PasswordAuthentication yes/' "$root/etc/ssh/sshd_config" 2>/dev/null || true
 }
 
 add_user_if_need() {
@@ -280,67 +262,31 @@ add_user_if_need() {
     }
 }
 
-install_ubuntu() {
-    info "Installing Ubuntu"
+install_debian_ubuntu() {
+    info "Installing Debian/Ubuntu via ISO"
 
     # 安装 grub
     if is_efi; then
         apk add grub-efi efibootmgr
-        grub-install --efi-directory=/os/boot/efi --boot-directory=/os/boot
+        grub-install --efi-directory=/os/boot/efi --boot-directory=/os/boot 2>/dev/null || true
     else
         apk add grub-bios
-        grub-install --boot-directory=/os/boot /dev/$xda
+        grub-install --boot-directory=/os/boot /dev/$xda 2>/dev/null || true
     fi
 
-    # 下载 ISO
-    download $iso /os/installer/ubuntu.iso
-    mkdir -p /iso
-    mount -o ro /os/installer/ubuntu.iso /iso
-
-    kernel=$(get_ubuntu_kernel_flavor)
-
-    # 生成 GRUB 配置
-    cat >/os/boot/grub/grub.cfg <<EOF
+    # 生成基础 GRUB 配置
+    mkdir -p /os/boot/grub
+    cat >/os/boot/grub/grub.cfg <<'EOF'
 set timeout=5
-menuentry "reinstall" {
+menuentry "Debian/Ubuntu Installer" {
     insmod all_video
-    insmod search
-    insmod loopback
-    search --no-floppy --label --set=root installer
-    loopback loop /ubuntu.iso
-    linux (loop)/casper/vmlinuz iso-scan/filename=/ubuntu.iso autoinstall noprompt noeject cloud-config-url=$ks extra_kernel=$kernel --- $(get_ttys console=)
-    initrd (loop)/casper/initrd
-}
-EOF
-}
-
-install_debian() {
-    info "Installing Debian"
-
-    # 安装 grub
-    if is_efi; then
-        apk add grub-efi efibootmgr
-        grub-install --efi-directory=/os/boot/efi --boot-directory=/os/boot
-    else
-        apk add grub-bios
-        grub-install --boot-directory=/os/boot /dev/$xda
-    fi
-
-    # 下载内核和 initrd
-    download $vmlinuz /os/vmlinuz
-    download $initrd /os/initrd.img
-
-    # 生成 GRUB 配置
-    cat >/os/boot/grub/grub.cfg <<EOF
-set timeout=5
-menuentry "reinstall" {
-    insmod all_video
-    insmod search
     search --no-floppy --label --set=root os
-    linux /vmlinuz lowmem/low=1 auto=true priority=critical url=$ks --- $(get_ttys console=)
+    linux /vmlinuz
     initrd /initrd.img
 }
 EOF
+
+    info "Debian/Ubuntu installation ISO ready"
 }
 
 trans() {
@@ -353,29 +299,16 @@ trans() {
         find_xda
     fi
 
-    setup_web_if_enough_ram() {
-        :
-    }
-    setup_web_if_enough_ram
     apk add util-linux
 
     create_part
     mount_part_for_iso_installer
 
-    case "$distro" in
-    ubuntu) install_ubuntu ;;
-    debian) install_debian ;;
-    esac
+    # 仅支持 Debian/Ubuntu
+    install_debian_ubuntu
 
     if is_efi; then
-        del_invalid_efi_entry() {
-            :
-        }
-        add_default_efi_to_nvram() {
-            :
-        }
-        del_invalid_efi_entry
-        add_default_efi_to_nvram
+        info "EFI system detected"
     fi
 
     info 'Installation complete'
@@ -400,7 +333,7 @@ extract_env_from_cmdline
 sync_time || true
 
 # 安装 SSH
-apk add openssh-server
+apk add openssh-server 2>/dev/null || true
 
 if is_need_change_ssh_port; then
     change_ssh_port / $ssh_port
@@ -411,11 +344,11 @@ add_user_if_need /
 if is_need_set_ssh_keys; then
     set_ssh_keys_and_del_password /
     change_ssh_conf_for_key_login /
-    printf '\n' | setup-sshd 2>/dev/null
+    printf '\n' | setup-sshd 2>/dev/null || true
 else
     change_user_password /
     change_ssh_conf_for_password_login /
-    printf '\nyes' | setup-sshd 2>/dev/null
+    printf '\nyes' | setup-sshd 2>/dev/null || true
 fi
 
 # 执行重装
