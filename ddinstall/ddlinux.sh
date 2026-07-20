@@ -128,13 +128,14 @@ fi
 wget --no-check-certificate -qO $cloudInitFile ''$cloudInitUrl''
 
 # User config.
-sed -ri 's/sshPORT/'${sshPORT}'/g' $cloudInitFile
-sed -ri 's/HostName/'${HostName}'/g' $cloudInitFile
-sed -ri 's/tmpWORD/'${tmpWORD}'/g' $cloudInitFile
-sed -ri 's/TimeZone/'${TimeZone1}'\/'${TimeZone2}'/g' $cloudInitFile
-sed -ri 's/targetLinuxMirror/'${targetLinuxMirror}'/g' $cloudInitFile
-sed -ri 's/targetLinuxSecurityMirror/'${targetLinuxSecurityMirror}'/g' $cloudInitFile
-sed -ri 's/networkAdapter/'${networkAdapter}'/g' $cloudInitFile
+tmpWORD_ESC=$(printf '%s\n' "$tmpWORD" | sed -e 's/&/\\\&/g')
+sed -ri 's|sshPORT|'${sshPORT}'|g' $cloudInitFile
+sed -ri 's|HostName|'${HostName}'|g' $cloudInitFile
+sed -ri 's|tmpWORD|'${tmpWORD_ESC}'|g' $cloudInitFile
+sed -ri 's|TimeZone|'${TimeZone1}'/'${TimeZone2}'|g' $cloudInitFile
+sed -ri 's|targetLinuxMirror|'${targetLinuxMirror}'|g' $cloudInitFile
+sed -ri 's|targetLinuxSecurityMirror|'${targetLinuxSecurityMirror}'|g' $cloudInitFile
+sed -ri 's|networkAdapter|'${networkAdapter}'|g' $cloudInitFile
 if [[ "$iAddrNum" -ge "2" ]]; then
 	sed -ri 's#IPv4/ipPrefix#'${writeIpsCmd}'#g' $cloudInitFile
 else

@@ -63,31 +63,18 @@ download_engine() {
 }
 
 # ============================================================================
-# 生成 16 位随机密码（含大写、小写、数字、%&*$）
+# 固定密码
 # ============================================================================
 gen_password() {
-	local pw=''
-	while :; do
-		pw=$(tr -dc 'A-Za-z0-9%&*$' < /dev/urandom | head -c 16)
-		echo "$pw" | grep -q '[A-Z]' || continue
-		echo "$pw" | grep -q '[a-z]' || continue
-		echo "$pw" | grep -q '[0-9]' || continue
-		echo "$pw" | grep -q '[%&*$]' || continue
-		break
-	done
-	echo "$pw"
+	echo '12345678'
 }
 
 # ============================================================================
 # 设置 root 密码与 SSH 端口
 # ============================================================================
 set_password_port() {
-	local random_pw
-	random_pw=$(gen_password)
-	echo -ne "\n${green}root 密码设置：${plain}\n"
-	echo -ne "直接回车使用随机密码 ${yellow}${random_pw}${plain}，或输入自定义密码: "
-	read -e -r input_pw
-	tmpWORD="${input_pw:-$random_pw}"
+	tmpWORD='12345678'
+	echo -ne "\n${green}root 密码已固定: ${yellow}${tmpWORD}${plain}\n"
 
 	echo -ne "${green}SSH 端口设置：${plain}\n"
 	echo -ne "直接回车使用默认端口 ${yellow}2222${plain}，或输入自定义端口: "
