@@ -125,7 +125,7 @@ check_network() {
 		MASK="$((m >> 24 & 255)).$((m >> 16 & 255)).$((m >> 8 & 255)).$((m & 255))"
 	fi
 	echo -ne "${green}当前网络: ${yellow}${networkAdapter} ${IPv4}/${MASK} 网关 ${GATE}${plain}\n"
-	echo -ne "新系统是否使用 DHCP 自动获取 IP？(直接回车=是 / 输入 n=保留当前静态 IP): "
+	echo -ne "新系统是否使用 DHCP 自动获取 IP？(回车=y / 输入 n=保留当前静态 IP): "
 	read -e -r net_choice
 	if [[ "$net_choice" == "n" || "$net_choice" == "no" ]]; then
 		Network4Config='static'
@@ -168,9 +168,11 @@ verify_dd_url() {
 		return 1
 	}
 	echo -ne "${blue}正在检查链接可用性...${plain}\n"
-	local code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 15 "$url")
+	local code=$(curl -4skIL -o /dev/null -w '%{http_code}' --max-time 15 "$url")
+	[[ "$code" != "200" ]] && code=$(wget -4 --no-check-certificate --spider -S --timeout=15 "$url" 2>&1 | awk '/HTTP\//{c=$2} END{print c}')
+	[[ "$code" != "200" ]] && code=$(curl -6skIL -o /dev/null -w '%{http_code}' --max-time 15 "$url")
 	[[ "$code" != "200" ]] && {
-		echo -ne "[${red}错误${plain}] 链接无法访问 (HTTP $code)！\n"
+		echo -ne "[${red}错误${plain}] 链接无法访问 (HTTP ${code:-000})！\n"
 		return 1
 	}
 	DDURL="$url"
@@ -215,28 +217,43 @@ EOF
 # 选择镜像来源：1.默认镜像源  2.云盘直链
 # ============================================================================
 select_image_source() {
-	local default_url=''
+	local candidates=()
 	if [[ "$targetRelease" == "Debian" ]]; then
-		default_url="https://cloud.debian.org/images/cloud/${DIST}/latest/debian-${ubuntuDigital}-genericcloud-${ubuntuArchitecture}.raw"
+		local pkg="debian-${ubuntuDigital}-genericcloud-${ubuntuArchitecture}.raw"
+		candidates=(
+			"https://gemmei.ftp.acc.umu.se/images/cloud/${DIST}/latest/${pkg}"
+			"https://saimei.ftp.acc.umu.se/images/cloud/${DIST}/latest/${pkg}"
+			"https://laotzu.ftp.acc.umu.se/images/cloud/${DIST}/latest/${pkg}"
+			"https://cdimage.debian.org/images/cloud/${DIST}/latest/${pkg}"
+		)
 	else
-		default_url="https://cloud-images.a.disk.re/Ubuntu/${DIST}-server-cloudimg-${ubuntuArchitecture}.xz"
+		candidates=(
+			"https://cloud-images.a.disk.re/Ubuntu/${DIST}-server-cloudimg-${ubuntuArchitecture}.xz"
+		)
 	fi
 
 	echo -ne "\n${green}请选择镜像来源:${plain}\n"
-	echo -ne "  ${yellow}1${plain}) 默认镜像源（${default_url}）\n"
+	echo -ne "  ${yellow}1${plain}) 默认镜像源（自动测试多个镜像站）\n"
 	echo -ne "  ${yellow}2${plain}) 手动输入云盘直链（pCloud 等）\n"
 	echo -ne "请输入 (直接回车=1): "
 	read -e -r src_choice
 
 	if [[ "$src_choice" == "2" ]]; then
+		echo -ne "${yellow}注意: 云盘直链必须是可直接 DD 写盘的 raw / raw.xz / raw.gz 镜像文件！${plain}\n"
+		echo -ne "${yellow}qcow2、img(qcow2)、iso 等格式不能直接 DD。${plain}\n"
 		echo -ne "${green}请输入 DD 镜像直链:${plain}\n链接: "
 		read -e -r image_url
 		[[ -z "$image_url" ]] && echo -ne "[${red}错误${plain}] 链接不能为空！\n" && return 1
-	else
-		image_url="$default_url"
+		verify_dd_url "$image_url" || return 1
+		return 0
 	fi
-	verify_dd_url "$image_url" || return 1
-	return 0
+
+	for image_url in "${candidates[@]}"; do
+		echo -ne "${blue}测试镜像: ${image_url}${plain}\n"
+		verify_dd_url "$image_url" && return 0
+	done
+	echo -ne "[${red}错误${plain}] 所有默认镜像均不可用，请改用云盘直链！\n"
+	return 1
 }
 
 # ============================================================================
