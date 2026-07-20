@@ -200,15 +200,24 @@ select_image_source() {
 	return 1
 }
 # ============================================================================
-# 调用引擎执行 DD（引擎负责下载 Alpine 内核、改 grub、重启进 Alpine 写盘）
-#   引擎的 Ubuntu 云镜像分支是唯一会注入 root 密码/SSH 端口/网络的路径，
-#   Debian genericcloud 采用相同的 cloud-init(NoCloud) 机制，故复用该分支。
-# 参数: $1=Ubuntu版本号(22.04/24.04)  $2=可选自定义镜像URL
+# 调用引擎执行安装
+#   Debian: 走引擎原生 preseed 安装分支（-debian 12/13），root 密码由
+#           "d-i passwd/root-password-crypted" 在安装阶段直接写入，
+#           不依赖 cloud-init，密码/SSH 端口最可靠。
+#   Ubuntu: 走引擎云镜像 DD 分支（-ubuntu 22.04/24.04），密码经
+#           cloud-init(NoCloud) 注入。
+# 参数: $1=OS(Debian/Ubuntu)  $2=版本号(Debian:12/13, Ubuntu:22.04/24.04)
+#       $3=可选自定义镜像URL(仅 Ubuntu/DD 有效)
 # ============================================================================
 run_engine() {
-	local ubuntu_ver="$1" img="$2"
-	local args=(-ubuntu "$ubuntu_ver" -port "$sshPORT" -pwd "$tmpWORD" -setdisk "$DISK")
-	[[ -n "$img" ]] && args+=(-dd "$img")
+	local os="$1" ver="$2" img="$3"
+	local args=()
+	if [[ "$os" == "Debian" ]]; then
+		args=(-debian "$ver" -port "$sshPORT" -pwd "$tmpWORD" -setdisk "$DISK")
+	else
+		args=(-ubuntu "$ver" -port "$sshPORT" -pwd "$tmpWORD" -setdisk "$DISK")
+		[[ -n "$img" ]] && args+=(-dd "$img")
+	fi
 	# 网络参数（DHCP 或静态）
 	[[ -n "$NET_ARGS" ]] && args+=($NET_ARGS)
 
@@ -218,22 +227,30 @@ run_engine() {
 }
 
 # ============================================================================
-# DD 通用流程
+# 安装通用流程
 # 参数: $1=OS(Debian/Ubuntu)  $2=代号  $3=版本号(Debian:12/13, Ubuntu:22.04/24.04)
-#       $4=映射到引擎的 Ubuntu 版本号(固定 22.04 或 24.04)
 # ============================================================================
 setup_dd() {
-	local os="$1" dist="$2" ver="$3" engine_ubuntu_ver="$4"
+	local os="$1" dist="$2" ver="$3"
 
 	get_disk || return 1
 	check_network || return 1
 	set_password_port
-	select_image_source "$os" "$dist" "$ver" || return 1
+	# Debian 走 preseed 网络安装，无需选择 DD 镜像
+	if [[ "$os" == "Debian" ]]; then
+		IMG_URL=''
+	else
+		select_image_source "$os" "$dist" "$ver" || return 1
+	fi
 
 	echo -ne "\n${green}配置确认:${plain}\n"
 	echo -ne "  系统:     ${yellow}${os} ${ver}${plain}\n"
 	echo -ne "  磁盘:     ${yellow}${DISK}${plain}\n"
-	echo -ne "  镜像:     ${yellow}${IMG_URL:-引擎默认源}${plain}\n"
+	if [[ "$os" == "Debian" ]]; then
+		echo -ne "  方式:     ${yellow}官方 netboot + preseed 无人值守安装${plain}\n"
+	else
+		echo -ne "  镜像:     ${yellow}${IMG_URL:-引擎默认源}${plain}\n"
+	fi
 	echo -ne "  网络:     ${yellow}${NET_ARGS:---network dhcp}${plain}\n"
 	echo -ne "  SSH 端口: ${yellow}${sshPORT}${plain}\n"
 	echo -ne "  root 密码: ${yellow}${tmpWORD}${plain}\n\n"
@@ -243,7 +260,7 @@ setup_dd() {
 	[[ "$confirm" != "yes" ]] && echo -ne "[${yellow}已取消${plain}]\n" && return 1
 
 	echo -ne "${yellow}请务必先保存好上方的 root 密码和 SSH 端口！${plain}\n"
-	run_engine "$engine_ubuntu_ver" "$IMG_URL"
+	run_engine "$os" "$ver" "$IMG_URL"
 	# 引擎成功后会自行 reboot；若返回到此说明未重启（可能出错或被中断）
 	echo -ne "\n${yellow}引擎已执行完毕。如未自动重启，请检查上方输出。${plain}\n"
 	echo -ne "${yellow}如需取消本次 DD，请重新运行本脚本并选择菜单 3。${plain}\n\n"
@@ -255,10 +272,8 @@ setup_debian_dd() {
 	echo -ne "\n${green}请选择 Debian 版本:${plain}\n  ${yellow}1${plain}) Debian 12 (bookworm)\n  ${yellow}2${plain}) Debian 13 (trixie)\n请输入 (1-2): "
 	read -e -r c
 	case $c in
-	# Debian 复用引擎 Ubuntu 云镜像分支：引擎版本号取 24.04 仅用于走 cloud-init 流程，
-	# 实际写盘镜像由 -dd 指定的 Debian raw 决定。
-	1) download_engine && setup_dd "Debian" "bookworm" "12" "24.04" ;;
-	2) download_engine && setup_dd "Debian" "trixie" "13" "24.04" ;;
+	1) download_engine && setup_dd "Debian" "bookworm" "12" ;;
+	2) download_engine && setup_dd "Debian" "trixie" "13" ;;
 	*) echo -ne "[${red}错误${plain}] 选择无效！\n" && return 1 ;;
 	esac
 }
@@ -267,8 +282,8 @@ setup_ubuntu_dd() {
 	echo -ne "\n${green}请选择 Ubuntu 版本:${plain}\n  ${yellow}1${plain}) Ubuntu 22.04 (jammy)\n  ${yellow}2${plain}) Ubuntu 24.04 (noble)\n请输入 (1-2): "
 	read -e -r c
 	case $c in
-	1) download_engine && setup_dd "Ubuntu" "jammy" "22.04" "22.04" ;;
-	2) download_engine && setup_dd "Ubuntu" "noble" "24.04" "24.04" ;;
+	1) download_engine && setup_dd "Ubuntu" "jammy" "22.04" ;;
+	2) download_engine && setup_dd "Ubuntu" "noble" "24.04" ;;
 	*) echo -ne "[${red}错误${plain}] 选择无效！\n" && return 1 ;;
 	esac
 }
