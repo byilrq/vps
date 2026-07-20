@@ -212,6 +212,34 @@ EOF
 }
 
 # ============================================================================
+# 选择镜像来源：1.默认镜像源  2.云盘直链
+# ============================================================================
+select_image_source() {
+	local default_url=''
+	if [[ "$targetRelease" == "Debian" ]]; then
+		default_url="https://cloud.debian.org/images/cloud/${DIST}/latest/debian-${ubuntuDigital}-genericcloud-${ubuntuArchitecture}.raw"
+	else
+		default_url="https://cloud-images.a.disk.re/Ubuntu/${DIST}-server-cloudimg-${ubuntuArchitecture}.xz"
+	fi
+
+	echo -ne "\n${green}请选择镜像来源:${plain}\n"
+	echo -ne "  ${yellow}1${plain}) 默认镜像源（${default_url}）\n"
+	echo -ne "  ${yellow}2${plain}) 手动输入云盘直链（pCloud 等）\n"
+	echo -ne "请输入 (直接回车=1): "
+	read -e -r src_choice
+
+	if [[ "$src_choice" == "2" ]]; then
+		echo -ne "${green}请输入 DD 镜像直链:${plain}\n链接: "
+		read -e -r image_url
+		[[ -z "$image_url" ]] && echo -ne "[${red}错误${plain}] 链接不能为空！\n" && return 1
+	else
+		image_url="$default_url"
+	fi
+	verify_dd_url "$image_url" || return 1
+	return 0
+}
+
+# ============================================================================
 # DD 通用配置流程（Debian/Ubuntu 共用）
 # ============================================================================
 setup_dd() {
@@ -219,11 +247,7 @@ setup_dd() {
 	check_network
 	set_password_port
 
-	echo -ne "\n${green}请输入 DD 镜像直链（pCloud 直链）:${plain}\n"
-	echo -ne "链接: "
-	read -e -r image_url
-	[[ -z "$image_url" ]] && echo -ne "[${red}错误${plain}] 链接不能为空！\n" && return 1
-	verify_dd_url "$image_url" || return 1
+	select_image_source || return 1
 
 	echo -ne "\n${green}配置确认:${plain}\n"
 	echo -ne "  系统:     ${yellow}${targetRelease} ${ubuntuDigital}${plain}\n"
