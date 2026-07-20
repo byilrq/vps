@@ -125,7 +125,46 @@ else
 fi
 
 # Download cloud init file.
-wget --no-check-certificate -qO $cloudInitFile ''$cloudInitUrl''
+# 直接内联cloud-init配置，避免网络下载失败
+mkdir -p /mnt/etc/cloud/cloud.cfg.d
+cat > $cloudInitFile << 'EOFCLOUD'
+#cloud-config
+timezone: TimeZone
+ssh_pwauth: true
+users:
+  - name: root
+    ssh_pwauth: true
+    passwd: tmpWORD
+    lock_passwd: false
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    hashed_passwd: '*'
+hostname: HostName
+runcmd:
+  - sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+  - sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+  - sed -ri 's/^#?Port.*/Port sshPORT/g' /etc/ssh/sshd_config
+  - sed -ri 's/^ListenStream=.*/ListenStream=sshPORT/g' /lib/systemd/system/ssh.socket
+  - systemctl daemon-reload
+  - systemctl restart ssh || systemctl restart sshd || true
+  - apt-get update
+  - DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget dnsutils fail2ban htop iftop iotop net-tools
+  - fail2ban-client set sshd bantime -1
+  - fail2ban-client set sshd findtime 3600
+  - fail2ban-client set sshd maxretry 5
+  - systemctl enable fail2ban
+  - systemctl restart fail2ban || true
+bootcmd:
+  - sed -ri 's/iso9660/osi9876/g' /usr/lib/python3/dist-packages/cloudinit/util.py 2>/dev/null || true
+  - sed -ri 's#"blkid"#"echo"#g' /usr/lib/python3/dist-packages/cloudinit/util.py 2>/dev/null || true
+network-config:
+  version: 2
+  ethernets:
+    networkAdapter:
+      dhcp4: true
+      dhcp6: true
+EOFCLOUD
+
 
 # User config.
 tmpWORD_ESC=$(printf '%s\n' "$tmpWORD" | sed -e 's/&/\\\&/g')
