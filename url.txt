@@ -3,7 +3,9 @@ wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/ntfy.sh && bash ntfy.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/trafficcop/t.sh && bash t.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/node/node.sh && bash node.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main//ddinstall/install.sh && bash install.sh
 
+/ddinstall/install.sh
 sni: 如果你用的是ca证书，这里填入你的域名,如果你是自签证书，这里填入www.bing.com;
 insecure: 如果你用的是ca证书,自签证书insecure为false。
 
