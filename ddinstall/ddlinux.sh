@@ -124,77 +124,44 @@ else
 	}
 fi
 
-# Download cloud init file.
-# 直接内联cloud-init配置，避免网络下载失败
-mkdir -p /mnt/etc/cloud/cloud.cfg.d
-cat > $cloudInitFile << 'EOFCLOUD'
-#cloud-config
-timezone: TimeZone
-ssh_pwauth: true
-users:
-  - name: root
-    ssh_pwauth: true
-    passwd: tmpWORD
-    lock_passwd: false
-    sudo: ALL=(ALL) NOPASSWD:ALL
-    shell: /bin/bash
-    hashed_passwd: '*'
-hostname: HostName
-runcmd:
-  - sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
-  - sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-  - sed -ri 's/^#?Port.*/Port sshPORT/g' /etc/ssh/sshd_config
-  - sed -ri 's/^ListenStream=.*/ListenStream=sshPORT/g' /lib/systemd/system/ssh.socket
-  - systemctl daemon-reload
-  - systemctl restart ssh || systemctl restart sshd || true
-  - apt-get update
-  - DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget dnsutils fail2ban htop iftop iotop net-tools
-  - fail2ban-client set sshd bantime -1
-  - fail2ban-client set sshd findtime 3600
-  - fail2ban-client set sshd maxretry 5
-  - systemctl enable fail2ban
-  - systemctl restart fail2ban || true
-bootcmd:
-  - sed -ri 's/iso9660/osi9876/g' /usr/lib/python3/dist-packages/cloudinit/util.py 2>/dev/null || true
-  - sed -ri 's#"blkid"#"echo"#g' /usr/lib/python3/dist-packages/cloudinit/util.py 2>/dev/null || true
-network-config:
-  version: 2
-  ethernets:
-    networkAdapter:
-      dhcp4: true
-      dhcp6: true
-EOFCLOUD
+# Create NoCloud seed for cloud-init.
+mkdir -p /mnt/var/lib/cloud/seed/nocloud
 
+# meta-data：cloud-init 需要识别的元数据
+cat > /mnt/var/lib/cloud/seed/nocloud/meta-data << EOF
+instance-id: i-ddinstall-${HostName}
+local-ipv4: ${IPv4}
+hostname: ${HostName}
+EOF
 
-# User config.
-tmpWORD_ESC=$(printf '%s\n' "$tmpWORD" | sed -e 's/&/\\\&/g')
-sed -ri 's|sshPORT|'${sshPORT}'|g' $cloudInitFile
-sed -ri 's|HostName|'${HostName}'|g' $cloudInitFile
-sed -ri 's|tmpWORD|'${tmpWORD_ESC}'|g' $cloudInitFile
-sed -ri 's|TimeZone|'${TimeZone1}'/'${TimeZone2}'|g' $cloudInitFile
-sed -ri 's|targetLinuxMirror|'${targetLinuxMirror}'|g' $cloudInitFile
-sed -ri 's|targetLinuxSecurityMirror|'${targetLinuxSecurityMirror}'|g' $cloudInitFile
-sed -ri 's|networkAdapter|'${networkAdapter}'|g' $cloudInitFile
-if [[ "$iAddrNum" -ge "2" ]]; then
-	sed -ri 's#IPv4/ipPrefix#'${writeIpsCmd}'#g' $cloudInitFile
-else
-	sed -ri 's/IPv4/'${IPv4}'/g' $cloudInitFile
-	sed -ri 's/ipPrefix/'${ipPrefix}'/g' $cloudInitFile
-	sed -ri "s/${IPv4}\/${ipPrefix}/${IPv4}\/${actualIp4Prefix}/g" $cloudInitFile
-fi
-sed -ri 's/GATE/'${GATE}'/g' $cloudInitFile
-sed -ri 's/ipDNS1/'${ipDNS1}'/g' $cloudInitFile
-sed -ri 's/ipDNS2/'${ipDNS2}'/g' $cloudInitFile
-if [[ "$i6AddrNum" -ge "2" ]]; then
-	sed -ri 's#ip6Addr/ip6Mask#'${writeIp6sCmd}'#g' $cloudInitFile
-else
-	sed -ri 's/ip6Addr/'${ip6Addr}'/g' $cloudInitFile
-	sed -ri 's/ip6Mask/'${ip6Mask}'/g' $cloudInitFile
-	sed -ri "s/${ip6Addr}\/${ip6Mask}/${ip6Addr}\/${actualIp6Prefix}/g" $cloudInitFile
-fi
-sed -ri 's/ip6Gate/'${ip6Gate}'/g' $cloudInitFile
-sed -ri 's/ip6DNS1/'${ip6DNS1}'/g' $cloudInitFile
-sed -ri 's/ip6DNS2/'${ip6DNS2}'/g' $cloudInitFile
+# user-data：云初始化脚本
+cat > /mnt/var/lib/cloud/seed/nocloud/user-data << 'EOFUSERDATA'
+#!/bin/bash
+set -e
+
+# 设置密码（直接在这里设置，不依赖 yaml 解析）
+echo 'root:tmpWORD' | chpasswd
+
+# SSH 配置
+sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
+sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
+sed -ri 's/^#?Port.*/Port sshPORT/g' /etc/ssh/sshd_config
+
+# 重启 SSH
+systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
+
+# 安装基础工具
+apt-get update
+DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget dnsutils fail2ban 2>&1 | tail -5 || true
+
+# 启用 fail2ban
+systemctl enable fail2ban 2>/dev/null || true
+systemctl restart fail2ban 2>/dev/null || true
+EOFUSERDATA
+
+# 替换占位符
+sed -i "s|tmpWORD|${tmpWORD}|g" /mnt/var/lib/cloud/seed/nocloud/user-data
+sed -i "s|sshPORT|${sshPORT}|g" /mnt/var/lib/cloud/seed/nocloud/user-data
 
 # Disable any datahouse.
 # Reference: https://github.com/canonical/cloud-init/issues/3772
