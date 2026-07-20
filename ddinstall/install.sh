@@ -1,599 +1,285 @@
 #!/bin/bash
 ##
 ## License: GPL
-## Simplified DD Installer Script - Support Debian 12~13, Ubuntu 22~24 Only
-## Based on InstallNET.sh by MoeClub.org
-## Simplified Version with Interactive Menu
+## DD Installer - Debian 12~13, Ubuntu 22~24 Only
+## Repo: https://github.com/byilrq/vps/tree/main/ddinstall
+## Usage: bash install.sh
 ## Default root password: LeitboGi0ro
 
-# ============================================================================
-# Color Definitions
-# ============================================================================
-underLine='\033[4m'
-aoiBlue='\033[36m'
+repoURL='https://raw.githubusercontent.com/byilrq/vps/main/ddinstall'
+workDir='/root/ddinstall'
+confFile='/root/alpine.config'
+
 blue='\033[34m'
 yellow='\033[33m'
 green='\033[32m'
 red='\033[31m'
 plain='\033[0m'
 
-# ============================================================================
-# Global Variables
-# ============================================================================
-export tmpDIST=''
-export tmpURL=''
 export tmpWORD='LeitboGi0ro'
-export tmpMirror=''
-export targetRelease=''
-export VER='amd64'
-export TimeZone='UTC'
-export IncDisk=''
-export interface=''
-export setInterfaceName='0'
-export autoPlugAdapter='1'
-export IsCN=''
-export Relese=''
-export DIST=''
-export finalDIST=''
 export sshPORT='22'
-export ddMode='0'
-export setNet='0'
-export ipAddr=''
-export ipMask=''
-export ipGate=''
-export ipDNS='8.8.8.8 1.1.1.1'
+export TimeZone='Asia/Shanghai'
 export setIPv6='1'
-export ip6Addr=''
-export ip6Mask=''
-export ip6Gate=''
-export ip6DNS='2001:4860:4860::8888 2606:4700:4700::1111'
+export IncDisk=''
 export DDURL=''
 export DEC_CMD=''
-export ubuntuArchitecture='amd64'
+export targetRelease=''
 export ubuntuDigital=''
-export partitionTable='mbr'
-export setMemCheck='1'
-export LANG="en_US.UTF-8"
-export LANGUAGE="en_US:en"
+export DIST=''
+export ubuntuArchitecture='amd64'
+export networkAdapter=''
+export Network4Config='dhcp'
+export IPv4=''
+export MASK=''
+export GATE=''
+export ipDNS1='8.8.8.8'
+export ipDNS2='1.1.1.1'
+export cloudInitUrl=''
+
+[[ $EUID -ne 0 ]] && echo -ne "\n[${red}Error${plain}] This script must be run as root!\n\n" && exit 1
 
 # ============================================================================
-# Check Root Permission
+# Download support files from GitHub repo
 # ============================================================================
-if [[ $EUID -ne 0 ]]; then
-	echo -ne "\n[${red}Error${plain}] This script must be run as root! \n\n"
-	exit 1
-fi
-
-# ============================================================================
-# Function: Show Main Menu
-# ============================================================================
-show_main_menu() {
-	clear
-	echo -ne "\n${blue}========================================${plain}\n"
-	echo -ne "${blue}    DD Linux Installer${plain}\n"
-	echo -ne "${blue}    Support: Debian 12~13, Ubuntu 22~24${plain}\n"
-	echo -ne "${blue}========================================${plain}\n\n"
-	echo -ne "${green}Please select an option:${plain}\n"
-	echo -ne "  ${yellow}1${plain}) DD Debian (12/13)\n"
-	echo -ne "  ${yellow}2${plain}) DD Ubuntu (22.04/24.04)\n"
-	echo -ne "  ${yellow}3${plain}) Clear DD Parameters\n"
-	echo -ne "  ${yellow}0${plain}) Exit\n\n"
-	echo -ne "${blue}========================================${plain}\n"
-	echo -ne "Enter your choice: "
+download_support_files() {
+	mkdir -p "$workDir/CloudInit"
+	local files=(
+		"CloudInit/dhcp_interfaces.cfg"
+		"CloudInit/ipv4_static_interfaces.cfg"
+		"CloudInit/ipv4_dhcp_ipv6_static_interfaces.cfg"
+		"CloudInit/ipv4_static_ipv6_dhcp_interfaces.cfg"
+		"CloudInit/ipv4_static_ipv6_static_interfaces.cfg"
+		"CloudInit/ipv6_static_interfaces.cfg"
+		"ubuntuInit.sh"
+	)
+	echo -ne "${blue}Downloading support files from GitHub...${plain}\n"
+	for f in "${files[@]}"; do
+		[[ -s "$workDir/$f" ]] && continue
+		wget --no-check-certificate -qO "$workDir/$f" "$repoURL/$f"
+		if [[ $? -ne 0 || ! -s "$workDir/$f" ]]; then
+			echo -ne "[${yellow}Warn${plain}] Failed to download: $f (will use repo URL at DD time)\n"
+			rm -f "$workDir/$f"
+		fi
+	done
+	echo -ne "${green}✓ Support files ready: $workDir${plain}\n"
 }
 
 # ============================================================================
-# Function: Clear DD Parameters
+# Detect architecture
 # ============================================================================
-clear_dd_params() {
-	echo -ne "\n${blue}Clearing DD parameters...${plain}\n"
+check_architecture() {
+	case "$(uname -m)" in
+	x86_64) ubuntuArchitecture='amd64' ;;
+	aarch64) ubuntuArchitecture='arm64' ;;
+	*) echo -ne "[${red}Error${plain}] Unsupported architecture: $(uname -m)\n" && exit 1 ;;
+	esac
+}
 
-	# Remove the alpine.config file if it exists
-	if [[ -f /root/alpine.config ]]; then
-		rm -f /root/alpine.config
-		echo -ne "${green}✓${plain} Configuration file cleared: /root/alpine.config\n"
+# ============================================================================
+# Detect network (adapter, IP, gateway)
+# ============================================================================
+check_network() {
+	networkAdapter=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
+	GATE=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
+	IPv4=$(ip -4 addr show "$networkAdapter" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d'/' -f1)
+	local prefix=$(ip -4 addr show "$networkAdapter" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d'/' -f2)
+	if [[ -n "$prefix" ]]; then
+		local m=$((0xffffffff << (32 - prefix) & 0xffffffff))
+		MASK="$((m >> 24 & 255)).$((m >> 16 & 255)).$((m >> 8 & 255)).$((m & 255))"
 	fi
+	echo -ne "${green}Network: ${yellow}${networkAdapter} ${IPv4}/${MASK} gw ${GATE}${plain}\n"
+	echo -ne "Use DHCP in new system? (Enter=yes / n=keep static IP): "
+	read -r net_choice
+	if [[ "$net_choice" == "n" || "$net_choice" == "no" ]]; then
+		Network4Config='static'
+		cloudInitUrl="$repoURL/CloudInit/ipv4_static_interfaces.cfg"
+	else
+		Network4Config='dhcp'
+		cloudInitUrl="$repoURL/CloudInit/dhcp_interfaces.cfg"
+	fi
+}
 
-	# Clear DD-related environment variables
-	export DDURL=""
-	export DEC_CMD=""
-	export ddMode='0'
-	export tmpURL=""
+# ============================================================================
+# Detect target disk
+# ============================================================================
+get_disk() {
+	local disk_array=($(lsblk -dpln -o NAME,TYPE 2>/dev/null | awk '$2=="disk"{print $1}' | grep -v 'loop\|sr[0-9]'))
+	local disk_count=${#disk_array[@]}
+	if [[ $disk_count -eq 0 ]]; then
+		echo -ne "[${red}Error${plain}] No hard disk found!\n" && exit 1
+	elif [[ $disk_count -eq 1 ]]; then
+		IncDisk="${disk_array[0]}"
+		echo -ne "${green}✓ Disk: ${yellow}$IncDisk${plain}\n"
+	else
+		echo -ne "${yellow}Multiple disks found:${plain}\n"
+		lsblk -dpln -o NAME,SIZE,TYPE | awk '$3=="disk"{print "   "NR") "$1"  "$2}'
+		echo -ne "Select target disk (1-$disk_count): "
+		read -r c
+		[[ $c -ge 1 && $c -le $disk_count ]] || { echo -ne "[${red}Error${plain}] Invalid selection!\n"; exit 1; }
+		IncDisk="${disk_array[$((c - 1))]}"
+		echo -ne "${green}✓ Disk: ${yellow}$IncDisk${plain}\n"
+	fi
+}
 
-	echo -ne "${green}✓${plain} DD parameters have been cleared\n"
-	echo -ne "${green}✓${plain} System can proceed without DD configuration\n\n"
-
-	read -p "Press Enter to return to main menu..."
+# ============================================================================
+# Verify pCloud/direct DD image URL
+# ============================================================================
+verify_dd_url() {
+	local url="$1"
+	echo "$url" | grep -q '^http://\|^https://\|^ftp://' || {
+		echo -ne "[${red}Error${plain}] Invalid URL, only http/https/ftp supported!\n"
+		return 1
+	}
+	echo -ne "${blue}Checking URL...${plain}\n"
+	local code=$(curl -sIL -o /dev/null -w '%{http_code}' --max-time 15 "$url")
+	[[ "$code" != "200" ]] && {
+		echo -ne "[${red}Error${plain}] URL not accessible (HTTP $code)!\n"
+		return 1
+	}
+	DDURL="$url"
+	case "$url" in
+	*.xz) DEC_CMD="xzcat" ;;
+	*.gz) DEC_CMD="gunzip -dc" ;;
+	*) DEC_CMD="cat" ;;
+	esac
+	echo -ne "${green}✓ URL OK, decompress: ${yellow}$DEC_CMD${plain}\n"
 	return 0
 }
 
 # ============================================================================
-# Function: Check Dependencies
+# Write config file
+# ============================================================================
+generate_config() {
+	cat > "$confFile" << EOF
+ubuntuArchitecture  ${ubuntuArchitecture}
+IncDisk  ${IncDisk}
+targetRelese  ${targetRelease}
+ubuntuDigital  ${ubuntuDigital}
+DDURL  ${DDURL}
+DEC_CMD  ${DEC_CMD}
+tmpWORD  ${tmpWORD}
+sshPORT  ${sshPORT}
+TimeZone  ${TimeZone}
+setIPv6  ${setIPv6}
+networkAdapter  ${networkAdapter}
+Network4Config  ${Network4Config}
+IPv4  ${IPv4}
+MASK  ${MASK}
+GATE  ${GATE}
+ipDNS1  ${ipDNS1}
+ipDNS2  ${ipDNS2}
+cloudInitUrl  ${cloudInitUrl}
+HostName  localhost
+EOF
+	echo -ne "${green}✓ Config written: ${confFile}${plain}\n"
+}
+
+# ============================================================================
+# Common DD setup (called by Debian/Ubuntu entries)
+# ============================================================================
+setup_dd() {
+	get_disk
+	check_network
+
+	echo -ne "\n${green}Enter DD image URL (pCloud direct link):${plain}\n"
+	echo -ne "URL: "
+	read -r image_url
+	[[ -z "$image_url" ]] && echo -ne "[${red}Error${plain}] URL cannot be empty!\n" && return 1
+	verify_dd_url "$image_url" || return 1
+
+	echo -ne "\n${green}Summary:${plain}\n"
+	echo -ne "  System:   ${yellow}${targetRelease} ${ubuntuDigital}${plain}\n"
+	echo -ne "  Disk:     ${yellow}${IncDisk}${plain}\n"
+	echo -ne "  Image:    ${yellow}${DDURL}${plain}\n"
+	echo -ne "  Network:  ${yellow}${Network4Config}${plain}\n"
+	echo -ne "  Password: ${yellow}${tmpWORD}${plain}\n\n"
+	echo -ne "${red}WARNING: ALL data on ${yellow}${IncDisk}${red} will be DESTROYED!${plain}\n"
+	echo -ne "Type ${yellow}yes${plain} to confirm: "
+	read -r confirm
+	[[ "$confirm" != "yes" ]] && echo -ne "[${yellow}Cancelled${plain}]\n" && return 1
+
+	download_support_files
+	generate_config
+
+	echo -ne "\n${green}✓ ${targetRelease} DD configured. Reboot to start installation.${plain}\n"
+	echo -ne "${yellow}To cancel before reboot, run this script and choose menu 3.${plain}\n\n"
+	read -p "Press Enter to return to menu..."
+	return 0
+}
+
+setup_debian_dd() {
+	targetRelease="Debian"
+	echo -ne "\n${green}Select Debian version:${plain}\n  ${yellow}1${plain}) Debian 12 (bookworm)\n  ${yellow}2${plain}) Debian 13 (trixie)\nChoice (1-2): "
+	read -r c
+	case $c in
+	1) DIST="bookworm" && ubuntuDigital="12" ;;
+	2) DIST="trixie" && ubuntuDigital="13" ;;
+	*) echo -ne "[${red}Error${plain}] Invalid selection!\n" && return 1 ;;
+	esac
+	setup_dd
+}
+
+setup_ubuntu_dd() {
+	targetRelease="Ubuntu"
+	echo -ne "\n${green}Select Ubuntu version:${plain}\n  ${yellow}1${plain}) Ubuntu 22.04 (jammy)\n  ${yellow}2${plain}) Ubuntu 24.04 (noble)\nChoice (1-2): "
+	read -r c
+	case $c in
+	1) DIST="jammy" && ubuntuDigital="22.04" ;;
+	2) DIST="noble" && ubuntuDigital="24.04" ;;
+	*) echo -ne "[${red}Error${plain}] Invalid selection!\n" && return 1 ;;
+	esac
+	setup_dd
+}
+
+# ============================================================================
+# Clear DD parameters (prevent repeated DD boot)
+# ============================================================================
+clear_dd_params() {
+	echo -ne "\n${blue}Clearing DD parameters...${plain}\n"
+	[[ -f "$confFile" ]] && rm -f "$confFile" && echo -ne "${green}✓ Removed ${confFile}${plain}\n"
+	[[ -d "$workDir" ]] && rm -rf "$workDir" && echo -ne "${green}✓ Removed ${workDir}${plain}\n"
+	echo -ne "${green}✓ Done. System will boot normally.${plain}\n\n"
+	read -p "Press Enter to return to menu..."
+}
+
+# ============================================================================
+# Dependencies
 # ============================================================================
 dependence() {
-	local dep_array=(
-		'awk'
-		'grep'
-		'sed'
-		'cut'
-		'wget'
-		'curl'
-		'xz'
-		'parted'
-		'fdisk'
-		'sfdisk'
-		'printf'
-		'mktemp'
-		'losetup'
-		'blockdev'
-		'kpartx'
-	)
-
-	for ((i = 0; i < ${#dep_array[@]}; i++)); do
-		type -P "${dep_array[$i]}" > /dev/null 2>&1
-		[[ $? -ne 0 ]] && {
-			echo -ne "[${red}Error${plain}] ${dep_array[$i]} is not installed.\n"
-			echo -ne "[${red}Error${plain}] Please use 'apt-get' or 'yum' to install it.\n\n"
+	for dep in awk grep sed cut wget curl lsblk ip; do
+		type -P "$dep" > /dev/null 2>&1 || {
+			echo -ne "[${red}Error${plain}] '$dep' is not installed, please install it first.\n"
 			exit 1
 		}
 	done
 }
 
 # ============================================================================
-# Function: Get System Architecture
-# ============================================================================
-check_architecture() {
-	VER=$(uname -m)
-	if [[ "$VER" == "x86_64" ]]; then
-		VER="amd64"
-		ubuntuArchitecture="amd64"
-	elif [[ "$VER" == "aarch64" ]]; then
-		VER="arm64"
-		ubuntuArchitecture="arm64"
-	fi
-
-	echo -ne "${green}System Architecture: ${yellow}$VER${plain}\n"
-}
-
-# ============================================================================
-# Function: Get Primary Hard Disk
-# ============================================================================
-get_disk() {
-	echo -ne "\n${blue}Detecting hard disk...${plain}\n"
-
-	# Get list of available disks
-	local disks=$(lsblk -dplnx name,size | grep -v "loop" | awk '{print $1}')
-	local disk_count=0
-	local disk_array=()
-
-	for disk in $disks; do
-		disk_count=$((disk_count + 1))
-		disk_array+=("$disk")
-	done
-
-	if [[ $disk_count -eq 0 ]]; then
-		echo -ne "[${red}Error${plain}] No hard disk found!\n"
-		exit 1
-	elif [[ $disk_count -eq 1 ]]; then
-		IncDisk="${disk_array[0]}"
-		echo -ne "${green}✓ Disk detected: ${yellow}$IncDisk${plain}\n"
-	else
-		echo -ne "${yellow}Multiple disks found:${plain}\n"
-		for ((i = 0; i < disk_count; i++)); do
-			echo -ne "  ${yellow}$((i+1))${plain}) ${disk_array[$i]}\n"
-		done
-		echo -ne "Select target disk (1-$disk_count): "
-		read -r disk_choice
-
-		if [[ $disk_choice -ge 1 && $disk_choice -le $disk_count ]]; then
-			IncDisk="${disk_array[$((disk_choice-1))]}"
-			echo -ne "${green}✓ Target disk: ${yellow}$IncDisk${plain}\n"
-		else
-			echo -ne "[${red}Error${plain}] Invalid disk selection!\n"
-			exit 1
-		fi
-	fi
-}
-
-# ============================================================================
-# Function: Verify DD Image URL
-# ============================================================================
-verify_url_validation_of_dd_images() {
-	local url="$1"
-
-	# Check URL format
-	echo "$url" | grep -q '^http://\|^ftp://\|^https://'
-	if [[ $? -ne 0 ]]; then
-		echo -ne "\n[${red}Error${plain}] Invalid URL format!\n"
-		echo -ne "[${red}Error${plain}] Only support http://, https:// or ftp:// URLs\n"
-		return 1
-	fi
-
-	# Check URL accessibility
-	echo -ne "${blue}Checking URL accessibility...${plain}\n"
-	tmpURLCheck=$(echo $(curl -s -I -X GET "$url") | grep -wi "http/[0-9]*" | awk '{print $2}')
-	if [[ $tmpURLCheck != "200" ]]; then
-		echo -ne "[${red}Error${plain}] Cannot access the image URL!\n"
-		echo -ne "[${red}Error${plain}] HTTP Response: $tmpURLCheck\n"
-		return 1
-	fi
-
-	DDURL="$url"
-
-	# Determine decompression command
-	if [[ "$DDURL" == *.xz ]]; then
-		DEC_CMD="xzcat"
-	elif [[ "$DDURL" == *.gz ]]; then
-		DEC_CMD="gunzip -dc"
-	else
-		# Try to guess based on content
-		DEC_CMD="xzcat"
-	fi
-
-	echo -ne "${green}✓ URL is valid${plain}\n"
-	echo -ne "${green}✓ Decompression method: ${yellow}$DEC_CMD${plain}\n"
-	return 0
-}
-
-# ============================================================================
-# Function: Select Mirror
-# ============================================================================
-select_mirror() {
-	local release="$1"
-	local dist="$2"
-	local ver="$3"
-
-	release=$(echo "$release" | sed -r 's/(.*)/\L\1/')
-	dist=$(echo "$dist" | sed 's/\ //g' | sed -r 's/(.*)/\L\1/')
-
-	local mirror_status=0
-	declare -A mirror_backup
-
-	# Define mirror sources
-	if [[ "$IsCN" == "cn" ]]; then
-		mirror_backup=(
-			["debian0"]=""
-			["debian1"]="http://mirror.sjtu.edu.cn/debian"
-			["debian2"]="http://mirror.nju.edu.cn/debian"
-			["debian3"]="https://mirrors.tuna.tsinghua.edu.cn/debian"
-			["ubuntu0"]=""
-			["ubuntu1"]="https://mirrors.ustc.edu.cn/ubuntu"
-			["ubuntu2"]="http://mirrors.xjtu.edu.cn/ubuntu"
-		)
-	else
-		mirror_backup=(
-			["debian0"]=""
-			["debian1"]="http://deb.debian.org/debian"
-			["debian2"]="http://mirrors.ocf.berkeley.edu/debian"
-			["debian3"]="http://ftp.yz.yamagata-u.ac.jp/pub/linux/debian"
-			["ubuntu0"]=""
-			["ubuntu1"]="http://archive.ubuntu.com/ubuntu"
-			["ubuntu2"]="http://ports.ubuntu.com"
-		)
-	fi
-
-	# Use custom mirror if provided
-	if echo "$tmpMirror" | grep -q '^http://\|^https://\|^ftp://'; then
-		mirror_backup[${release}0]="${tmpMirror%*/}"
-	fi
-
-	# Test mirrors
-	for mirror_key in $(echo "${!mirror_backup[@]}" | sed 's/\ /\n/g' | sort -n); do
-		[[ ! "$mirror_key" =~ ^"$release" ]] && continue
-
-		local current="${mirror_backup[$mirror_key]}"
-		[[ -z "$current" ]] && continue
-
-		# Simple mirror test
-		wget --no-check-certificate --spider --timeout=3 -o /dev/null "$current" 2>/dev/null
-		if [[ $? -eq 0 ]]; then
-			mirror_status=1
-			echo -ne "${green}✓ Using mirror: ${yellow}$current${plain}\n"
-			echo "$current"
-			return 0
-		fi
-	done
-
-	if [[ $mirror_status -eq 0 ]]; then
-		echo -ne "[${red}Error${plain}] No available mirror found!\n"
-		return 1
-	fi
-}
-
-# ============================================================================
-# Function: Generate alpine.config
-# ============================================================================
-generate_config() {
-	echo -ne "${blue}Generating configuration file...${plain}\n"
-
-	cat > /root/alpine.config << EOF
-# DD System Configuration File
-# Generated automatically
-
-# System Architecture
-ubuntuArchitecture  ${ubuntuArchitecture}
-
-# Target Disk
-IncDisk  ${IncDisk}
-
-# Target System Information
-targetRelese  ${targetRelease}
-ubuntuDigital  ${ubuntuDigital}
-
-# DD Image URL and Decompression
-DDURL  ${DDURL}
-DEC_CMD  ${DEC_CMD}
-
-# Root Password
-tmpWORD  ${tmpWORD}
-
-# SSH Configuration
-sshPORT  ${sshPORT}
-
-# Network Configuration (optional, can be configured in target system)
-setIPv6  ${setIPv6}
-
-# Timezone
-TimeZone  ${TimeZone}
-
-# Network Interface
-networkAdapter
-
-# IP Configuration Method (dhcp or static)
-Network4Config
-
-# IPv4 Configuration
-IPv4
-MASK
-GATE
-
-# IPv6 Configuration
-setIPv6  ${setIPv6}
-
-EOF
-
-	echo -ne "${green}✓ Configuration file generated: /root/alpine.config${plain}\n"
-}
-
-# ============================================================================
-# Function: Setup Debian DD
-# ============================================================================
-setup_debian_dd() {
-	clear
-	echo -ne "\n${blue}========== DD Debian Setup ==========${plain}\n"
-
-	Relese="Debian"
-	targetRelease="Debian"
-	ddMode='1'
-
-	# Ask for Debian version
-	echo -ne "\n${green}Select Debian version:${plain}\n"
-	echo -ne "  ${yellow}1${plain}) Debian 12 (bookworm)\n"
-	echo -ne "  ${yellow}2${plain}) Debian 13 (trixie)\n"
-	echo -ne "Enter your choice (1-2): "
-	read -r debian_choice
-
-	case $debian_choice in
-		1)
-			tmpDIST="12"
-			DIST="bookworm"
-			ubuntuDigital="12"
-			echo -ne "${green}✓ Selected: Debian 12 (bookworm)${plain}\n"
-			;;
-		2)
-			tmpDIST="13"
-			DIST="trixie"
-			ubuntuDigital="13"
-			echo -ne "${green}✓ Selected: Debian 13 (trixie)${plain}\n"
-			;;
-		*)
-			echo -ne "[${red}Error${plain}] Invalid selection!\n"
-			return 1
-			;;
-	esac
-
-	# Get disk selection
-	get_disk
-
-	# Input custom mirror URL
-	echo -ne "\n${green}Debian Mirror Source Configuration${plain}\n"
-	echo -ne "You can use default mirror or provide a custom pcloud direct link.\n"
-	echo -ne "Leave empty to use default mirror.\n"
-	echo -ne "Enter mirror URL (or press Enter for default): "
-	read -r custom_mirror
-
-	if [[ -n "$custom_mirror" ]]; then
-		tmpMirror="$custom_mirror"
-	fi
-
-	# Select mirror
-	select_mirror "Debian" "$DIST" "$VER" > /dev/null
-
-	# Input DD image URL
-	echo -ne "\n${green}Enter DD Image URL${plain}\n"
-	echo -ne "This should be a direct link to Debian DD image (pcloud or other source)\n"
-	echo -ne "URL: "
-	read -r image_url
-
-	if [[ -z "$image_url" ]]; then
-		echo -ne "[${red}Error${plain}] Image URL cannot be empty!\n"
-		return 1
-	fi
-
-	verify_url_validation_of_dd_images "$image_url"
-	if [[ $? -ne 0 ]]; then
-		return 1
-	fi
-
-	echo -ne "\n${green}Configuration Summary:${plain}\n"
-	echo -ne "  System: ${yellow}Debian ${ubuntuDigital}${plain}\n"
-	echo -ne "  Target Disk: ${yellow}${IncDisk}${plain}\n"
-	echo -ne "  Image URL: ${yellow}${DDURL}${plain}\n"
-	echo -ne "  Decompression: ${yellow}${DEC_CMD}${plain}\n"
-	echo -ne "  Root Password: ${yellow}${tmpWORD}${plain}\n\n"
-
-	echo -ne "${red}WARNING: This will overwrite all data on ${yellow}${IncDisk}${red}!${plain}\n"
-	echo -ne "Continue? (yes/no): "
-	read -r confirm
-
-	if [[ "$confirm" != "yes" ]]; then
-		echo -ne "[${yellow}Cancelled${plain}] Installation aborted.\n"
-		return 1
-	fi
-
-	generate_config
-
-	echo -ne "\n${green}✓ Debian DD setup completed!${plain}\n"
-	echo -ne "${blue}Next steps:${plain}\n"
-	echo -ne "  1. Reboot the system\n"
-	echo -ne "  2. The system will start Alpine Linux\n"
-	echo -ne "  3. Debian will be automatically installed via DD\n"
-	echo -ne "  4. After installation, the system will reboot into Debian\n\n"
-
-	read -p "Press Enter to return to main menu..."
-	return 0
-}
-
-# ============================================================================
-# Function: Setup Ubuntu DD
-# ============================================================================
-setup_ubuntu_dd() {
-	clear
-	echo -ne "\n${blue}========== DD Ubuntu Setup ==========${plain}\n"
-
-	Relese="Ubuntu"
-	targetRelease="Ubuntu"
-	ddMode='1'
-
-	# Ask for Ubuntu version
-	echo -ne "\n${green}Select Ubuntu version:${plain}\n"
-	echo -ne "  ${yellow}1${plain}) Ubuntu 22.04 LTS (jammy)\n"
-	echo -ne "  ${yellow}2${plain}) Ubuntu 24.04 LTS (noble)\n"
-	echo -ne "Enter your choice (1-2): "
-	read -r ubuntu_choice
-
-	case $ubuntu_choice in
-		1)
-			tmpDIST="22.04"
-			finalDIST="22.04"
-			DIST="jammy"
-			ubuntuDigital="22.04"
-			echo -ne "${green}✓ Selected: Ubuntu 22.04 LTS (jammy)${plain}\n"
-			;;
-		2)
-			tmpDIST="24.04"
-			finalDIST="24.04"
-			DIST="noble"
-			ubuntuDigital="24.04"
-			echo -ne "${green}✓ Selected: Ubuntu 24.04 LTS (noble)${plain}\n"
-			;;
-		*)
-			echo -ne "[${red}Error${plain}] Invalid selection!\n"
-			return 1
-			;;
-	esac
-
-	# Get disk selection
-	get_disk
-
-	# Input custom mirror URL
-	echo -ne "\n${green}Ubuntu Mirror Source Configuration${plain}\n"
-	echo -ne "You can use default Ubuntu cloud-images or provide a custom pcloud direct link.\n"
-	echo -ne "Leave empty to use default cloud-images mirror.\n"
-	echo -ne "Enter mirror URL (or press Enter for default): "
-	read -r custom_mirror
-
-	if [[ -n "$custom_mirror" ]]; then
-		tmpMirror="$custom_mirror"
-	fi
-
-	# Input DD image URL
-	echo -ne "\n${green}Enter DD Image URL${plain}\n"
-	echo -ne "Examples:\n"
-	echo -ne "  - https://cloud-images.ubuntu.com/jammy/current/jammy-server-cloudimg-amd64.img.xz\n"
-	echo -ne "  - pcloud direct link to Ubuntu image\n"
-	echo -ne "URL: "
-	read -r image_url
-
-	if [[ -z "$image_url" ]]; then
-		# Try to use default Ubuntu cloud-images
-		echo -ne "${yellow}Using default Ubuntu cloud-images...${plain}\n"
-		image_url="https://cloud-images.ubuntu.com/${DIST}/current/${DIST}-server-cloudimg-amd64.img.xz"
-	fi
-
-	verify_url_validation_of_dd_images "$image_url"
-	if [[ $? -ne 0 ]]; then
-		return 1
-	fi
-
-	echo -ne "\n${green}Configuration Summary:${plain}\n"
-	echo -ne "  System: ${yellow}Ubuntu ${ubuntuDigital}${plain}\n"
-	echo -ne "  Target Disk: ${yellow}${IncDisk}${plain}\n"
-	echo -ne "  Image URL: ${yellow}${DDURL}${plain}\n"
-	echo -ne "  Decompression: ${yellow}${DEC_CMD}${plain}\n"
-	echo -ne "  Root Password: ${yellow}${tmpWORD}${plain}\n\n"
-
-	echo -ne "${red}WARNING: This will overwrite all data on ${yellow}${IncDisk}${red}!${plain}\n"
-	echo -ne "Continue? (yes/no): "
-	read -r confirm
-
-	if [[ "$confirm" != "yes" ]]; then
-		echo -ne "[${yellow}Cancelled${plain}] Installation aborted.\n"
-		return 1
-	fi
-
-	generate_config
-
-	echo -ne "\n${green}✓ Ubuntu DD setup completed!${plain}\n"
-	echo -ne "${blue}Next steps:${plain}\n"
-	echo -ne "  1. Reboot the system\n"
-	echo -ne "  2. The system will start Alpine Linux\n"
-	echo -ne "  3. Ubuntu will be automatically installed via DD\n"
-	echo -ne "  4. After installation, the system will reboot into Ubuntu\n\n"
-
-	read -p "Press Enter to return to main menu..."
-	return 0
-}
-
-# ============================================================================
-# Main Program
+# Main
 # ============================================================================
 main() {
-	# Check dependencies
 	dependence
-
-	# Check system architecture
 	check_architecture
-
-	# Check if running on Chinese network
-	ping -c 1 -W 1 8.8.8.8 > /dev/null 2>&1 || IsCN='cn'
-
-	# Main loop
 	while true; do
-		show_main_menu
+		clear
+		echo -ne "\n${blue}==============================${plain}\n"
+		echo -ne "${blue}  DD Installer (Debian/Ubuntu)${plain}\n"
+		echo -ne "${blue}==============================${plain}\n"
+		echo -ne "  ${yellow}1${plain}) DD Debian (12/13)\n"
+		echo -ne "  ${yellow}2${plain}) DD Ubuntu (22.04/24.04)\n"
+		echo -ne "  ${yellow}3${plain}) Clear DD parameters\n"
+		echo -ne "  ${yellow}0${plain}) Exit\n"
+		echo -ne "${blue}==============================${plain}\n"
+		echo -ne "Choice: "
 		read -r choice
-
 		case $choice in
-			1)
-				setup_debian_dd
-				;;
-			2)
-				setup_ubuntu_dd
-				;;
-			3)
-				clear_dd_params
-				;;
-			0)
-				echo -ne "\n${blue}Exiting...${plain}\n\n"
-				exit 0
-				;;
-			*)
-				echo -ne "[${red}Error${plain}] Invalid choice! Please try again.\n"
-				sleep 2
-				;;
+		1) setup_debian_dd ;;
+		2) setup_ubuntu_dd ;;
+		3) clear_dd_params ;;
+		0) exit 0 ;;
+		*) sleep 1 ;;
 		esac
 	done
 }
 
-# Run main program
 main
