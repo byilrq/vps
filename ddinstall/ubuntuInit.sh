@@ -5,15 +5,16 @@
 exec >/dev/tty0 2>&1
 
 # Delete the initial script itself to prevent to be executed in the new system.
-rm -f /etc/local.d/ddlinuxConf.start /etc/local.d/ubuntuConf.start
+rm -f /etc/local.d/ubuntuConf.start
 rm -f /etc/runlevels/default/local
 
 # Install necessary components.
 apk update
 apk add coreutils grep sed
 
-# Get Debian/Ubuntu Linux configurations.
+# Get Ubuntu Linux configurations.
 confFile='/root/alpine.config'
+cloudInitFile='/mnt/etc/cloud/cloud.cfg.d/99-fake_cloud.cfg'
 
 # Read configs from initial file.
 IncDisk=$(grep "IncDisk" $confFile | awk '{print $2}')
@@ -123,51 +124,37 @@ else
 	}
 fi
 
-# Create NoCloud seed for cloud-init.
-mkdir -p /mnt/var/lib/cloud/seed/nocloud
+# Download cloud init file.
+wget --no-check-certificate -qO $cloudInitFile ''$cloudInitUrl''
 
-# meta-data：cloud-init 需要识别的元数据
-cat > /mnt/var/lib/cloud/seed/nocloud/meta-data << EOF
-instance-id: i-ddinstall-${HostName}
-local-ipv4: ${IPv4}
-local-hostname: ${HostName}
-hostname: ${HostName}
-EOF
-
-# user-data：云初始化脚本
-cat > /mnt/var/lib/cloud/seed/nocloud/user-data << 'EOFUSERDATA'
-#!/bin/bash
-set -e
-
-# 设置密码（直接在这里设置，不依赖 yaml 解析）
-echo 'root:tmpWORD' | chpasswd
-
-# 设置主机名
-hostnamectl set-hostname 'HostName' 2>/dev/null || hostname 'HostName'
-sed -i "s/^127.0.1.1.*/127.0.1.1\tHostName/" /etc/hosts
-grep -q '^127.0.1.1' /etc/hosts || echo -e "127.0.1.1\tHostName" >> /etc/hosts
-
-# SSH 配置
-sed -ri 's/^#?PermitRootLogin.*/PermitRootLogin yes/g' /etc/ssh/sshd_config
-sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/g' /etc/ssh/sshd_config
-sed -ri 's/^#?Port.*/Port sshPORT/g' /etc/ssh/sshd_config
-
-# 重启 SSH
-systemctl restart ssh 2>/dev/null || systemctl restart sshd 2>/dev/null || true
-
-# 安装基础工具
-apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y curl wget dnsutils fail2ban 2>&1 | tail -5 || true
-
-# 启用 fail2ban
-systemctl enable fail2ban 2>/dev/null || true
-systemctl restart fail2ban 2>/dev/null || true
-EOFUSERDATA
-
-# 替换占位符
-sed -i "s|tmpWORD|${tmpWORD}|g" /mnt/var/lib/cloud/seed/nocloud/user-data
-sed -i "s|sshPORT|${sshPORT}|g" /mnt/var/lib/cloud/seed/nocloud/user-data
-sed -i "s|HostName|${HostName}|g" /mnt/var/lib/cloud/seed/nocloud/user-data
+# User config.
+sed -ri 's/sshPORT/'${sshPORT}'/g' $cloudInitFile
+sed -ri 's/HostName/'${HostName}'/g' $cloudInitFile
+sed -ri 's/tmpWORD/'${tmpWORD}'/g' $cloudInitFile
+sed -ri 's/TimeZone/'${TimeZone1}'\/'${TimeZone2}'/g' $cloudInitFile
+sed -ri 's/targetLinuxMirror/'${targetLinuxMirror}'/g' $cloudInitFile
+sed -ri 's/targetLinuxSecurityMirror/'${targetLinuxSecurityMirror}'/g' $cloudInitFile
+sed -ri 's/networkAdapter/'${networkAdapter}'/g' $cloudInitFile
+if [[ "$iAddrNum" -ge "2" ]]; then
+	sed -ri 's#IPv4/ipPrefix#'${writeIpsCmd}'#g' $cloudInitFile
+else
+	sed -ri 's/IPv4/'${IPv4}'/g' $cloudInitFile
+	sed -ri 's/ipPrefix/'${ipPrefix}'/g' $cloudInitFile
+	sed -ri "s/${IPv4}\/${ipPrefix}/${IPv4}\/${actualIp4Prefix}/g" $cloudInitFile
+fi
+sed -ri 's/GATE/'${GATE}'/g' $cloudInitFile
+sed -ri 's/ipDNS1/'${ipDNS1}'/g' $cloudInitFile
+sed -ri 's/ipDNS2/'${ipDNS2}'/g' $cloudInitFile
+if [[ "$i6AddrNum" -ge "2" ]]; then
+	sed -ri 's#ip6Addr/ip6Mask#'${writeIp6sCmd}'#g' $cloudInitFile
+else
+	sed -ri 's/ip6Addr/'${ip6Addr}'/g' $cloudInitFile
+	sed -ri 's/ip6Mask/'${ip6Mask}'/g' $cloudInitFile
+	sed -ri "s/${ip6Addr}\/${ip6Mask}/${ip6Addr}\/${actualIp6Prefix}/g" $cloudInitFile
+fi
+sed -ri 's/ip6Gate/'${ip6Gate}'/g' $cloudInitFile
+sed -ri 's/ip6DNS1/'${ip6DNS1}'/g' $cloudInitFile
+sed -ri 's/ip6DNS2/'${ip6DNS2}'/g' $cloudInitFile
 
 # Disable any datahouse.
 # Reference: https://github.com/canonical/cloud-init/issues/3772
@@ -190,8 +177,10 @@ sed -ri 's/^Accept=.*/Accept=yes/g' /mnt/lib/systemd/system/ssh.socket
 
 # Disable installing fail2ban.
 [[ "$setFail2banStatus" != "1" ]] && {
-	sed -ri 's/dnsutils fail2ban/dnsutils/g' /mnt/var/lib/cloud/seed/nocloud/user-data
-	sed -i '/fail2ban/d' /mnt/var/lib/cloud/seed/nocloud/user-data
+	sed -ri 's/dnsutils fail2ban/dnsutils/g' $cloudInitFile
+	sed -i '/\/etc\/fail2ban/d' $cloudInitFile
+	sed -i '/fail2ban enable/d' $cloudInitFile
+	sed -i '/fail2ban restart/d' $cloudInitFile
 }
 
 # Hack cloud init, this method is effective for versions from 22.1.9 to 23.2.2 .

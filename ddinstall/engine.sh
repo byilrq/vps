@@ -316,6 +316,11 @@ while [[ $# -ge 1 ]]; do
 		shift
 		useCloudImage="1"
 		;;
+	--initurl)
+		shift
+		customInitUrl="$1"
+		shift
+		;;
 	-filetype)
 		shift
 		setFileType="$1"
@@ -3980,12 +3985,14 @@ elif [[ "$linux_relese" == 'alpinelinux' ]]; then
 		AlpineInitLineNum=$(grep -E -n '^exec (/bin/busybox )?switch_root' /tmp/boot/init | cut -d: -f1)
 		AlpineInitLineNum=$((AlpineInitLineNum - 1))
 		if [[ "$IsCN" == "cn" ]]; then
-			alpineInstallOrDdAdditionalFiles "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/alpineInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/network/resolv_cn.conf" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/motd.sh" "mirrors.ustc.edu.cn" "mirrors.tuna.tsinghua.edu.cn" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Ubuntu/ubuntuInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Windows/windowsInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Windows/SetupComplete.bat" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/RedHat/RHELinit.sh" "mirrors.ustc.edu.cn"
+			alpineInstallOrDdAdditionalFiles "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/alpineInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/network/resolv_cn.conf" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/motd.sh" "mirrors.ustc.edu.cn" "mirrors.tuna.tsinghua.edu.cn" "https://raw.githubusercontent.com/byilrq/vps/main/ddinstall/ubuntuInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Windows/windowsInit.sh" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Windows/SetupComplete.bat" "https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/RedHat/RHELinit.sh" "mirrors.ustc.edu.cn"
 		else
-			alpineInstallOrDdAdditionalFiles "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/alpineInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/network/resolv.conf" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/motd.sh" "archive.ubuntu.com" "ports.ubuntu.com" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Ubuntu/ubuntuInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Windows/windowsInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Windows/SetupComplete.bat" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/RedHat/RHELinit.sh" "security.ubuntu.com"
+			alpineInstallOrDdAdditionalFiles "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/alpineInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/network/resolv.conf" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/motd.sh" "archive.ubuntu.com" "ports.ubuntu.com" "https://raw.githubusercontent.com/byilrq/vps/main/ddinstall/ubuntuInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Windows/windowsInit.sh" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Windows/SetupComplete.bat" "https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/RedHat/RHELinit.sh" "security.ubuntu.com"
 			# Reserved alternative mirror comes from gitlab.com of initial files for engineering, if you are not fascinated with debugging, don't uncomment with them!
 			# alpineInstallOrDdAdditionalFiles "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Alpine/alpineInit.sh" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Alpine/network/resolv.conf" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Alpine/motd.sh" "archive.ubuntu.com" "ports.ubuntu.com" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Ubuntu/ubuntuInit.sh" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Windows/windowsInit.sh" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/Windows/SetupComplete.bat" "https://gitlab.com/leitbogioro/Tools/-/raw/main/Linux_reinstall/RedHat/RHELinit.sh" "security.ubuntu.com"
 		fi
+		# Use a custom initial script (e.g. ddlinux.sh which writes a NoCloud seed compatible with Debian cloud images) instead of the default one.
+		[[ -n "$customInitUrl" ]] && AlpineInitFile="$customInitUrl"
 		# Cloud init configurate documents and resources:
 		# Ubuntu cloud images:
 		# https://cloud-images.ubuntu.com/daily/server/
@@ -4006,8 +4013,8 @@ elif [[ "$linux_relese" == 'alpinelinux' ]]; then
 		alpineNetcfgMirrorCn="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Alpine/network/"
 		alpineNetcfgMirror="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Alpine/network/"
 		[[ "$targetRelese" == 'Ubuntu' ]] && {
-			ubuntuCloudinitMirrorCn="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/Ubuntu/CloudInit/"
-			ubuntuCloudinitMirror="https://raw.githubusercontent.com/leitbogioro/Tools/master/Linux_reinstall/Ubuntu/CloudInit/"
+			ubuntuCloudinitMirrorCn="https://raw.githubusercontent.com/byilrq/vps/main/ddinstall/CloudInit/"
+			ubuntuCloudinitMirror="https://raw.githubusercontent.com/byilrq/vps/main/ddinstall/CloudInit/"
 		}
 		[[ "$targetRelese" == 'AlmaLinux' || "$targetRelese" == 'Rocky' ]] && {
 			rhelCloudinitMirrorCn="https://gitee.com/mb9e8j2/Tools/raw/master/Linux_reinstall/RedHat/CloudInit/"

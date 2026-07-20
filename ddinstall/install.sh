@@ -20,6 +20,7 @@ plain='\033[0m'
 
 sshPORT='2222'
 tmpWORD=''
+HOSTNAME_SET=''
 ARCH='amd64'
 
 [[ $EUID -ne 0 ]] && echo -ne "\n[${red}错误${plain}] 请以 root 身份运行本脚本！\n\n" && exit 1
@@ -66,14 +67,14 @@ download_engine() {
 # 固定密码
 # ============================================================================
 gen_password() {
-	echo '12345678'
+	echo '123456'
 }
 
 # ============================================================================
 # 设置 root 密码与 SSH 端口
 # ============================================================================
 set_password_port() {
-	tmpWORD='12345678'
+	tmpWORD='123456'
 	echo -ne "\n${green}root 密码已固定: ${yellow}${tmpWORD}${plain}\n"
 
 	echo -ne "${green}SSH 端口设置：${plain}\n"
@@ -87,6 +88,24 @@ set_password_port() {
 			echo -ne "[${red}错误${plain}] 端口无效，已改用默认 2222\n"
 		fi
 	fi
+}
+
+# ============================================================================
+# 设置主机名（回车使用默认 debian，通过引擎 -hostname 传入新系统）
+# ============================================================================
+set_hostname() {
+	echo -ne "${green}主机名设置：${plain}\n"
+	echo -ne "直接回车使用默认主机名 ${yellow}debian${plain}，或输入自定义主机名: "
+	read -e -r input_hostname
+	HOSTNAME_SET='debian'
+	if [[ -n "$input_hostname" ]]; then
+		if [[ "$input_hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]]; then
+			HOSTNAME_SET="$input_hostname"
+		else
+			echo -ne "[${red}错误${plain}] 主机名无效（仅限字母数字与中划线），已改用默认 debian\n"
+		fi
+	fi
+	echo -ne "${green}✓ 主机名: ${yellow}${HOSTNAME_SET}${plain}\n"
 }
 # ============================================================================
 # 选择目标磁盘（多盘时让用户选）
@@ -214,10 +233,16 @@ run_engine() {
 	local args=()
 	if [[ "$os" == "Debian" ]]; then
 		args=(-debian "$ver" -port "$sshPORT" -pwd "$tmpWORD" -setdisk "$DISK")
+	elif [[ "$os" == "DebianDD" ]]; then
+		# 云盘直链 DD：走引擎 Alpine DD 分支（-ubuntu 24.04 仅用于进入该分支），
+		# 实际写盘镜像由 -dd 指定，初始化脚本改用本仓库 ddlinux.sh（NoCloud 注入
+		# 密码/端口/主机名，兼容 Debian 云镜像）。
+		args=(-ubuntu "24.04" -port "$sshPORT" -pwd "$tmpWORD" -setdisk "$DISK" -dd "$img" --initurl "$repoURL/ddlinux.sh")
 	else
 		args=(-ubuntu "$ver" -port "$sshPORT" -pwd "$tmpWORD" -setdisk "$DISK")
 		[[ -n "$img" ]] && args+=(-dd "$img")
 	fi
+	args+=(-hostname "$HOSTNAME_SET")
 	# 网络参数（DHCP 或静态）
 	[[ -n "$NET_ARGS" ]] && args+=($NET_ARGS)
 
@@ -236,15 +261,28 @@ setup_dd() {
 	get_disk || return 1
 	check_network || return 1
 	set_password_port
-	# Debian 走 preseed 网络安装，无需选择 DD 镜像
+	set_hostname
+	# Debian 走 preseed 网络安装，无需选择 DD 镜像；DebianDD 手动输入云盘直链
 	if [[ "$os" == "Debian" ]]; then
 		IMG_URL=''
+	elif [[ "$os" == "DebianDD" ]]; then
+		echo -ne "\n${yellow}注意: 云盘直链必须是可直接 DD 写盘的 raw / raw.xz / raw.gz 镜像文件！${plain}\n"
+		echo -ne "${yellow}qcow2、img(qcow2)、iso 等格式不能直接 DD。${plain}\n"
+		echo -ne "${green}请输入 DD 镜像直链 (pCloud 等):${plain}\n链接: "
+		read -e -r image_url
+		[[ -z "$image_url" ]] && echo -ne "[${red}错误${plain}] 链接不能为空！\n" && return 1
+		verify_dd_url "$image_url" || return 1
+		IMG_URL="$image_url"
 	else
 		select_image_source "$os" "$dist" "$ver" || return 1
 	fi
 
 	echo -ne "\n${green}配置确认:${plain}\n"
-	echo -ne "  系统:     ${yellow}${os} ${ver}${plain}\n"
+	if [[ "$os" == "DebianDD" ]]; then
+		echo -ne "  系统:     ${yellow}自定义镜像 (云盘直链 DD)${plain}\n"
+	else
+		echo -ne "  系统:     ${yellow}${os} ${ver}${plain}\n"
+	fi
 	echo -ne "  磁盘:     ${yellow}${DISK}${plain}\n"
 	if [[ "$os" == "Debian" ]]; then
 		echo -ne "  方式:     ${yellow}官方 netboot + preseed 无人值守安装${plain}\n"
@@ -252,6 +290,7 @@ setup_dd() {
 		echo -ne "  镜像:     ${yellow}${IMG_URL:-引擎默认源}${plain}\n"
 	fi
 	echo -ne "  网络:     ${yellow}${NET_ARGS:---network dhcp}${plain}\n"
+	echo -ne "  主机名:   ${yellow}${HOSTNAME_SET}${plain}\n"
 	echo -ne "  SSH 端口: ${yellow}${sshPORT}${plain}\n"
 	echo -ne "  root 密码: ${yellow}${tmpWORD}${plain}\n\n"
 	echo -ne "${red}警告: ${yellow}${DISK}${red} 上的所有数据将被销毁！${plain}\n"
@@ -269,11 +308,12 @@ setup_dd() {
 }
 
 setup_debian_dd() {
-	echo -ne "\n${green}请选择 Debian 版本:${plain}\n  ${yellow}1${plain}) Debian 12 (bookworm)\n  ${yellow}2${plain}) Debian 13 (trixie)\n请输入 (1-2): "
+	echo -ne "\n${green}请选择 Debian 安装方式:${plain}\n  ${yellow}1${plain}) Debian 12 (bookworm) - 官方 netboot 安装\n  ${yellow}2${plain}) Debian 13 (trixie) - 官方 netboot 安装\n  ${yellow}3${plain}) 云盘直链 DD (pCloud 等，自选镜像源和版本)\n请输入 (1-3): "
 	read -e -r c
 	case $c in
 	1) download_engine && setup_dd "Debian" "bookworm" "12" ;;
 	2) download_engine && setup_dd "Debian" "trixie" "13" ;;
+	3) download_engine && setup_dd "DebianDD" "" "" ;;
 	*) echo -ne "[${red}错误${plain}] 选择无效！\n" && return 1 ;;
 	esac
 }
