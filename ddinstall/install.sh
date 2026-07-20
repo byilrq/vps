@@ -128,34 +128,12 @@ get_disk() {
 }
 
 # ============================================================================
-# 网络方式：DHCP 或保留当前静态 IP
+# 网络方式：固定 DHCP（避免静态 IP 格式问题）
 # ============================================================================
 NET_ARGS=''
 check_network() {
-	local adapter gate ipv4 prefix mask
-	adapter=$(ip route show default 2>/dev/null | awk '/default/ {print $5; exit}')
-	gate=$(ip route show default 2>/dev/null | awk '/default/ {print $3; exit}')
-	ipv4=$(ip -4 addr show "$adapter" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d'/' -f1)
-	prefix=$(ip -4 addr show "$adapter" 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d'/' -f2)
-	if [[ -n "$prefix" ]]; then
-		local m=$((0xffffffff << (32 - prefix) & 0xffffffff))
-		mask="$((m >> 24 & 255)).$((m >> 16 & 255)).$((m >> 8 & 255)).$((m & 255))"
-	fi
-	echo -ne "${green}当前网络: ${yellow}${adapter} ${ipv4}/${mask} 网关 ${gate}${plain}\n"
-	echo -ne "新系统是否使用 DHCP 自动获取 IP？(回车=y / 输入 n=保留当前静态 IP): "
-	read -e -r net_choice
-	if [[ "$net_choice" == "n" || "$net_choice" == "no" ]]; then
-		[[ -z "$ipv4" || -z "$mask" || -z "$gate" ]] && {
-			echo -ne "[${yellow}警告${plain}] 未能识别当前静态 IP，已回退为 DHCP。\n"
-			NET_ARGS=''
-			return 0
-		}
-		NET_ARGS="--network static --ip-addr $ipv4 --ip-mask $mask --ip-gate $gate"
-		echo -ne "${green}✓ 保留静态 IP: ${yellow}${ipv4}/${mask} 网关 ${gate}${plain}\n"
-	else
-		NET_ARGS="--network dhcp"
-		echo -ne "${green}✓ 使用 DHCP${plain}\n"
-	fi
+	NET_ARGS="--network dhcp"
+	echo -ne "${green}✓ 使用 DHCP${plain}\n"
 	return 0
 }
 
