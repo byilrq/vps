@@ -1479,6 +1479,9 @@ ssh_settings() {
       1) ssh_port 2222 ;;
       2) auth_key root ;;
       0) return 0 ;;
+      *) return 0 ;;
+    esac
+}
 
 # ============================================
 # 函数：修改 Debian 系统主机名
