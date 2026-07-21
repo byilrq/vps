@@ -1473,7 +1473,7 @@ ssh_settings() {
     case "$ssh_choice" in
       1) ssh_port 2222 ;;
       2) auth_key root ;;
-      0) return 0 ;;#!/bin/bash
+      0) return 0 ;;
 
 # ============================================
 # 函数：修改 Debian 系统主机名
