@@ -1431,9 +1431,6 @@ ${http2_extra_line}
     ssl_certificate ${CERT_FULLCHAIN};
     ssl_certificate_key ${CERT_PRIVKEY};
 
-    error_page 400 401 402 403 500 501 502 503 504 =404 /404;
-    proxy_intercept_errors on;
-
     include /etc/nginx/snippets/includes.conf;
 }
 EOF
@@ -1445,11 +1442,21 @@ EOF
             exit 1
         }
 
+        # 注意：如果此 VPS 上同时安装了 ISM（或其他占用 127.0.0.1:8080 的服务），
+        # 则不要启用 x.sh 的 domain.conf，避免 nginx 冲突。
+        # ISM 的伪装站已在 127.0.0.1:8080，xray 会 fallback 到该地址。
+
         # 只移除以 domain 命名的 x-ui 站点配置，不碰其他站点
         rm -f "/etc/nginx/sites-enabled/${domain}" 2>/dev/null || true
+        # 不启用 domain.conf，让 ISM nginx 独占 8080
+        # ln -sf "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
+
         rm -f /etc/nginx/sites-enabled/80.conf 2>/dev/null || true
-        ln -sf "/etc/nginx/sites-available/${domain}" "/etc/nginx/sites-enabled/${domain}"
         ln -sf "/etc/nginx/sites-available/80.conf" "/etc/nginx/sites-enabled/80.conf"
+
+        msg_inf "已跳过启用 ${domain} 配置（ISM nginx 已占用 8080）"
+        msg_inf "ISM nginx 监听 127.0.0.1:8080（伪装站）"
+        msg_inf "xray fallback 指向 127.0.0.1:8080（ISM nginx）"
     }
 
     test_and_reload_nginx() {
