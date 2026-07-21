@@ -1473,7 +1473,85 @@ ssh_settings() {
     case "$ssh_choice" in
       1) ssh_port 2222 ;;
       2) auth_key root ;;
-      0) return 0 ;;
+      0) return 0 ;;#!/bin/bash
+
+# ============================================
+# 函数：修改 Debian 系统主机名
+# 用法：change_hostname <新主机名>
+# 示例：change_hostname minibox
+# ============================================
+change_hostname() {
+    local new_hostname="$1"
+    
+    # 参数检查
+    if [[ -z "$new_hostname" ]]; then
+        echo "❌ 错误：请提供新的主机名"
+        echo "用法：change_hostname <新主机名>"
+        return 1
+    fi
+    
+    # 检查是否包含非法字符（只允许 a-z, 0-9, -）
+    if [[ ! "$new_hostname" =~ ^[a-zA-Z0-9-]+$ ]]; then
+        echo "❌ 错误：主机名只能包含字母、数字和连字符 (-)"
+        return 1
+    fi
+    
+    # 获取当前主机名
+    local current_hostname=$(hostname)
+    
+    # 如果新主机名和当前一样，无需操作
+    if [[ "$new_hostname" == "$current_hostname" ]]; then
+        echo "ℹ️  主机名已经是 '$new_hostname'，无需修改"
+        return 0
+    fi
+    
+    echo "📝 正在修改主机名：$current_hostname → $new_hostname"
+    
+    # 1. 使用 hostnamectl 修改静态主机名
+    sudo hostnamectl set-hostname "$new_hostname"
+    if [[ $? -ne 0 ]]; then
+        echo "❌ 修改静态主机名失败"
+        return 1
+    fi
+    
+    # 2. 立即更新内核主机名（让当前会话生效）
+    sudo hostname "$new_hostname"
+    
+    # 3. 更新 /etc/hosts 文件
+    if [[ -f /etc/hosts ]]; then
+        # 备份原文件
+        sudo cp /etc/hosts /etc/hosts.bak.$(date +%Y%m%d_%H%M%S)
+        
+        # 替换 hosts 文件中的旧主机名
+        sudo sed -i "s/127\.0\.1\.1\s*${current_hostname}/127.0.1.1 ${new_hostname}/g" /etc/hosts
+        sudo sed -i "s/::1\s*${current_hostname}/::1 ${new_hostname}/g" /etc/hosts
+        
+        echo "✅ /etc/hosts 已更新"
+    fi
+    
+    # 4. 重启 systemd-hostnamed 服务（确保所有服务识别新主机名）
+    sudo systemctl restart systemd-hostnamed 2>/dev/null
+    
+    echo "✅ 主机名修改完成！"
+    echo "📌 当前主机名：$(hostname)"
+    echo "💡 提示：如果提示符未更新，请重新登录或执行 'exec bash'"
+    
+    return 0
+}
+
+# ============================================
+# 函数：获取当前主机名信息（辅助函数）
+# ============================================
+show_hostname_info() {
+    echo "=========================================="
+    echo "📊 主机名信息"
+    echo "=========================================="
+    echo "内核主机名   : $(hostname)"
+    echo "静态主机名   : $(hostnamectl --static 2>/dev/null || echo 'N/A')"
+    echo "易读主机名   : $(hostnamectl --pretty 2>/dev/null || echo 'N/A')"
+    echo "临时主机名   : $(hostnamectl --transient 2>/dev/null || echo 'N/A')"
+    echo "=========================================="
+}
       *) yellow "无效选项"; sleep 1 ;;
     esac
   done
@@ -1499,10 +1577,11 @@ menu_sys_conf() {
     echo -e " ${GREEN}7.${tianlan} 设置系统清理"
     echo -e " ${GREEN}8.${tianlan} 设置IP优先级"
     echo -e " ${GREEN}9.${tianlan} 设置定时重启"
+    echo -e " ${GREEN}10.${tianlan} 修改主机名"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-9]: " choice
+    read -rp "请选择 [0-10]: " choice
     case "$choice" in
       1) bbr ;;
       2) firewall ;;
@@ -1513,6 +1592,7 @@ menu_sys_conf() {
       7) sys_cle ;;
       8) set_ip_priority ;;
       9) cron_reboot ;;
+      10) change_hostname ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
