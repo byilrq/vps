@@ -299,6 +299,17 @@ verify_installed_version() {
         return 1
     fi
 
+    # 同步版本号到 x-ui 数据库，防止面板检测到版本不一致覆盖二进制文件
+    local xuidb="/etc/x-ui/x-ui.db"
+    if [[ -f "$xuidb" ]] && command -v sqlite3 >/dev/null 2>&1; then
+        local db_ver
+        db_ver=$(sqlite3 "$xuidb" "SELECT value FROM settings WHERE key='xrayVersion';" 2>/dev/null || true)
+        if [[ -n "$db_ver" ]]; then
+            sqlite3 "$xuidb" "UPDATE settings SET value='v${expected}' WHERE key='xrayVersion';" 2>/dev/null && \
+                msg_inf "已同步 xrayVersion 到数据库: v${expected}"
+        fi
+    fi
+
     return 0
 }
 

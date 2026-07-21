@@ -75,7 +75,8 @@ read_tty() {
     local prompt="$1"
     local __var_name="$2"
     local __tmp=""
-    read -rp "$prompt" __tmp
+    # -e 启用 readline 支持（正确处理 backspace/delete）
+    read -e -rp "$prompt" __tmp
     printf -v "$__var_name" '%s' "$__tmp"
 }
 
