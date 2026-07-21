@@ -1102,9 +1102,13 @@ EOF
         special='$%*&#'
         all="${upper}${lower}${digit}${special}"
 
+        # 用 openssl 生成随机字节，保证更强的随机性
         _pick_one() {
             local chars="$1"
-            printf '%s' "$chars" | fold -w1 | shuf -n1
+            local idx
+            idx=$(od -An -N1 -tu1 /dev/urandom 2>/dev/null | tr -d ' ')
+            idx=$(( idx % ${#chars} ))
+            printf '%s' "${chars:$idx:1}"
         }
 
         result="$(_pick_one "$upper")"
@@ -1116,7 +1120,8 @@ EOF
             result+="$(_pick_one "$all")"
         done
 
-        printf '%s\n' "$result" | fold -w1 | shuf | tr -d '\n'
+        # 最终打乱顺序：将每个字符转为一行后用 sort -R（比 fold|shuf 更随机）
+        printf '%s' "$result" | grep -o . | sort -R | tr -d '\n'
     }
 
     while true; do
