@@ -3173,6 +3173,9 @@ sed -ri 's/^#?PasswordAuthentication.*/PasswordAuthentication yes/g' /target/etc
 echo '@reboot root cat /etc/run.sh 2>/dev/null |base64 -d >/tmp/run.sh; rm -rf /etc/run.sh; sed -i /^@reboot/d /etc/crontab; bash /tmp/run.sh' >>/target/etc/crontab; \
 echo '' >>/target/etc/crontab; \
 echo '${setCMD}' >/target/etc/run.sh; \
+echo '${HostName}' >/target/etc/hostname; \
+sed -ri 's/^127.0.1.1.*/127.0.1.1\t${HostName}/g' /target/etc/hosts; \
+grep -q '^127.0.1.1' /target/etc/hosts || echo '127.0.1.1\t${HostName}' >>/target/etc/hosts; \
 ${DebianModifiedProcession}
 EOF
 	fi
