@@ -117,7 +117,9 @@ cleanup_services() {
     pkill -f 'xray-linux' 2>/dev/null || true
     pkill -x xray 2>/dev/null || true
 
-    # 不停止 nginx/apache2/caddy — 避免影响已有业务
+    # 安装过程中会重新配置 nginx 并重启，先停掉释放旧配置占用的端口
+    systemctl stop nginx 2>/dev/null || true
+    pkill -f nginx 2>/dev/null || true
     sleep 2
 }
 
@@ -218,6 +220,9 @@ UNINSTALL_XUI() {
     rm -f "/etc/nginx/sites-enabled/${domain}" 2>/dev/null || true
     rm -f /etc/nginx/sites-available/80.conf /etc/nginx/sites-enabled/80.conf 2>/dev/null || true
 
+    # 重载 nginx 释放端口（即使 -t 因无存活站点而告警，也要强制 reload/restart）
+    systemctl reload nginx 2>/dev/null || systemctl restart nginx 2>/dev/null || true
+
     msg_ok "已卸载 x-ui / xray，已保留 nginx 与证书。"
 }
 
@@ -272,7 +277,7 @@ prepare_domain_vars() {
         echo "----------------------------------------------------------------"
         echo "单域名配置（请输入可解析到本机的域名）"
         echo "格式示例：domain.tld"
-        read -rp "请输入域名（domain.tld）: " domain
+        read_tty "请输入域名（domain.tld）: " domain
     done
 
     domain=$(echo "$domain" | tr -d '[:space:]')
@@ -828,49 +833,9 @@ install_panel() {
             exit 1
         fi
     else
-        # 交互模式：获取最新版本，让用户选择
-        echo "正在获取 3x-ui 最新版本信息..."
-        tag_version_latest=$(curl -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$tag_version_latest" ]]; then
-            echo "尝试使用 IPv4 获取版本信息..."
-            tag_version_latest=$(curl -4 -Ls "https://api.github.com/repos/MHSanaei/3x-ui/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-            if [[ ! -n "$tag_version_latest" ]]; then
-                echo "获取 x-ui 版本失败，可能受到 GitHub API 限制。将使用默认版本 v2.8.11 进行安装。"
-                tag_version_latest="v2.8.11"
-            fi
-        fi
-
-        echo "--------------------------------------------------------------"
-        echo "当前 3x-ui 最新版本为: ${tag_version_latest}"
-        echo "默认安装版本: v2.8.11"
-        echo "提示: 直接回车将安装 v2.8.11，输入 latest 则安装最新版 ${tag_version_latest}"
-        echo "或者输入其他具体版本号（例如 v2.8.11 或 2.8.11）进行安装"
-        read -rp "请选择: " version_input
-
-        # 处理用户输入
-        if [[ -z "$version_input" ]]; then
-            tag_version="v2.8.11"
-            echo "将安装默认版本: ${tag_version}"
-        elif [[ "$version_input" == "latest" ]]; then
-            tag_version="${tag_version_latest}"
-            echo "将安装最新版本: ${tag_version}"
-        else
-            # 确保版本号以 v 开头
-            if [[ "$version_input" =~ ^v[0-9] ]]; then
-                tag_version="$version_input"
-            else
-                tag_version="v${version_input}"
-            fi
-            echo "将安装指定版本: ${tag_version}"
-        fi
-
-        # 版本号有效性检查（最低版本要求）
-        tag_version_numeric=${tag_version#v}
-        min_version="2.3.5"
-        if [[ "$(printf '%s\n' "$min_version" "$tag_version_numeric" | sort -V | head -n1)" != "$min_version" ]]; then
-            echo "错误: 版本 ${tag_version} 低于最低要求 v2.3.5，安装终止。"
-            exit 1
-        fi
+        # 固定安装 v2.9.4 版本，不提示用户选择
+        tag_version="v2.9.4"
+        echo "将安装固定版本: ${tag_version}"
 
         url="https://github.com/MHSanaei/3x-ui/releases/download/${tag_version}/x-ui-linux-$(arch).tar.gz"
         echo "开始下载 x-ui ${tag_version} ..."
@@ -1657,12 +1622,11 @@ setup_cronjob() {
     echo "----------------------------------------------------------------"
     echo "配置计划任务"
     echo "----------------------------------------------------------------"
-    echo "即将写入以下4个 crontab："
+    echo "即将写入以下3个 crontab："
     echo "1. 开机启动 sub2sing-box"
     echo "2. 每日重启 x-ui 并重载 nginx"
     echo "3. 每月自动续签证书"
-    echo "4. 每月自动更新 Xray-core"
-    read -rp "确认是否写入4个计划任务？(Y/n): " confirm_cron
+    read -rp "确认是否写入3个计划任务？(Y/n): " confirm_cron
     if [[ "$confirm_cron" =~ ^[Nn]$ ]]; then
         msg_err "已跳过计划任务配置。"
     else
@@ -1672,8 +1636,6 @@ setup_cronjob() {
             echo '@daily x-ui restart > /dev/null 2>&1 && nginx -s reload > /dev/null 2>&1'
             echo '@monthly certbot renew --webroot -w /var/www/acme --non-interactive --post-hook "nginx -s reload" > /dev/null 2>&1'
         } | crontab -
-
-        setup_xray_update_cron "n" || msg_err "Xray 自动更新任务写入失败，请稍后从菜单 3 重试。"
     fi
 }
 
@@ -2793,8 +2755,6 @@ install_xui_pro() {
     install_sub2sing_box
     install_fake_site
     setup_cronjob
-    # 安装时静默写入 Xray 自动更新 cron，不依赖用户弹框确认
-    setup_xray_update_cron "n" 2>/dev/null || true
     show_final_details
     pause
 }
@@ -2818,20 +2778,19 @@ menu() {
         echo -e " ${blue}${bold}1)${none} ${blue}安装${none}"
         echo -e " ${red}${bold}2)${none} ${red}卸载${none}"
         echo -e "${gray}--------------------------------------------------${none}"
-        echo -e " ${yellow}${bold}3)${none} ${yellow}更新 Xray-core${none}"
-        echo -e " ${yellow}${bold}4)${none} ${yellow}查看状态${none}"
-        echo -e " ${yellow}${bold}5)${none} ${yellow}打印节点信息${none}"
-        echo -e " ${yellow}${bold}6)${none} ${yellow}目标网站检测${none}"
-        echo -e " ${yellow}${bold}7)${none} ${yellow}系统参数配置${none}"
-        echo -e " ${yellow}${bold}8)${none} ${yellow}回程路由测试${none}"
-        echo -e " ${yellow}${bold}9)${none} ${yellow}IP质量检测${none}"
-        echo -e " ${yellow}${bold}10)${none} ${yellow}系统查询${none}"
-		echo -e " ${green}${bold}11)${none} ${green}更新域名/SNI${none}"   # 新增行
+        echo -e " ${yellow}${bold}3)${none} ${yellow}查看状态${none}"
+        echo -e " ${yellow}${bold}4)${none} ${yellow}打印节点信息${none}"
+        echo -e " ${yellow}${bold}5)${none} ${yellow}目标网站检测${none}"
+        echo -e " ${yellow}${bold}6)${none} ${yellow}系统参数配置${none}"
+        echo -e " ${yellow}${bold}7)${none} ${yellow}回程路由测试${none}"
+        echo -e " ${yellow}${bold}8)${none} ${yellow}IP质量检测${none}"
+        echo -e " ${yellow}${bold}9)${none} ${yellow}系统查询${none}"
+		echo -e " ${green}${bold}10)${none} ${green}更新域名/SNI${none}"
         echo -e " ${red}${bold}0)${none} 退出"
 
         echo -e "${gray}--------------------------------------------------${none}"
         echo -e "${dim}${gray}提示：输入数字后回车${none}"
-        echo -ne "${green}${bold}请选择 [0-11]${none}${green}: ${none}"
+        echo -ne "${green}${bold}请选择 [0-10]${none}${green}: ${none}"
 
         local choice=""
 
@@ -2840,15 +2799,14 @@ menu() {
         case "${choice}" in
             1) INSTALL="y"; UNINSTALL="n"; install_xui_pro ;;
             2) uninstall_xui_menu ;;
-            3) xray_updata ;;
-            4) view_status ;;
-            5) print_node_info ;;
-            6) detect_target_site ;;
-            7) run_sys_conf ;;
-            8) besttrace_test ;;
-            9) ip_quality_check ;;
-            10) system_query ;;
-            11) update_domain_sni ;;
+            3) view_status ;;
+            4) print_node_info ;;
+            5) detect_target_site ;;
+            6) run_sys_conf ;;
+            7) besttrace_test ;;
+            8) ip_quality_check ;;
+            9) system_query ;;
+            10) update_domain_sni ;;
             0) exit 0 ;;
             *) msg_err "无效输入，请重新选择。"; pause ;;
         esac
