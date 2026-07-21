@@ -1561,10 +1561,6 @@ show_hostname_info() {
     echo "临时主机名   : $(hostnamectl --transient 2>/dev/null || echo 'N/A')"
     echo "=========================================="
 }
-      *) yellow "无效选项"; sleep 1 ;;
-    esac
-  done
-}
 
 # -----------------------------
 # Menu
