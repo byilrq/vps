@@ -24,7 +24,7 @@ ISM_STATE_FILE="/root/.asset_manager_install.conf"
 SERVICE_NAME="ntfy"
 CONTAINER_NAME="ntfy"
 INTERNAL_PORT="8083"
-PUBLIC_PORT="2085"
+PUBLIC_PORT="8183"
 DOMAIN=""
 NTFY_BASE_URL=""
 NTFY_ENABLE_AUTH="true"
@@ -307,6 +307,13 @@ refresh_base_url() {
     fi
 }
 
+cleanup_old_nginx_configs() {
+    info "清理旧的 ntfy Nginx 配置..."
+    rm -f /etc/nginx/sites-available/ntfy_*.conf 2>/dev/null || true
+    rm -f /etc/nginx/sites-enabled/ntfy_*.conf 2>/dev/null || true
+    ok "旧配置已清理"
+}
+
 prompt_value() {
     local prompt="$1" default="$2" var_name="$3" input
     if [ -n "$default" ]; then
@@ -321,7 +328,7 @@ prompt_value() {
     elif [ -n "${input:-}" ]; then
         printf -v "$var_name" '%s' "$input"
     else
-        return 1  # no default and no input
+        return 1
     fi
     return 0
 }
@@ -390,13 +397,14 @@ prompt_basic_config() {
     if [ "${NTFY_ENABLE_AUTH}" = "true" ]; then
         prompt_value "管理员用户名" "${NTFY_ADMIN_USER}" NTFY_ADMIN_USER
 
-        local pass_display
+        local pass_display input_pass
         if [ -n "${NTFY_ADMIN_PASS:-}" ]; then
             pass_display="********"
         else
             pass_display=""
         fi
-        read -r -p "管理员密码（回车=自动生成，输入=设置密码）[${pass_display:-自动生成}]: " input_pass
+        stty sane 2>/dev/null || true
+        read -e -r -p "管理员密码（回车=自动生成，输入=设置密码）[${pass_display:-自动生成}]: " input_pass
         if [ -z "${input_pass:-}" ] && [ -z "${NTFY_ADMIN_PASS:-}" ]; then
             NTFY_ADMIN_PASS="$(openssl rand -base64 18 | tr -d '/+=' | cut -c1-20)"
             echo "  已自动生成密码: $NTFY_ADMIN_PASS"
@@ -460,7 +468,7 @@ services:
       - serve
     restart: unless-stopped
     ports:
-      - "127.0.0.1:${INTERNAL_PORT}:80"
+      - "0.0.0.0:${INTERNAL_PORT}:80"
     environment:
       - TZ=Asia/Shanghai
     volumes:
@@ -553,7 +561,8 @@ write_nginx_https() {
     local cert_dir="/etc/letsencrypt/live/${DOMAIN}"
     cat > "$NGINX_SITE_FILE" <<EOF_NGINX_HTTPS
 server {
-    listen ${PUBLIC_PORT} ssl http2;
+    listen ${PUBLIC_PORT} ssl;
+    http2 on;
     server_name ${DOMAIN};
 
     ssl_certificate ${cert_dir}/fullchain.pem;
@@ -584,8 +593,9 @@ configure_nginx() {
     NGINX_SITE_LINK="/etc/nginx/sites-enabled/${SERVICE_NAME}_${PUBLIC_PORT}.conf"
 
     info "配置 Nginx 反向代理"
-    # 不要删除 sites-enabled 下所有 ntfy 配置，只删自己那份
-    rm -f "${NGINX_SITE_FILE}" "${NGINX_SITE_LINK}" 2>/dev/null || true
+    # 删除所有旧的 ntfy Nginx 配置（避免冲突）
+    rm -f /etc/nginx/sites-available/ntfy_*.conf 2>/dev/null || true
+    rm -f /etc/nginx/sites-enabled/ntfy_*.conf 2>/dev/null || true
     if [ -n "${DOMAIN:-}" ] && [ -f "/etc/letsencrypt/live/${DOMAIN}/fullchain.pem" ] && [ -f "/etc/letsencrypt/live/${DOMAIN}/privkey.pem" ]; then
         write_nginx_https
         NTFY_BASE_URL="https://${DOMAIN}:${PUBLIC_PORT}"
@@ -630,6 +640,7 @@ configure_nginx() {
 
 install_ntfy_all() {
     load_state
+    cleanup_old_nginx_configs
     install_dependencies
     prompt_basic_config
     write_server_config
@@ -637,7 +648,6 @@ install_ntfy_all() {
     start_ntfy
     ensure_admin_user
     configure_nginx
-    print_access_info
 }
 
 restart_ntfy() {
@@ -683,55 +693,6 @@ show_status() {
     ss -lntp 2>/dev/null | grep -E ":(${INTERNAL_PORT}|${PUBLIC_PORT})\b" || true
 }
 
-print_access_info() {
-    load_state
-    local local_base_url
-    local_base_url="http://127.0.0.1:${INTERNAL_PORT}"
-    echo
-    printf "${BOLD}${GREEN}ntfy 部署/配置完成${NC}\n"
-    echo
-    echo "====== 访问配置 ======"
-    echo "外部访问地址：${NTFY_BASE_URL}"
-    echo "本机推送地址：${local_base_url}"
-    echo "默认 Topic：${NTFY_DEFAULT_TOPIC}"
-    echo "默认优先级：${NTFY_DEFAULT_PRIORITY}"
-    echo "默认 Tags：${NTFY_DEFAULT_TAGS:-未设置}"
-    echo "登录认证：${NTFY_ENABLE_AUTH}"
-    if [ "${NTFY_ENABLE_AUTH}" = "true" ]; then
-        echo "管理员账号：${NTFY_ADMIN_USER}"
-        echo "管理员密码：${NTFY_ADMIN_PASS}"
-    else
-        echo "认证状态：未开启，任何知道 Topic 的人都可发布/订阅"
-    fi
-    echo
-    echo "====== 端口配置 ======"
-    echo "容器内部端口：80"
-    echo "本机内部映射：127.0.0.1:${INTERNAL_PORT}"
-    echo "Nginx 外部端口：${PUBLIC_PORT}"
-    echo "防火墙放行端口：${PUBLIC_PORT}/tcp（脚本已尝试自动放行）"
-    echo
-    echo "====== 本地配置路径 ======"
-    echo "脚本状态配置：${NTFY_STATE_FILE}"
-    echo "ntfy 服务配置：${NTFY_SERVER_FILE}"
-    echo "Docker Compose：${NTFY_COMPOSE_FILE}"
-    echo "Nginx 反代配置：${NGINX_SITE_FILE}"
-    echo "ntfy 缓存目录：${NTFY_CACHE_DIR}"
-    echo "ntfy 数据目录：${NTFY_LIB_DIR}"
-    echo "附件目录：${NTFY_ATTACH_DIR}"
-    echo
-    echo "====== RSS 配置片段：外部/手机/其它服务器使用 ======" 
-
-    if [ "${NTFY_ENABLE_AUTH}" = "true" ]; then
-        cat <<EOF_CFG_AUTH
-{
-  "notice_type": "ntfy",
-  "ntfy_url": "${NTFY_BASE_URL}",
-  "ntfy_topic": "${NTFY_DEFAULT_TOPIC}",
-  "ntfy_username": "${NTFY_ADMIN_USER}",
-  "ntfy_password": "${NTFY_ADMIN_PASS}",
-  "ntfy_priority": ${NTFY_DEFAULT_PRIORITY},
-  "ntfy_tags": "${NTFY_DEFAULT_TAGS}"
-}
 EOF_CFG_AUTH
     else
         cat <<EOF_CFG_OPEN
@@ -781,126 +742,13 @@ EOF_CFG_LOCAL_OPEN
     echo
     echo "提示：同一台 VPS 上的程序建议用 ${local_base_url}；手机、浏览器和其它服务器用 ${NTFY_BASE_URL}。"
 }
-test_push() {
-    load_state
-    local topic title message priority tags auth_args=()
-
-    read -r -p "Topic [${NTFY_DEFAULT_TOPIC}]: " topic
-    topic="${topic:-$NTFY_DEFAULT_TOPIC}"
-
-    read -r -p "标题 [LET RSS ntfy 测试]: " title
-    title="${title:-LET RSS ntfy 测试}"
-
-    read -r -p "优先级 1-5 [${NTFY_DEFAULT_PRIORITY}]: " priority
-    priority="${priority:-$NTFY_DEFAULT_PRIORITY}"
-
-    read -r -p "Tags（逗号分隔）[${NTFY_DEFAULT_TAGS}]: " tags
-    tags="${tags:-$NTFY_DEFAULT_TAGS}"
-
-    read -r -p "推送内容 [ntfy Markdown 测试成功]: " message
-    message="${message:-ntfy Markdown 测试成功\n\n- 推送通道：ntfy\n- Topic：${topic}\n- 链接：https://ntfy.sh/}"
-
-    if [ "${NTFY_ENABLE_AUTH}" = "true" ]; then
-        read -r -p "用户名 [${NTFY_ADMIN_USER}]: " input_user
-        local push_user push_pass
-        push_user="${input_user:-$NTFY_ADMIN_USER}"
-        read -r -s -p "密码（回车=使用保存密码）: " input_pass
-        echo
-        push_pass="${input_pass:-$NTFY_ADMIN_PASS}"
-        auth_args=(-u "${push_user}:${push_pass}")
-    fi
-
-    local url
-    url="${NTFY_BASE_URL%/}/${topic}"
-    info "发送测试推送到：${url}"
-    curl -fsS -X POST "${auth_args[@]}" "$url" \
-        -H "Title: ${title}" \
-        -H "Priority: ${priority}" \
-        -H "Tags: ${tags}" \
-        -H "Markdown: yes" \
-        --data-binary "$message"
-    echo
-    ok "测试推送已发送"
-}
-
-test_push_from_let_config() {
-    local config_file
-    config_file="/root/let/data/config.json"
-
-    read -r -p "请输入 RSS 配置文件路径 [${config_file}]，DELETE=恢复默认: " input_config_file
-    if is_delete_input "${input_config_file:-}"; then
-        config_file="/root/let/data/config.json"
-    elif [ -n "${input_config_file:-}" ]; then
-        config_file="$input_config_file"
-    fi
-
-    if [ ! -f "$config_file" ]; then
-        err "未找到配置文件：${config_file}"
-        return 1
-    fi
-
-    if ! command -v python3 >/dev/null 2>&1; then
-        err "未检测到 python3，无法读取 JSON 配置"
-        return 1
-    fi
-
-    info "读取配置文件并调用 RSS 项目的 send.py 测试推送：${config_file}"
-    python3 - "$config_file" <<'PY_TEST_PUSH'
-import json
-import sys
-from pathlib import Path
-from datetime import datetime
-
-config_path = Path(sys.argv[1]).expanduser().resolve()
-project_root = config_path.parent.parent
-sys.path.insert(0, str(project_root))
-
-try:
-    with config_path.open('r', encoding='utf-8') as f:
-        raw = json.load(f)
-    config = raw.get('config', raw)
-except Exception as e:
-    print(f"[ERR] 读取配置失败：{e}")
-    raise SystemExit(1)
-
-notice_type = config.get('notice_type', 'telegram')
-
-try:
-    from send import NotificationSender
-except Exception as e:
-    print(f"[ERR] 无法导入 {project_root}/send.py：{e}")
-    print("[TIP] 请确认该配置文件位于项目 data/config.json，且项目根目录存在 send.py")
-    raise SystemExit(1)
-
-message = (
-    "LET RSS 配置文件测试推送\n\n"
-    f"推送通道：{notice_type}\n"
-    f"配置文件：{config_path}\n"
-    f"测试时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
-    "如果你收到这条消息，说明当前 data/config.json 的推送配置可用。"
-)
-
-try:
-    ok = NotificationSender(config).send_message(message)
-except Exception as e:
-    print(f"[ERR] 调用 NotificationSender 失败：{e}")
-    raise SystemExit(1)
-
-print(f"send_result={ok}")
-if not ok:
-    print("[ERR] 推送函数返回 False，请检查 notice_type、URL、Topic、用户名/密码、网络和服务端日志")
-    raise SystemExit(2)
-PY_TEST_PUSH
-
-    ok "已按 ${config_file} 执行测试推送"
-}
-
 reset_admin_user() {
     load_state
     warn "该操作会创建或更新 ntfy 管理员账号密码，不会删除消息缓存或现有 topic。"
     echo
     NTFY_ENABLE_AUTH="true"
-    read -r -p "请输入管理员用户名 [${NTFY_ADMIN_USER}]: " input_user
+    stty sane 2>/dev/null || true
+    read -e -r -p "请输入管理员用户名 [${NTFY_ADMIN_USER}]: " input_user
     if [ -n "${input_user:-}" ]; then
         NTFY_ADMIN_USER="$input_user"
     fi
@@ -913,12 +761,14 @@ reset_admin_user() {
         echo "  已自动生成密码: $NTFY_ADMIN_PASS"
     fi
 
-    read -r -p "输入 RESET 确认重置/更新 ntfy 登录账号: " confirm_text
+    stty sane 2>/dev/null || true
+    read -e -r -p "输入 RESET 确认重置/更新 ntfy 登录账号: " confirm_text
     if [ "${confirm_text:-}" != "RESET" ]; then
         warn "已取消重置"
         return 0
     fi
 
+    cleanup_old_nginx_configs
     save_state
     write_server_config
     write_compose
@@ -937,7 +787,8 @@ uninstall_ntfy() {
     load_state
     warn "该操作会停止并删除 ntfy 容器、Nginx 反代配置。"
     warn "默认不会删除数据目录：${NTFY_ROOT}"
-    read -r -p "输入 YES 确认卸载 ntfy: " confirm_text
+    stty sane 2>/dev/null || true
+    read -e -r -p "输入 YES 确认卸载 ntfy: " confirm_text
     if [ "${confirm_text:-}" != "YES" ]; then
         warn "已取消卸载"
         return 0
@@ -952,7 +803,8 @@ uninstall_ntfy() {
     rm -f "$NGINX_SITE_LINK" "$NGINX_SITE_FILE"
     nginx -t && systemctl restart nginx || true
 
-    read -r -p "是否同时删除 ntfy 数据目录 ${NTFY_ROOT} ? 输入 DELETE 确认删除: " delete_text
+    stty sane 2>/dev/null || true
+    read -e -r -p "是否同时删除 ntfy 数据目录 ${NTFY_ROOT} ? 输入 DELETE 确认删除: " delete_text
     if [ "${delete_text:-}" = "DELETE" ]; then
         rm -rf "$NTFY_ROOT"
         ok "ntfy 数据目录已删除"
@@ -960,7 +812,8 @@ uninstall_ntfy() {
         warn "保留数据目录：${NTFY_ROOT}"
     fi
 
-    read -r -p "是否同时移除防火墙端口 ${PUBLIC_PORT}/tcp ? 输入 CLOSE 确认移除: " close_text
+    stty sane 2>/dev/null || true
+    read -e -r -p "是否同时移除防火墙端口 ${PUBLIC_PORT}/tcp ? 输入 CLOSE 确认移除: " close_text
     if [ "${close_text:-}" = "CLOSE" ]; then
         close_firewall_port "$PUBLIC_PORT"
         ok "已尝试移除防火墙端口 ${PUBLIC_PORT}/tcp"
@@ -980,11 +833,8 @@ show_menu() {
     printf "${BOLD}${CYAN}  [2] 仅重写 Nginx 反代${NC}          ${WHITE}修改域名/端口后单独刷新反代${NC}\n"
     printf "${BOLD}${CYAN}  [3] 重启 ntfy${NC}                  ${WHITE}重启容器和 Nginx${NC}\n"
     printf "${BOLD}${YELLOW} [4] 查看状态${NC}                   ${WHITE}查看容器、端口、访问地址、Topic${NC}\n"
-    printf "${BOLD}${YELLOW} [5] 测试推送${NC}                   ${WHITE}输入 Topic 后发一条 Markdown 测试${NC}\n"
-    printf "${BOLD}${GREEN} [6] 输出 RSS 配置片段${NC}          ${WHITE}复制到 data/config.json${NC}\n"
-    printf "${BOLD}${YELLOW} [7] 读取 RSS 配置测试推送${NC}      ${WHITE}/root/let/data/config.json -> send.py${NC}\n"
-    printf "${BOLD}${MAGENTA} [8] 设置/重置登录账号${NC}         ${WHITE}创建或更新 ntfy 管理员账号${NC}\n"
-    printf "${BOLD}${RED}   [9] 卸载 ntfy${NC}                 ${YELLOW}删除容器和反代，可选择保留数据${NC}\n"
+    printf "${BOLD}${MAGENTA} [5] 设置/重置登录账号${NC}         ${WHITE}创建或更新 ntfy 管理员账号${NC}\n"
+    printf "${BOLD}${RED}   [6] 卸载 ntfy${NC}                 ${YELLOW}删除容器和反代，可选择保留数据${NC}\n"
     printf "${BOLD}${RED}   [0] 退出${NC}\n"
     printf "${BOLD}${BLUE}-------------------------------------------------------------------------${NC}\n"
     printf "${BOLD}${YELLOW} ★ 默认外部端口：${NC}${GREEN}${PUBLIC_PORT}${NC}${WHITE}，避免与你现有 asset_manager / gotify 端口冲突${NC}\n"
@@ -1000,23 +850,22 @@ main() {
     load_state
     while true; do
         show_menu
-        read -r -p "请输入菜单编号: " choice
+        stty sane 2>/dev/null || true
+        read -e -r -p "请输入菜单编号: " choice
         echo
         case "${choice:-}" in
             1) install_ntfy_all ;;
-            2) prompt_basic_config; configure_nginx; print_access_info ;;
+            2) prompt_basic_config; configure_nginx ;;
             3) restart_ntfy ;;
             4) show_status ;;
-            5) test_push ;;
-            6) print_access_info ;;
-            7) test_push_from_let_config ;;
-            8) reset_admin_user ;;
-            9) uninstall_ntfy ;;
+            5) reset_admin_user ;;
+            6) uninstall_ntfy ;;
             0) exit 0 ;;
             *) warn "无效选项" ;;
         esac
         echo
-        read -r -p "按回车继续..." _
+        stty sane 2>/dev/null || true
+        read -e -r -p "按回车继续..." _
     done
 }
 
