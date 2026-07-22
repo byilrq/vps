@@ -693,55 +693,6 @@ show_status() {
     ss -lntp 2>/dev/null | grep -E ":(${INTERNAL_PORT}|${PUBLIC_PORT})\b" || true
 }
 
-EOF_CFG_AUTH
-    else
-        cat <<EOF_CFG_OPEN
-{
-  "notice_type": "ntfy",
-  "ntfy_url": "${NTFY_BASE_URL}",
-  "ntfy_topic": "${NTFY_DEFAULT_TOPIC}",
-  "ntfy_priority": ${NTFY_DEFAULT_PRIORITY},
-  "ntfy_tags": "${NTFY_DEFAULT_TAGS}"
-}
-EOF_CFG_OPEN
-    fi
-
-    echo
-    echo "====== RSS 配置片段：同一台 VPS 本机程序推荐使用 ======" 
-    if [ "${NTFY_ENABLE_AUTH}" = "true" ]; then
-        cat <<EOF_CFG_LOCAL_AUTH
-{
-  "notice_type": "ntfy",
-  "ntfy_url": "${local_base_url}",
-  "ntfy_topic": "${NTFY_DEFAULT_TOPIC}",
-  "ntfy_username": "${NTFY_ADMIN_USER}",
-  "ntfy_password": "${NTFY_ADMIN_PASS}",
-  "ntfy_priority": ${NTFY_DEFAULT_PRIORITY},
-  "ntfy_tags": "${NTFY_DEFAULT_TAGS}"
-}
-EOF_CFG_LOCAL_AUTH
-    else
-        cat <<EOF_CFG_LOCAL_OPEN
-{
-  "notice_type": "ntfy",
-  "ntfy_url": "${local_base_url}",
-  "ntfy_topic": "${NTFY_DEFAULT_TOPIC}",
-  "ntfy_priority": ${NTFY_DEFAULT_PRIORITY},
-  "ntfy_tags": "${NTFY_DEFAULT_TAGS}"
-}
-EOF_CFG_LOCAL_OPEN
-    fi
-
-    echo
-    echo "curl 示例："
-    if [ "${NTFY_ENABLE_AUTH}" = "true" ]; then
-        echo "curl -u '${NTFY_ADMIN_USER}:你的密码' -H 'Title: 测试' -H 'Priority: ${NTFY_DEFAULT_PRIORITY}' -H 'Tags: ${NTFY_DEFAULT_TAGS}' -d 'hello ntfy' '${local_base_url}/${NTFY_DEFAULT_TOPIC}'"
-    else
-        echo "curl -H 'Title: 测试' -H 'Priority: ${NTFY_DEFAULT_PRIORITY}' -H 'Tags: ${NTFY_DEFAULT_TAGS}' -d 'hello ntfy' '${local_base_url}/${NTFY_DEFAULT_TOPIC}'"
-    fi
-    echo
-    echo "提示：同一台 VPS 上的程序建议用 ${local_base_url}；手机、浏览器和其它服务器用 ${NTFY_BASE_URL}。"
-}
 reset_admin_user() {
     load_state
     warn "该操作会创建或更新 ntfy 管理员账号密码，不会删除消息缓存或现有 topic。"
