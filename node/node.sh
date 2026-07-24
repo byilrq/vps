@@ -501,15 +501,22 @@ restart_service() {
     return 1
 }
 
-restart_system() {
-    echo -e "${BLUE}正在重启系统...${PLAIN}"
-    if command -v systemctl >/dev/null 2>&1; then
-        systemctl reboot
-    elif command -v reboot >/dev/null 2>&1; then
-        reboot
+restart_node_service() {
+    echo -e "${BLUE}正在重启整个 node 系统...${PLAIN}"
+    if have_systemd; then
+        systemctl restart "$SERVICE_NAME"
+        sleep 2
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            echo -e "${GREEN}✅ node 系统已成功重启${PLAIN}"
+            return 0
+        else
+            echo -e "${RED}❌ node 系统重启失败${PLAIN}"
+            return 1
+        fi
     else
-        echo -e "${RED}❌ 无法执行系统重启${PLAIN}"
-        return 1
+        stop_running
+        sleep 1
+        echo -e "${GREEN}✅ node 系统已重启${PLAIN}"
     fi
 }
 
@@ -848,17 +855,17 @@ main_menu() {
         echo -e "${PURPLE} node Python 监控管理菜单 ${PLAIN}"
         echo -e "${BLUE}======================================${PLAIN}"
         echo -e "${GREEN}1.${PLAIN} 安装依赖"
-        echo -e "${GREEN}2.${PLAIN} 安装 / 部署（仅 HTTP 8068）"
+        echo -e "${GREEN}2.${PLAIN} 安装系统"
         echo -e "${GREEN}3.${PLAIN} 配置参数"
         echo -e "${GREEN}4.${PLAIN} 停止运行"
-        echo -e "${GREEN}5.${PLAIN} 查看运行情况"
-        echo -e "${GREEN}6.${PLAIN} 卸载服务"
-        echo -e "${GREEN}7.${PLAIN} 重启整个系统"
+        echo -e "${GREEN}5.${PLAIN} 查看状态"
+        echo -e "${GREEN}6.${PLAIN} 卸载"
+        echo -e "${GREEN}7.${PLAIN} 重启"
         echo -e "${GREEN}8.${PLAIN} 推送测试消息"
-		echo -e "${GREEN}9.${PLAIN} 更新域名/HTTPS"   # 新增
+	echo -e "${GREEN}9.${PLAIN} 更新域名/HTTPS"
         echo -e "${WHITE}0.${PLAIN} 退出"
         echo -e "${BLUE}======================================${PLAIN}"
-        read -rp "请选择操作 [0-8]: " choice
+        read -rp "请选择操作 [0-9]: " choice
         echo
         case "$choice" in
             1) install_dependencies ;;
@@ -867,9 +874,9 @@ main_menu() {
             4) stop_running ;;
             5) show_status ;;
             6) uninstall_service ;;
-            7) restart_system ;;
+            7) restart_node_service ;;
             8) test_notification ;;
-			9) update_node_domain ;;   # 新增
+			9) update_node_domain ;;
             0) exit 0 ;;
             *) echo "无效选项" ;;
         esac

@@ -1112,7 +1112,13 @@ def build_keyword_handler(cfg: Dict[str, str]):
 
         def do_GET(self):
             try:
-                self.rfile._sock.settimeout(REQUEST_TIMEOUT)
+                try:
+                    if hasattr(self, 'connection') and hasattr(self.connection, 'settimeout'):
+                        self.connection.settimeout(REQUEST_TIMEOUT)
+                    elif hasattr(self.rfile, '_sock') and self.rfile._sock:
+                        self.rfile._sock.settimeout(REQUEST_TIMEOUT)
+                except Exception:
+                    pass
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path == "/api/runtime-status":
                     self._send_json({"ok": True, "enabled": is_run_enabled(), "server_time": now_str()})
@@ -1156,7 +1162,13 @@ def build_keyword_handler(cfg: Dict[str, str]):
 
         def do_POST(self):
             try:
-                self.rfile._sock.settimeout(REQUEST_TIMEOUT)
+                try:
+                    if hasattr(self, 'connection') and hasattr(self.connection, 'settimeout'):
+                        self.connection.settimeout(REQUEST_TIMEOUT)
+                    elif hasattr(self.rfile, '_sock') and self.rfile._sock:
+                        self.rfile._sock.settimeout(REQUEST_TIMEOUT)
+                except Exception:
+                    pass
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path == "/api/runtime-toggle":
                     form = self._read_form()
