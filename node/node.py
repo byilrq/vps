@@ -1100,25 +1100,15 @@ def build_keyword_handler(cfg: Dict[str, str]):
         def _read_form(self) -> Dict[str, List[str]]:
             try:
                 length = int(self.headers.get("Content-Length", "0"))
-                if length > MAX_REQUEST_SIZE:
+                if length <= 0 or length > MAX_REQUEST_SIZE:
                     return {}
-                if length <= 0:
-                    return {}
-                self.rfile._sock.settimeout(REQUEST_TIMEOUT)
                 body = self.rfile.read(length).decode("utf-8", errors="ignore")
                 return parse_qs(body, keep_blank_values=True)
-            except Exception as exc:
+            except Exception:
                 return {}
 
         def do_GET(self):
             try:
-                try:
-                    if hasattr(self, 'connection') and hasattr(self.connection, 'settimeout'):
-                        self.connection.settimeout(REQUEST_TIMEOUT)
-                    elif hasattr(self.rfile, '_sock') and self.rfile._sock:
-                        self.rfile._sock.settimeout(REQUEST_TIMEOUT)
-                except Exception:
-                    pass
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path == "/api/runtime-status":
                     self._send_json({"ok": True, "enabled": is_run_enabled(), "server_time": now_str()})
@@ -1162,13 +1152,6 @@ def build_keyword_handler(cfg: Dict[str, str]):
 
         def do_POST(self):
             try:
-                try:
-                    if hasattr(self, 'connection') and hasattr(self.connection, 'settimeout'):
-                        self.connection.settimeout(REQUEST_TIMEOUT)
-                    elif hasattr(self.rfile, '_sock') and self.rfile._sock:
-                        self.rfile._sock.settimeout(REQUEST_TIMEOUT)
-                except Exception:
-                    pass
                 parsed = urllib.parse.urlparse(self.path)
                 if parsed.path == "/api/runtime-toggle":
                     form = self._read_form()
@@ -1209,6 +1192,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
 
                 form = self._read_form()
                 new_keywords = form.get("keywords", [""])[0].strip()
+                if not form:
+                    self.respond_page(read_keywords(), "表单数据读取失败", True, status=400)
+                    return
                 try:
                     update_keywords(new_keywords)
                     self.send_response(303)
