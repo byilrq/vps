@@ -27,7 +27,7 @@ LAST_NODE_TXT="$WORK_DIR/last_node.txt"
 
 DEFAULT_NS_URL="https://rss.nodeseek.com/?sortBy=postTime"
 DEFAULT_INTERVAL_SEC="15"
-DEFAULT_WEB_PORT="2068"
+DEFAULT_WEB_PORT="8068"
 DEFAULT_WEB_PIN="0819"
 
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
@@ -214,20 +214,33 @@ prepare_web_cert_for_domain() {
 
     ensure_certbot_installed || return 1
 
-    # 临时停止占用 80 端口的服务
-    systemctl stop nginx 2>/dev/null || true
+    # 临时停止占用 80 端口的服务（检查是否运行中）
+    local nginx_was_running=0
+    if systemctl is-active --quiet nginx 2>/dev/null; then
+        nginx_was_running=1
+        echo "暂停 nginx 服务以申请证书..."
+        systemctl stop nginx 2>/dev/null || true
+    fi
+
     systemctl stop apache2 2>/dev/null || true
     sleep 2
 
     # 使用 standalone 方式申请证书（更可靠）
     if ! certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain"; then
         echo "❌ Let's Encrypt 证书申请失败。请检查域名解析、80端口、防火墙/安全组。"
-        # 恢复 nginx
-        systemctl start nginx 2>/dev/null || true
+        # 恢复 nginx（仅在原来运行中时恢复）
+        if [ "$nginx_was_running" -eq 1 ]; then
+            echo "恢复 nginx 服务..."
+            systemctl start nginx 2>/dev/null || true
+        fi
         return 1
     fi
 
-    systemctl start nginx 2>/dev/null || true
+    # 恢复 nginx（仅在原来运行中时恢复）
+    if [ "$nginx_was_running" -eq 1 ]; then
+        echo "恢复 nginx 服务..."
+        systemctl start nginx 2>/dev/null || true
+    fi
 
     if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
         echo "✅ Let's Encrypt 证书已就绪。"
@@ -488,21 +501,16 @@ restart_service() {
     return 1
 }
 
-restart_web() {
-    local port
-    read_config 2>/dev/null || true
-    port="${WEB_PORT:-$DEFAULT_WEB_PORT}"
-    echo -e "${BLUE}正在重启 Web 管理端...${PLAIN}"
-    if command -v curl >/dev/null 2>&1; then
-        if curl -ksS --max-time 5 -X POST "http://127.0.0.1:${port}/api/restart-web" -d "" 2>/dev/null; then
-            echo -e "${GREEN}✅ Web 管理端已重启${PLAIN}"
-            return 0
-        fi
+restart_system() {
+    echo -e "${BLUE}正在重启系统...${PLAIN}"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl reboot
+    elif command -v reboot >/dev/null 2>&1; then
+        reboot
+    else
+        echo -e "${RED}❌ 无法执行系统重启${PLAIN}"
+        return 1
     fi
-    echo "尝试通过 kill 重启 web 进程..."
-    pkill -f "python3 $PYTHON_SCRIPT keyword-web" 2>/dev/null || true
-    sleep 1
-    echo -e "${GREEN}✅ 已触发 Web 管理端重启${PLAIN}"
 }
 
 deploy_from_github() {
@@ -536,6 +544,7 @@ uninstall_service() {
     fi
     cleanup_old_cron >/dev/null 2>&1 || true
     echo -e "${GREEN}✔ node systemd 服务已卸载，配置和数据仍保留在 $WORK_DIR${PLAIN}"
+    echo -e "${YELLOW}⚠️ 注意：nginx 配置和业务未受影响${PLAIN}"
 }
 
 run_py() {
@@ -839,12 +848,12 @@ main_menu() {
         echo -e "${PURPLE} node Python 监控管理菜单 ${PLAIN}"
         echo -e "${BLUE}======================================${PLAIN}"
         echo -e "${GREEN}1.${PLAIN} 安装依赖"
-        echo -e "${GREEN}2.${PLAIN} 安装 / 部署（仅 HTTP 2068）"
+        echo -e "${GREEN}2.${PLAIN} 安装 / 部署（仅 HTTP 8068）"
         echo -e "${GREEN}3.${PLAIN} 配置参数"
         echo -e "${GREEN}4.${PLAIN} 停止运行"
         echo -e "${GREEN}5.${PLAIN} 查看运行情况"
         echo -e "${GREEN}6.${PLAIN} 卸载服务"
-        echo -e "${GREEN}7.${PLAIN} 重启 Web 管理端"
+        echo -e "${GREEN}7.${PLAIN} 重启整个系统"
         echo -e "${GREEN}8.${PLAIN} 推送测试消息"
 		echo -e "${GREEN}9.${PLAIN} 更新域名/HTTPS"   # 新增
         echo -e "${WHITE}0.${PLAIN} 退出"
@@ -858,7 +867,7 @@ main_menu() {
             4) stop_running ;;
             5) show_status ;;
             6) uninstall_service ;;
-            7) restart_web ;;
+            7) restart_system ;;
             8) test_notification ;;
 			9) update_node_domain ;;   # 新增
             0) exit 0 ;;

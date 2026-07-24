@@ -49,8 +49,10 @@ WEB_RESTART_FILE = WORK_DIR / ".node_web_restart"
 
 DEFAULT_URL = "https://rss.nodeseek.com/?sortBy=postTime"
 DEFAULT_WEB_HOST = os.environ.get("NODE_WEB_HOST", "0.0.0.0")
-DEFAULT_WEB_PORT = int(os.environ.get("NODE_WEB_PORT", "2068"))
+DEFAULT_WEB_PORT = int(os.environ.get("NODE_WEB_PORT", "8068"))
 DEFAULT_WEB_PIN = os.environ.get("NODE_WEB_PIN", "0819")
+MAX_REQUEST_SIZE = 1024 * 1024
+REQUEST_TIMEOUT = 30
 LETSENCRYPT_LIVE = Path("/etc/letsencrypt/live")
 MAX_STATE_ENTRIES = 30
 MAX_RSS_LOG_ENTRIES = 120
@@ -1096,92 +1098,123 @@ def build_keyword_handler(cfg: Dict[str, str]):
             self.wfile.write(body)
 
         def _read_form(self) -> Dict[str, List[str]]:
-            length = int(self.headers.get("Content-Length", "0"))
-            body = self.rfile.read(length).decode("utf-8", errors="ignore")
-            return parse_qs(body, keep_blank_values=True)
+            try:
+                length = int(self.headers.get("Content-Length", "0"))
+                if length > MAX_REQUEST_SIZE:
+                    return {}
+                if length <= 0:
+                    return {}
+                self.rfile._sock.settimeout(REQUEST_TIMEOUT)
+                body = self.rfile.read(length).decode("utf-8", errors="ignore")
+                return parse_qs(body, keep_blank_values=True)
+            except Exception as exc:
+                return {}
 
         def do_GET(self):
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path == "/api/runtime-status":
-                self._send_json({"ok": True, "enabled": is_run_enabled(), "server_time": now_str()})
-                return
-            if parsed.path == "/api/rss-logs":
-                query = parse_qs(parsed.query, keep_blank_values=True)
-                mode = (query.get("mode", ["all"])[0] or "all").strip().lower()
-                monitor = NodeMonitor()
-                cfg_now = load_runtime_config()
-                interval = max(15, safe_int(cfg_now.get("INTERVAL_SEC", "20"), 20))
-                logs = monitor.get_rss_logs(mode=mode, limit=20)
-                self._send_json({
-                    "ok": True,
-                    "mode": "hits" if mode in {"hit", "hits", "matched"} else "all",
-                    "logs": logs,
-                    "server_time": now_str(),
-                    "refresh_interval_sec": interval,
-                    "runtime_enabled": is_run_enabled(),
-                })
-                return
-            self.respond_page(read_keywords(), "", False)
+            try:
+                self.rfile._sock.settimeout(REQUEST_TIMEOUT)
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/api/runtime-status":
+                    self._send_json({"ok": True, "enabled": is_run_enabled(), "server_time": now_str()})
+                    return
+                if parsed.path == "/api/rss-logs":
+                    query = parse_qs(parsed.query, keep_blank_values=True)
+                    mode = (query.get("mode", ["all"])[0] or "all").strip().lower()
+                    monitor = NodeMonitor()
+                    cfg_now = load_runtime_config()
+                    interval = max(15, safe_int(cfg_now.get("INTERVAL_SEC", "20"), 20))
+                    logs = monitor.get_rss_logs(mode=mode, limit=20)
+                    self._send_json({
+                        "ok": True,
+                        "mode": "hits" if mode in {"hit", "hits", "matched"} else "all",
+                        "logs": logs,
+                        "server_time": now_str(),
+                        "refresh_interval_sec": interval,
+                        "runtime_enabled": is_run_enabled(),
+                    })
+                    return
+                self.respond_page(read_keywords(), "", False)
+            except Exception as exc:
+                try:
+                    self._send_json({"ok": False, "error": str(exc)}, status=500)
+                except Exception:
+                    pass
 
         def do_DELETE(self):
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path == "/api/rss-logs":
-                NodeMonitor().clear_rss_logs()
-                self._send_json({"ok": True, "message": "RSS日志已清除", "server_time": now_str()})
-                return
-            self._send_json({"ok": False, "message": "Not found"}, status=404)
+            try:
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/api/rss-logs":
+                    NodeMonitor().clear_rss_logs()
+                    self._send_json({"ok": True, "message": "RSS日志已清除", "server_time": now_str()})
+                    return
+                self._send_json({"ok": False, "message": "Not found"}, status=404)
+            except Exception as exc:
+                try:
+                    self._send_json({"ok": False, "error": str(exc)}, status=500)
+                except Exception:
+                    pass
 
         def do_POST(self):
-            parsed = urllib.parse.urlparse(self.path)
-            if parsed.path == "/api/runtime-toggle":
-                form = self._read_form()
-                raw = (form.get("enabled", [""])[0] or "").strip().lower()
-                enabled = raw in {"1", "true", "on", "yes", "run", "running"}
-                set_run_enabled(enabled)
-                self._send_json({"ok": True, "enabled": enabled, "server_time": now_str()})
-                return
-            if parsed.path == "/api/restart-web":
-                WEB_RESTART_FILE.write_text(now_str(), encoding="utf-8")
-                self._send_json({"ok": True, "message": "网页服务正在重启", "server_time": now_str()})
-                return
-            if parsed.path == "/api/rss-refresh":
-                if not is_run_enabled():
+            try:
+                self.rfile._sock.settimeout(REQUEST_TIMEOUT)
+                parsed = urllib.parse.urlparse(self.path)
+                if parsed.path == "/api/runtime-toggle":
+                    form = self._read_form()
+                    raw = (form.get("enabled", [""])[0] or "").strip().lower()
+                    enabled = raw in {"1", "true", "on", "yes", "run", "running"}
+                    set_run_enabled(enabled)
+                    self._send_json({"ok": True, "enabled": enabled, "server_time": now_str()})
+                    return
+                if parsed.path == "/api/restart-web":
+                    WEB_RESTART_FILE.write_text(now_str(), encoding="utf-8")
+                    self._send_json({"ok": True, "message": "网页服务正在重启", "server_time": now_str()})
+                    return
+                if parsed.path == "/api/rss-refresh":
+                    if not is_run_enabled():
+                        self._send_json({
+                            "ok": False,
+                            "status": "disabled",
+                            "changed": 0,
+                            "pushed": 0,
+                            "server_time": now_str(),
+                        })
+                        return
+                    monitor = NodeMonitor()
+                    status, changed = monitor.refresh_once()
+                    pushed = monitor.auto_push_once() if status in {"ok", "not_modified"} else 0
                     self._send_json({
-                        "ok": False,
-                        "status": "disabled",
-                        "changed": 0,
-                        "pushed": 0,
+                        "ok": status in {"ok", "not_modified"},
+                        "status": status,
+                        "changed": changed,
+                        "pushed": pushed,
                         "server_time": now_str(),
                     })
                     return
-                monitor = NodeMonitor()
-                status, changed = monitor.refresh_once()
-                pushed = monitor.auto_push_once() if status in {"ok", "not_modified"} else 0
-                self._send_json({
-                    "ok": status in {"ok", "not_modified"},
-                    "status": status,
-                    "changed": changed,
-                    "pushed": pushed,
-                    "server_time": now_str(),
-                })
-                return
-            if parsed.path == "/api/rss-logs/clear":
-                NodeMonitor().clear_rss_logs()
-                self._send_json({"ok": True, "message": "RSS日志已清除", "server_time": now_str()})
-                return
+                if parsed.path == "/api/rss-logs/clear":
+                    NodeMonitor().clear_rss_logs()
+                    self._send_json({"ok": True, "message": "RSS日志已清除", "server_time": now_str()})
+                    return
 
-            form = self._read_form()
-            new_keywords = form.get("keywords", [""])[0].strip()
-            try:
-                update_keywords(new_keywords)
-                self.send_response(303)
-                self.send_header("Location", "/")
-                self.end_headers()
+                form = self._read_form()
+                new_keywords = form.get("keywords", [""])[0].strip()
+                try:
+                    update_keywords(new_keywords)
+                    self.send_response(303)
+                    self.send_header("Location", "/")
+                    self.end_headers()
+                except Exception as exc:
+                    self.respond_page(new_keywords, f"保存失败: {exc}", True, status=500)
             except Exception as exc:
-                self.respond_page(new_keywords, f"保存失败: {exc}", True, status=500)
+                try:
+                    self._send_json({"ok": False, "error": str(exc)}, status=500)
+                except Exception:
+                    pass
 
         def log_message(self, fmt, *args):
-            return
+            pass
+
+        def version_string(self):
+            return ""
 
         def respond_page(self, keywords: str, message: str, editing: bool, status: int = 200):
             safe_keywords = html.escape(keywords, quote=True)
@@ -1696,6 +1729,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
 def build_keyword_web_server(cfg: Dict[str, str]) -> ThreadingHTTPServer:
     settings = keyword_web_settings(cfg)
     server = ThreadingHTTPServer((settings["host"], int(settings["port"])), build_keyword_handler(cfg))
+    server.daemon_threads = True
+    server.allow_reuse_address = True
+    server.timeout = REQUEST_TIMEOUT
     if settings["ssl_cert"] and settings["ssl_key"]:
         cert_path = Path(settings["ssl_cert"])
         key_path = Path(settings["ssl_key"])
@@ -1887,26 +1923,37 @@ def cmd_run_all() -> int:
         thread = threading.Thread(target=monitor.monitor_loop, name="node-monitor", daemon=True)
         thread.start()
 
+        web_startup_retries = 0
+        max_retries = 3
         while True:
-            cfg = load_runtime_config()
-            server = build_keyword_web_server(cfg)
-            settings = keyword_web_settings(cfg)
-            print(f"node run-all started; monitor interval={max(15, safe_int(cfg.get('INTERVAL_SEC', '15'), 15))}s; keyword web={settings['url']}", flush=True)
+            try:
+                cfg = load_runtime_config()
+                server = build_keyword_web_server(cfg)
+                settings = keyword_web_settings(cfg)
+                print(f"node run-all started; monitor interval={max(15, safe_int(cfg.get('INTERVAL_SEC', '15'), 15))}s; keyword web={settings['url']}", flush=True)
+                web_startup_retries = 0
 
-            def watch_restart(svr):
-                while True:
-                    time.sleep(1)
-                    if WEB_RESTART_FILE.exists():
-                        try:
-                            WEB_RESTART_FILE.unlink()
-                        except Exception:
-                            pass
-                        svr.shutdown()
-                        break
+                def watch_restart(svr):
+                    while True:
+                        time.sleep(1)
+                        if WEB_RESTART_FILE.exists():
+                            try:
+                                WEB_RESTART_FILE.unlink()
+                            except Exception:
+                                pass
+                            svr.shutdown()
+                            break
 
-            threading.Thread(target=watch_restart, args=(server,), daemon=True).start()
-            server.serve_forever()
-            server.server_close()
+                threading.Thread(target=watch_restart, args=(server,), daemon=True).start()
+                server.serve_forever()
+                server.server_close()
+            except Exception as exc:
+                web_startup_retries += 1
+                if web_startup_retries >= max_retries:
+                    print(f"❌ Web服务启动失败超过{max_retries}次: {exc}", flush=True)
+                    return 1
+                print(f"⚠️ Web服务启动异常 (重试{web_startup_retries}/{max_retries}): {exc}", flush=True)
+                time.sleep(2)
         return 0
     finally:
         remove_pid_file(PID_FILE)
