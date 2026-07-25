@@ -30,7 +30,6 @@ import xml.etree.ElementTree as ET
 
 WORK_DIR = Path(os.environ.get("NODE_WORK_DIR", "/root/node"))
 CONFIG_FILE = WORK_DIR / "node_config.txt"
-KEYWORDS_FILE = WORK_DIR / "node_keywords.txt"
 LOG_FILE = WORK_DIR / "node.log"
 CRON_LOG = WORK_DIR / "node_cron.log"
 BOOT_LOG = WORK_DIR / "node_boot.log"
@@ -63,7 +62,6 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
 )
-KEY_RE = re.compile(r'^(\s*KEYWORDS\s*=\s*")(.*?)("\s*)$')
 
 
 def ensure_workdir() -> None:
@@ -216,31 +214,25 @@ def unescape_shell_value(value: str) -> str:
 
 
 def read_keywords() -> str:
-    if KEYWORDS_FILE.exists():
-        try:
-            return KEYWORDS_FILE.read_text(encoding="utf-8").strip()
-        except Exception:
-            pass
-    # fallback + 迁移: 从旧配置文件读取
-    if CONFIG_FILE.exists():
-        with CONFIG_FILE.open("r", encoding="utf-8") as fh:
-            for raw in fh:
-                m = KEY_RE.match(raw.rstrip("\n"))
-                if m:
-                    val = unescape_shell_value(m.group(2))
-                    if val:
-                        try:
-                            KEYWORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
-                            KEYWORDS_FILE.write_text(val, encoding="utf-8")
-                        except Exception:
-                            pass
-                    return val
-    return ""
+    cfg = parse_shell_config(CONFIG_FILE)
+    return cfg.get("KEYWORDS", "").strip()
 
 
 def update_keywords(new_value: str) -> None:
-    KEYWORDS_FILE.parent.mkdir(parents=True, exist_ok=True)
-    KEYWORDS_FILE.write_text(new_value, encoding="utf-8")
+    cfg = parse_shell_config(CONFIG_FILE)
+    cfg["KEYWORDS"] = new_value
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        for key in ["TG_BOT_TOKEN", "TG_PUSH_CHAT_ID", "PUSH_CHANNEL", "NTFY_URL", "NTFY_USERNAME", "NTFY_PASSWORD", "NTFY_TOPIC", "NTFY_PRIORITY", "NS_URL", "KEYWORDS", "INTERVAL_SEC", "DEBUG_LOG", "WEB_HOST", "WEB_PORT", "WEB_PIN", "WEB_DOMAIN"]:
+            val = cfg.get(key, "")
+            escaped = val.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", " ")
+            fh.write(f'{key}="{escaped}"\n')
+    tmp.replace(CONFIG_FILE)
+    try:
+        os.chmod(str(CONFIG_FILE), 0o600)
+    except Exception:
+        pass
 
 
 def keyword_web_settings(cfg: Dict[str, str]) -> Dict[str, str]:
