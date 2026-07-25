@@ -1477,11 +1477,11 @@ def build_keyword_handler(cfg: Dict[str, str]):
         <table>
           <thead>
             <tr>
+              <th>标题</th>
+              <th style="width:112px;">命中词</th>
               <th style="width:132px;">时间</th>
               <th style="width:82px;">结果</th>
               <th style="width:102px;">推送</th>
-              <th style="width:112px;">命中词</th>
-              <th>标题</th>
               <th style="width:62px;">链接</th>
             </tr>
           </thead>
@@ -1626,11 +1626,11 @@ def build_keyword_handler(cfg: Dict[str, str]):
         const url = escapeHtml(row.url || '');
         const link = url ? `<a href="${url}" target="_blank" rel="noopener noreferrer">打开</a>` : '-';
         return `<tr>
+          <td class="title">${title}</td>
+          <td>${hit}</td>
           <td class="time">${compactTime(row.checked_at || row.first_seen_at || '')}</td>
           <td>${tag}</td>
           <td>${statusTag}</td>
-          <td>${hit}</td>
-          <td class="title">${title}</td>
           <td class="url">${link}</td>
         </tr>`;
       }).join('');
