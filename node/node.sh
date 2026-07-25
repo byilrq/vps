@@ -97,15 +97,6 @@ setup_firewall() {
 }
 
 # ==================== Let's Encrypt 证书处理 ====================
-get_public_ipv4() {
-    local ip=""
-    ip="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}' || true)"
-    if [ -z "$ip" ] && command -v curl >/dev/null 2>&1; then
-        ip="$(curl -4fsS --max-time 5 https://ipv4.icanhazip.com 2>/dev/null | tr -d '[:space:]' || true)"
-    fi
-    echo "$ip"
-}
-
 find_cert_name_by_domain() {
     local cert_domain="$1"
     local d=""
@@ -175,25 +166,8 @@ show_local_cert_info() {
     fi
 }
 
-ensure_certbot_installed() {
-    if command -v certbot >/dev/null 2>&1; then
-        return 0
-    fi
-    echo "未检测到 certbot，正在安装..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y
-        apt-get install -y certbot
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y certbot
-    else
-        echo "❌ 未检测到 apt-get/yum，无法自动安装 certbot。"
-        return 1
-    fi
-}
-
 prepare_web_cert_for_domain() {
     local cert_domain="$1"
-    local server_ip="" resolved_ip=""
     echo "检查域名证书：${cert_domain}"
 
     if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
@@ -202,53 +176,9 @@ prepare_web_cert_for_domain() {
         return 0
     fi
 
-    echo "未找到可用正式证书，将自动申请 Let's Encrypt 证书。"
-    server_ip="$(get_public_ipv4)"
-    resolved_ip="$(getent ahostsv4 "$cert_domain" 2>/dev/null | awk 'NR==1{print $1}' || true)"
-    if [ -n "$server_ip" ] && [ -n "$resolved_ip" ] && [ "$server_ip" != "$resolved_ip" ]; then
-        echo "⚠️ 域名解析 IP 与本机公网 IP 可能不一致："
-        echo "   域名解析: $resolved_ip"
-        echo "   本机公网: $server_ip"
-        echo "   证书申请可能失败，请确认 DNS 已指向本机。"
-    fi
-
-    ensure_certbot_installed || return 1
-
-    # 临时停止占用 80 端口的服务（检查是否运行中）
-    local nginx_was_running=0
-    if systemctl is-active --quiet nginx 2>/dev/null; then
-        nginx_was_running=1
-        echo "暂停 nginx 服务以申请证书..."
-        systemctl stop nginx 2>/dev/null || true
-    fi
-
-    systemctl stop apache2 2>/dev/null || true
-    sleep 2
-
-    # 使用 standalone 方式申请证书（更可靠）
-    if ! certbot certonly --standalone --non-interactive --agree-tos --register-unsafely-without-email -d "$cert_domain"; then
-        echo "❌ Let's Encrypt 证书申请失败。请检查域名解析、80端口、防火墙/安全组。"
-        # 恢复 nginx（仅在原来运行中时恢复）
-        if [ "$nginx_was_running" -eq 1 ]; then
-            echo "恢复 nginx 服务..."
-            systemctl start nginx 2>/dev/null || true
-        fi
-        return 1
-    fi
-
-    # 恢复 nginx（仅在原来运行中时恢复）
-    if [ "$nginx_was_running" -eq 1 ]; then
-        echo "恢复 nginx 服务..."
-        systemctl start nginx 2>/dev/null || true
-    fi
-
-    if cert_files_exist "$cert_domain" && cert_is_valid "$cert_domain" && cert_key_matches "$cert_domain"; then
-        echo "✅ Let's Encrypt 证书已就绪。"
-        show_local_cert_info "$cert_domain"
-        return 0
-    fi
-
-    echo "❌ 证书文件存在性/有效性/私钥匹配校验未通过。"
+    echo "❌ 证书文件不存在或无效，请先使用 certbot 为 ${cert_domain} 申请证书。"
+    echo "   证书路径：/etc/letsencrypt/live/${cert_domain}/fullchain.pem"
+    echo "   申请命令：certbot certonly --standalone -d ${cert_domain}"
     return 1
 }
 chmod_if_needed() {
@@ -430,8 +360,12 @@ download_node_py() {
 install_dependencies() {
     echo -e "${BLUE}开始安装/检查依赖...${PLAIN}"
     if command -v apt-get >/dev/null 2>&1; then
+        local pkgs="python3 python3-pip curl wget ca-certificates"
+        if ! command -v nginx >/dev/null 2>&1; then
+            pkgs="$pkgs nginx"
+        fi
         export DEBIAN_FRONTEND=noninteractive
-        apt-get update && apt-get install -y python3 python3-pip curl wget ca-certificates
+        apt-get update && apt-get install -y $pkgs
     else
         echo -e "${YELLOW}⚠️ 当前系统未检测到 apt-get，请手动安装 python3 / pip / curl 或 wget。${PLAIN}"
     fi
@@ -551,6 +485,11 @@ uninstall_service() {
         systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
     fi
     cleanup_old_cron >/dev/null 2>&1 || true
+    # 移除 ufw 放行规则
+    if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+        ufw delete allow "${DEFAULT_WEB_PORT}/tcp" >/dev/null 2>&1 || true
+        ufw reload >/dev/null 2>&1 || true
+    fi
     echo -e "${GREEN}✔ node systemd 服务已卸载，配置和数据仍保留在 $WORK_DIR${PLAIN}"
     echo -e "${YELLOW}⚠️ 注意：nginx 配置和业务未受影响${PLAIN}"
 }
