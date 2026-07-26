@@ -1563,6 +1563,105 @@ show_hostname_info() {
 }
 
 # -----------------------------
+# 11) 修复站点 nginx 配置 — 重建 quant-* 站点配置，不干扰其他 nginx 用户
+# -----------------------------
+fix_nginx_site() {
+  need_root
+
+  echo "============================================"
+  echo "修复站点 nginx 配置"
+  echo "提示：此功能用于重建某个服务的 nginx 配置文件"
+  echo "（如 quant 的 HTTPS 反代），不修改其他 nginx 站点。"
+  echo "============================================"
+
+  local domain="" backend_port="" public_port="" cert_file key_file
+  local nginx_conf nginx_link
+
+  read -erp "请输入域名（如 wow.xyrq.de）: " domain
+  [ -z "$domain" ] && { red "域名不能为空"; return 1; }
+
+  read -erp "请输入内部服务端口（如 2097）: " backend_port
+  [[ "$backend_port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; return 1; }
+
+  read -erp "请输入对外 HTTPS 端口（如 2096）: " public_port
+  [[ "$public_port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; return 1; }
+
+  cert_file="/etc/letsencrypt/live/${domain}/fullchain.pem"
+  key_file="/etc/letsencrypt/live/${domain}/privkey.pem"
+
+  if [ ! -f "$cert_file" ] || [ ! -f "$key_file" ]; then
+    red "证书文件不存在："
+    red "  ${cert_file}"
+    red "  ${key_file}"
+    yellow "请先使用 certbot 为 ${domain} 申请证书，例如："
+    echo "  certbot certonly --standalone -d ${domain}"
+    return 1
+  fi
+
+  yellow "将创建 nginx 配置："
+  echo "  域名：${domain}"
+  echo "  反代后端：http://127.0.0.1:${backend_port}"
+  echo "  对外端口：${public_port}（HTTPS）"
+  echo "  证书：${cert_file}"
+  read -erp "确认创建？(y/n): " confirm
+  [[ "$confirm" =~ ^[Yy]$ ]] || { yellow "已取消"; return 0; }
+
+  nginx_conf="/etc/nginx/sites-available/${domain//./-}-${public_port}.conf"
+  nginx_link="/etc/nginx/sites-enabled/${domain//./-}-${public_port}.conf"
+
+  cat > "$nginx_conf" <<EOF
+server {
+    listen ${public_port} ssl http2;
+    listen [::]:${public_port} ssl http2;
+    server_name ${domain};
+
+    ssl_certificate     ${cert_file};
+    ssl_certificate_key ${key_file};
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
+    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_prefer_server_ciphers off;
+
+    client_max_body_size 10m;
+
+    location / {
+        proxy_pass http://127.0.0.1:${backend_port};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_read_timeout 60;
+    }
+}
+
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${domain};
+    return 301 https://\$server_name:${public_port}\$request_uri;
+}
+EOF
+
+  ln -sf "$nginx_conf" "$nginx_link"
+  nginx -t 2>&1 || { red "nginx 配置检查失败，已取消启用"; rm -f "$nginx_link"; return 1; }
+  systemctl reload nginx && green "nginx 配置已生效" || red "nginx 重载失败"
+
+  # 放行防火墙端口
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi active; then
+    ufw allow "${public_port}/tcp" >/dev/null 2>&1 || true
+    ufw reload >/dev/null 2>&1 || true
+    green "UFW 已放行端口 ${public_port}"
+  fi
+
+  echo ""
+  green "✅ 站点配置完成"
+  echo "  访问地址：https://${domain}:${public_port}"
+  echo "  配置文件：${nginx_conf}"
+  echo ""
+  read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
 # Menu
 # -----------------------------
 menu_sys_conf() {
@@ -1583,10 +1682,11 @@ menu_sys_conf() {
     echo -e " ${GREEN}8.${tianlan} 设置IP优先级"
     echo -e " ${GREEN}9.${tianlan} 设置定时重启"
     echo -e " ${GREEN}10.${tianlan} 修改主机名"
+    echo -e " ${GREEN}11.${tianlan} 修复站点 nginx 配置（域名+端口）"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-10]: " choice
+    read -rp "请选择 [0-11]: " choice
     case "$choice" in
       1) bbr ;;
       2) firewall ;;
@@ -1598,6 +1698,7 @@ menu_sys_conf() {
       8) set_ip_priority ;;
       9) cron_reboot ;;
       10) change_hostname ;;
+      11) fix_nginx_site ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
