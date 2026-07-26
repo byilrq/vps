@@ -1370,6 +1370,8 @@ def build_keyword_handler(cfg: Dict[str, str]):
     .tag.pending { color: #ffe7b8; background: rgba(217,119,6,.24); border: 1px solid rgba(217,119,6,.35); }
     .tag.fail { color: #ffd2d2; background: rgba(239,68,68,.20); border: 1px solid rgba(239,68,68,.38); }
     .empty { text-align: center; color: var(--muted); padding: 28px 12px; }
+    .keyword-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .keyword-title { margin: 0; font-size: 22px; letter-spacing: .6px; color: #effcff; }
     @media (max-width: 640px) {
       body { padding: 14px 10px; }
       .hero { padding: 22px 18px; border-radius: 24px; }
@@ -1452,12 +1454,11 @@ def build_keyword_handler(cfg: Dict[str, str]):
 
     <section class="card keyword-card">
       <form id="keywordForm" method="post" autocomplete="off">
-        <div class="compact-row">
-          <textarea id="keywords" name="keywords" spellcheck="false" __READONLY__ placeholder="例如：抽奖 甲&乙 amd&7950x&盒装&国行">__SAFE_KEYWORDS__</textarea>
-          <div class="side-actions">
-            <button id="actionBtn" type="button" onclick="handleAction()">__ACTION_LABEL__</button>
-          </div>
+        <div class="keyword-header">
+          <h2 class="keyword-title">关键词</h2>
+          <button id="actionBtn" type="button" onclick="handleAction()">__ACTION_LABEL__</button>
         </div>
+          <textarea id="keywords" name="keywords" spellcheck="false" __READONLY__ placeholder="例如：抽奖 甲&乙 amd&7950x&盒装&国行">__SAFE_KEYWORDS__</textarea>
         <div class="__MSG_CLASS__">__SAFE_MESSAGE__</div>
       </form>
     </section>
