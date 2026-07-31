@@ -1343,8 +1343,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
     h2 { margin: 0; font-size: 22px; letter-spacing: .6px; color: #effcff; }
     .log-meta { color: var(--muted); font-size: 13px; }
     .log-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 12px; }
-    .log-card { display: none; }
-    .log-card.show { display: block; }
+    .log-card { display: block; }
+    .log-body { display: none; }
+    .log-body.show { display: block; }
     .switch-group { display: inline-flex; align-items: center; justify-content: flex-end; gap: 14px; flex-wrap: wrap; }
     .switch-wrap { display: inline-flex; align-items: center; gap: 9px; color: #dcefff; font-weight: 800; }
     .switch-label { color: var(--yellow); transition: color .2s ease, text-shadow .2s ease; }
@@ -1437,16 +1438,11 @@ def build_keyword_handler(cfg: Dict[str, str]):
       <div class="hero-line">
         <div>
           <h1>node捕🐟</h1>
-          <div class="title-rule">关键词规则：空格或逗号分隔规则，多个关键词采用 &amp; 间隔</div>
         </div>
         <div class="switch-group">
           <label id="runSwitchWrap" class="switch-wrap on" title="开启或暂停自动监控和推送">
             <span id="runLabel" class="switch-label">运行</span>
             <span class="switch"><input id="runToggle" type="checkbox" checked><span class="slider"></span></span>
-          </label>
-          <label id="logSwitchWrap" class="switch-wrap" title="显示或隐藏RSS日志">
-            <span id="logLabel" class="switch-label">日志</span>
-            <span class="switch"><input id="logToggle" type="checkbox"><span class="slider"></span></span>
           </label>
         </div>
       </div>
@@ -1455,7 +1451,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     <section class="card keyword-card">
       <form id="keywordForm" method="post" autocomplete="off">
         <div class="keyword-header">
-          <h2 class="keyword-title">关键词</h2>
+          <h2 class="keyword-title">关键词 <span class="title-rule">空格或逗号分隔规则，多个关键词采用 &amp; 间隔</span></h2>
           <button id="actionBtn" type="button" onclick="handleAction()">__ACTION_LABEL__</button>
         </div>
           <textarea id="keywords" name="keywords" spellcheck="false" __READONLY__ placeholder="例如：抽奖 甲&乙 amd&7950x&盒装&国行">__SAFE_KEYWORDS__</textarea>
@@ -1466,28 +1462,34 @@ def build_keyword_handler(cfg: Dict[str, str]):
     <section id="logCard" class="card log-card">
       <div class="log-head">
         <h2>RSS日志 <span class="log-meta">最新20条</span></h2>
+        <label id="logSwitchWrap" class="switch-wrap" title="显示或隐藏RSS日志">
+          <span id="logLabel" class="switch-label">日志</span>
+          <span class="switch"><input id="logToggle" type="checkbox"><span class="slider"></span></span>
+        </label>
+      </div>
+      <div id="logBody" class="log-body">
         <div class="log-meta" id="logMeta">等待刷新</div>
-      </div>
-      <div class="log-actions">
-        <button type="button" class="secondary" onclick="fetchLogs(true)">刷新</button>
-        <button id="btnAll" type="button" class="active" onclick="setMode('all')">RSS全部</button>
-        <button id="btnHits" type="button" class="secondary" onclick="setMode('hits')">命中</button>
-        <button type="button" class="danger" onclick="clearLogs()">清除</button>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>标题</th>
-              <th style="width:112px;">命中词</th>
-              <th style="width:132px;">时间</th>
-              <th style="width:82px;">结果</th>
-              <th style="width:102px;">推送</th>
-              <th style="width:62px;">链接</th>
-            </tr>
-          </thead>
-          <tbody id="rssLogBody"><tr><td class="empty" colspan="6">日志已隐藏</td></tr></tbody>
-        </table>
+        <div class="log-actions">
+          <button type="button" class="secondary" onclick="fetchLogs(true)">刷新</button>
+          <button id="btnAll" type="button" class="active" onclick="setMode('all')">RSS全部</button>
+          <button id="btnHits" type="button" class="secondary" onclick="setMode('hits')">命中</button>
+          <button type="button" class="danger" onclick="clearLogs()">清除</button>
+        </div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>标题</th>
+                <th style="width:112px;">命中词</th>
+                <th style="width:132px;">时间</th>
+                <th style="width:82px;">结果</th>
+                <th style="width:102px;">推送</th>
+                <th style="width:62px;">链接</th>
+              </tr>
+            </thead>
+            <tbody id="rssLogBody"><tr><td class="empty" colspan="6"></td></tr></tbody>
+          </table>
+        </div>
       </div>
     </section>
   </div>
@@ -1587,10 +1589,10 @@ def build_keyword_handler(cfg: Dict[str, str]):
 
     function setLogVisible(visible, shouldFetch) {
       const toggle = document.getElementById('logToggle');
-      const card = document.getElementById('logCard');
+      const body = document.getElementById('logBody');
       toggle.checked = Boolean(visible);
       setSwitchLabelState('logSwitchWrap', visible);
-      card.classList.toggle('show', Boolean(visible));
+      body.classList.toggle('show', Boolean(visible));
       localStorage.setItem('nodeRssLogVisible', visible ? 'true' : 'false');
       if (visible) {
         if (shouldFetch) fetchLogs(false);
@@ -1680,6 +1682,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     });
 
     setMode(logMode);
+    setLogVisible(false, false);
 
     document.getElementById('confirmModal').addEventListener('click', (e) => {
       if (e.target === e.currentTarget) closeConfirmModal();
