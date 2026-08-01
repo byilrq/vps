@@ -8,7 +8,7 @@ set -o pipefail
 
 APP_NAME="let"
 SERVICE_NAME="let"
-REPO_URL="https://github.com/byilrq/let"
+REPO_URL="https://raw.githubusercontent.com/byilrq/vps/main/let"
 INSTALL_DIR="/root/let"
 INSTALL_PARENT="/root"
 VENV_DIR="${INSTALL_DIR}/.venv"
