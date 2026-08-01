@@ -1,0 +1,39 @@
+{
+    "config": {
+        "enable_rss": true,
+        "enable_extra_urls": false,
+        "auto_add_rss_hits_to_extra_urls": false,
+        "auto_extra_urls": {},
+        "restrict_24h": true,
+        "frequency": 60,
+        "rss_scan_limit": 20,
+        "telegrambot": "",
+        "chat_id": "",
+        "notice_type": "ntfy",
+        "wechat_key": "",
+        "custom_url": "",
+        "gotify_priority": 5,
+        "gotify_token": "",
+        "gotify_server": "",
+        "ntfy_password": "Plex0819$",
+        "ntfy_username": "admin",
+        "ntfy_server": "http://127.0.0.1:8083",
+        "ntfy_priority": 3,
+        "ntfy_topic": "vps",
+        "cf_account_id": "93**************************",
+        "cf_token": "cfut_**********************************",
+        "model": "@cf/qwen/qwen3-30b-a3b-fp8",
+        "thread_prompt": "设定：你是一位精通 VPS 相关信息的中文助手，专注帮助用户高效筛选和总结 VPS 论坛中的内容。接下来会提供一则评论信息，你需要返回 FALSE 或对评论的翻译。依据是：判断这个 LowEndTalk/LowEndSpirit 新主题是否是优惠活动。如果包含:折扣、优惠码、限时促销 、闪购、 FLASH SALE、中国线路优化、绿云等信息，则输出内容格式“\n总结：40字以内的中文摘要，重点突出折扣、套仓价格、VPS配置；\n套餐：每个套餐的配置、价格概述及其订购链接，如果有多个套餐则换行独立显示每个套餐的信息，例如，\n套餐1：配置、价格，\n套餐2配置、价格，\n套餐n ...;\n折扣码：\n原文链接”。\n你不需要告诉我你的判断过程或是判断理由。否则返回 false。",
+        "comment_prompt": "设定：你是一位精通 VPS 相关信息的中文助手，专注帮助用户高效筛选和总结 VPS 论坛中的内容。接下来会提供一则评论信息，你需要返回 FALSE 或对评论的翻译。依据是：判断这一评论是否发起了新的活动，包括促销discount、抽奖giveaway、补货restock，如果不是，返回FALSE，是则将这段回复翻译到中文并返回。例如，如果评论仅仅是对某人的回复，你需要返回 FALSE。输出格式：翻译：XXX END 在你输出的最末端添加 END。你不需要告诉我你的判断过程或是判断理由。",
+        "use_thread_keywords_filter": false,
+        "thread_keywords_rule": "",
+        "use_comment_keywords_filter": false,
+        "comment_keywords_rule": "",
+        "use_ai_filter": true,
+        "comment_filter": "by_author",
+        "urls": [
+            "https://lowendtalk.com/categories/offers/feed.rss"
+        ],
+        "extra_urls": []
+    }
+}

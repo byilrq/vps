@@ -1,0 +1,1815 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LET监控</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/element-plus@2.8.8/dist/index.css">
+    <style>
+        [v-cloak] { display: none !important; }
+        body { font-family: Arial, sans-serif; margin: 0; padding: 0; background-color: #f4f7fa; }
+        #app { max-width: 1180px; margin: 0 auto; padding: 22px; }
+        #app.auth-app { max-width: none; padding: 0; }
+        h1, h2 { margin: 18px 0 12px; }
+        h1 { font-size: 30px; letter-spacing: .5px; }
+        .page-hero { background: linear-gradient(135deg, #0f172a, #155e75); color: #fff; border-radius: 18px; padding: 24px 26px; margin-bottom: 18px; box-shadow: 0 12px 30px rgba(15, 23, 42, .22); }
+        .hero-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+        .page-hero h1 { margin: 0 0 8px; }
+        .page-hero p { margin: 0; color: rgba(255,255,255,.78); }
+        .hero-logout {
+          flex: 0 0 auto;
+          border: 1px solid rgba(255,255,255,.24);
+          background: rgba(255,255,255,.10);
+          color: #fff;
+          border-radius: 999px;
+          padding: 9px 15px;
+          cursor: pointer;
+          font-weight: 700;
+          box-shadow: inset 0 1px 0 rgba(255,255,255,.14);
+          transition: transform .16s ease, background .16s ease;
+        }
+        .hero-logout:hover {
+          transform: translateY(-1px);
+          background: rgba(255,255,255,.18);
+        }
+        .card { border: 1px solid #e5e7eb; }
+        .card h2 { color: #0f172a; }
+        .el-form-item { margin-bottom: 18px; }
+        .card { background: #fff; border-radius: 12px; padding: 18px; margin-bottom: 18px; box-shadow: 0 4px 18px rgba(0,0,0,.06); }
+        .hint { color: #666; font-size: 13px; line-height: 1.6; }
+        .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+        .matched { color: #18a058; font-weight: bold; }
+        .missed { color: #909399; font-weight: bold; }
+        .pin { color: #d97706; font-weight: 700; }
+        .feature-tag { margin: 2px 4px 2px 0; max-width: 100%; white-space: normal; word-break: break-word; height: auto; line-height: 1.25; }
+        .message-preview { max-height: 150px; overflow: auto; white-space: pre-wrap; color: #333; line-height: 1.45; word-break: break-all; overflow-wrap: anywhere; }
+        .push-preview { max-height: 260px; overflow: auto; white-space: pre-wrap; color: #1f2937; line-height: 1.45; background: #f8fafc; border-radius: 8px; padding: 8px; word-break: break-all; overflow-wrap: anywhere; }
+        .el-table .cell { line-height: 1.45; white-space: normal; word-break: break-all; overflow-wrap: anywhere; padding-left: 6px; padding-right: 6px; }
+        .el-table__row.manual-pinned-row { background: #fffaf0; }
+        .compact-cell { white-space: normal; word-break: break-all; overflow-wrap: anywhere; }
+        .reason-cell { white-space: pre-wrap; word-break: break-all; overflow-wrap: anywhere; max-height: 150px; overflow: auto; }
+        .title-text { font-weight: 700; word-break: break-all; overflow-wrap: anywhere; }
+        .push-preview a, .message-preview a { color: #2563eb; text-decoration: underline; word-break: break-all; overflow-wrap: anywhere; }
+        .push-preview a:hover, .message-preview a:hover { color: #1d4ed8; }
+        .switch-warning { color: #b45309; font-size: 13px; margin-top: 6px; }
+
+        /* 登录页：深色玻璃拟态风格 */
+        body.auth-mode {
+          min-height: 100vh;
+          color: #edf7ff;
+          background:
+            radial-gradient(circle at 74% 12%, rgba(24, 210, 176, 0.18), transparent 30%),
+            radial-gradient(circle at 18% 20%, rgba(78, 126, 180, 0.18), transparent 34%),
+            linear-gradient(180deg, #0d2133 0%, #07111d 58%, #050b14 100%);
+          overflow-x: hidden;
+        }
+        .login-stage {
+          position: fixed;
+          inset: 0;
+          pointer-events: none;
+          overflow: hidden;
+          z-index: 0;
+        }
+        .login-stage::before {
+          content: "";
+          position: absolute;
+          inset: 0;
+          background-image:
+            linear-gradient(rgba(126,232,216,0.045) 1px, transparent 1px),
+            linear-gradient(90deg, rgba(126,232,216,0.045) 1px, transparent 1px);
+          background-size: 46px 46px;
+          opacity: 0.24;
+          mask-image: linear-gradient(180deg, rgba(0,0,0,0.9), transparent 82%);
+        }
+        .login-page {
+          min-height: 100vh;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          position: relative;
+          z-index: 1;
+          padding: max(18px, env(safe-area-inset-top)) 18px max(18px, env(safe-area-inset-bottom));
+          transform: translateY(-5vh);
+        }
+        .login-card {
+          position: relative;
+          width: min(100%, 430px);
+          padding: 34px 24px 28px;
+          border-radius: 30px;
+          background:
+            linear-gradient(135deg, rgba(126,232,216,0.14), transparent 25%),
+            linear-gradient(180deg, rgba(22,47,68,0.82), rgba(9,21,35,0.78));
+          border: 1px solid rgba(132, 180, 210, 0.22);
+          box-shadow: 0 28px 70px rgba(0, 10, 22, 0.46), inset 0 1px 0 rgba(255,255,255,0.10);
+          backdrop-filter: blur(20px) saturate(145%);
+          -webkit-backdrop-filter: blur(20px) saturate(145%);
+          overflow: hidden;
+        }
+        .login-card::before {
+          content: "";
+          position: absolute;
+          inset: -1px;
+          border-radius: inherit;
+          background: linear-gradient(135deg, rgba(126,232,216,0.48), transparent 25%, transparent 70%, rgba(92,149,200,0.26));
+          opacity: 0.32;
+          pointer-events: none;
+          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+          padding: 1px;
+          -webkit-mask-composite: xor;
+          mask-composite: exclude;
+        }
+        .login-title {
+          margin: 0 0 24px;
+          text-align: center;
+          font-size: clamp(34px, 7vw, 46px);
+          line-height: 1.12;
+          letter-spacing: 1.8px;
+          font-weight: 850;
+          background: linear-gradient(180deg, #ffffff 0%, #c9f7ef 54%, #7bb7d0 100%);
+          -webkit-background-clip: text;
+          background-clip: text;
+          color: transparent;
+          text-shadow: 0 16px 36px rgba(0,10,25,0.42);
+        }
+        .login-subtitle {
+          width: min(100%, 340px);
+          margin: -14px auto 20px;
+          color: rgba(224, 241, 252, 0.58);
+          text-align: center;
+          font-size: 14px;
+        }
+        .login-form {
+          width: min(100%, 340px);
+          margin: 0 auto;
+        }
+        .login-field {
+          margin-bottom: 14px;
+        }
+        .login-field label {
+          position: absolute;
+          width: 1px;
+          height: 1px;
+          padding: 0;
+          margin: -1px;
+          overflow: hidden;
+          clip: rect(0, 0, 0, 0);
+          white-space: nowrap;
+          border: 0;
+        }
+        .login-input {
+          height: 54px;
+          border-radius: 18px;
+          border: 1px solid rgba(126,232,216,0.18);
+          background:
+            linear-gradient(180deg, rgba(126,232,216,0.08), rgba(255,255,255,0.025)),
+            rgba(7,17,29,0.62);
+          display: flex;
+          align-items: center;
+          gap: 11px;
+          padding: 0 15px;
+          transition: border-color 0.2s ease, box-shadow 0.2s ease, transform 0.2s ease;
+        }
+        .login-input:focus-within {
+          border-color: rgba(24,210,176,0.68);
+          box-shadow: 0 0 0 4px rgba(24,210,176,0.10), 0 0 28px rgba(24,210,176,0.12);
+          transform: translateY(-1px);
+        }
+        .login-input svg {
+          width: 18px;
+          height: 18px;
+          color: #7fe8d8;
+          flex: 0 0 auto;
+        }
+        .login-input input {
+          width: 100%;
+          height: 52px;
+          border: 0;
+          outline: 0;
+          background: transparent;
+          color: #edf7ff;
+          font-size: 17px;
+        }
+        .login-input input::placeholder {
+          color: rgba(224, 241, 252, 0.42);
+        }
+        .login-button {
+          width: 100%;
+          min-height: 56px;
+          margin-top: 12px;
+          border-radius: 18px;
+          border: 1px solid rgba(126,232,216,0.36);
+          background: linear-gradient(180deg, #25ddbf 0%, #13ae97 58%, #0b786b 100%);
+          color: #ecfffb;
+          font-size: 19px;
+          font-weight: 850;
+          letter-spacing: 2px;
+          cursor: pointer;
+          box-shadow: 0 18px 34px rgba(0,20,35,0.36), 0 0 28px rgba(24,210,176,0.12), inset 0 1px 0 rgba(255,255,255,0.36);
+          transition: transform 0.18s ease, filter 0.18s ease, box-shadow 0.18s ease;
+        }
+        .login-button:hover,
+        .login-button:active {
+          transform: translateY(-1px);
+          filter: brightness(1.08);
+          box-shadow: 0 22px 42px rgba(0,20,35,0.44), 0 0 34px rgba(24,210,176,0.18), inset 0 1px 0 rgba(255,255,255,0.42);
+        }
+        .login-error {
+          width: min(100%, 340px);
+          margin: 0 auto 16px;
+          padding: 11px 14px;
+          border-radius: 14px;
+          color: #ffd2d2;
+          background: rgba(238, 80, 96, 0.14);
+          border: 1px solid rgba(255, 150, 150, 0.22);
+          text-align: center;
+          font-size: 14px;
+        }
+        @media (max-width: 640px) {
+          .hero-header { flex-direction: column; }
+          .hero-logout { align-self: flex-start; }
+        }
+        @media (max-width: 520px) {
+          .login-card {
+            width: min(100%, 408px);
+            padding: 32px 18px 24px;
+            border-radius: 26px;
+          }
+          .login-form, .login-error, .login-subtitle { width: min(100%, 318px); }
+          .login-title { margin-bottom: 24px; }
+          .login-input { height: 52px; border-radius: 17px; }
+          .login-input input { height: 50px; font-size: 16px; }
+          .login-button { min-height: 54px; border-radius: 17px; }
+        }
+
+        @media (max-width: 768px) { #app { padding: 10px; } }
+    
+        body:not(.auth-mode) #app {
+          overflow-x: hidden;
+        }
+
+        /* 手机端主页面与登录页适配 */
+        .table-scroll-wrap {
+          width: 100%;
+          overflow-x: auto;
+          -webkit-overflow-scrolling: touch;
+          border-radius: 10px;
+        }
+
+        @media (max-width: 768px) {
+          body:not(.auth-mode) {
+            background: #f4f7fa;
+          }
+
+          #app {
+            max-width: none;
+            width: 100%;
+            padding: 10px;
+          }
+
+          #app.auth-app {
+            padding: 0;
+          }
+
+          .page-hero {
+            border-radius: 14px;
+            padding: 18px 16px;
+            margin-bottom: 12px;
+          }
+
+          .page-hero h1 {
+            font-size: 24px;
+            line-height: 1.15;
+          }
+
+          .page-hero p {
+            font-size: 13px;
+            line-height: 1.5;
+          }
+
+          .hero-header {
+            flex-direction: column;
+            align-items: flex-start;
+            gap: 12px;
+          }
+
+          .hero-logout {
+            padding: 8px 12px;
+            font-size: 13px;
+          }
+
+          .card {
+            border-radius: 14px;
+            padding: 14px;
+            margin-bottom: 12px;
+          }
+
+          .card h2 {
+            font-size: 18px;
+            margin: 8px 0 12px;
+          }
+
+          .toolbar {
+            align-items: flex-start;
+            gap: 8px;
+            flex-wrap: wrap;
+          }
+
+          .toolbar h2 {
+            width: 100%;
+            font-size: 17px;
+          }
+
+          .toolbar .el-button,
+          .toolbar .el-switch {
+            margin-bottom: 4px;
+          }
+
+          .el-form-item {
+            margin-bottom: 14px;
+          }
+
+          .el-form-item__label {
+            font-size: 13px;
+            line-height: 1.35;
+          }
+
+          .el-input,
+          .el-select,
+          .el-textarea,
+          .el-input-number {
+            width: 100% !important;
+          }
+
+          .el-input-number .el-input__inner {
+            text-align: left;
+          }
+
+          .el-switch {
+            max-width: 100%;
+            white-space: normal;
+            height: auto;
+            line-height: 1.3;
+          }
+
+          .el-switch__label {
+            white-space: normal;
+            line-height: 1.35;
+            font-size: 12px;
+          }
+
+          .switch-warning,
+          .hint {
+            font-size: 12px;
+            line-height: 1.55;
+          }
+
+          .login-page {
+            min-height: 100vh;
+            padding: 16px;
+            transform: translateY(-3vh);
+          }
+
+          .login-card {
+            width: min(100%, 390px);
+            padding: 28px 18px 24px;
+            border-radius: 24px;
+          }
+
+          .login-title {
+            font-size: 34px;
+            margin-bottom: 22px;
+          }
+
+          .login-form,
+          .login-error {
+            width: 100%;
+          }
+
+          .login-input {
+            height: 50px;
+            border-radius: 16px;
+          }
+
+          .login-input input {
+            height: 48px;
+            font-size: 16px;
+          }
+
+          .login-button {
+            min-height: 52px;
+            font-size: 17px;
+            border-radius: 16px;
+          }
+
+          .el-table {
+            min-width: 760px;
+            font-size: 12px;
+          }
+
+          .el-table .cell {
+            padding-left: 5px;
+            padding-right: 5px;
+            line-height: 1.35;
+          }
+
+          .feature-tag {
+            font-size: 11px;
+            margin: 1px 2px 1px 0;
+          }
+
+          .push-preview {
+            max-height: 220px;
+            font-size: 12px;
+            padding: 6px;
+          }
+
+          .message-preview {
+            max-height: 120px;
+            font-size: 12px;
+          }
+        }
+
+        @media (max-width: 420px) {
+          #app {
+            padding: 8px;
+          }
+
+          #app.auth-app {
+            padding: 0;
+          }
+
+          .page-hero {
+            padding: 16px 14px;
+          }
+
+          .page-hero h1 {
+            font-size: 22px;
+          }
+
+          .card {
+            padding: 12px;
+          }
+
+          .login-page {
+            padding: 12px;
+            transform: translateY(-2vh);
+          }
+
+          .login-card {
+            width: 100%;
+            padding: 26px 16px 22px;
+            border-radius: 22px;
+          }
+
+          .login-title {
+            font-size: 31px;
+          }
+
+          .el-button {
+            padding-left: 10px;
+            padding-right: 10px;
+          }
+
+          .toolbar {
+            flex-direction: column;
+            align-items: stretch;
+          }
+
+          .toolbar .el-button {
+            width: 100%;
+          }
+        }
+
+  
+        .filter-section {
+          border: 1px solid #e5e7eb;
+          border-radius: 14px;
+          padding: 16px;
+          margin-bottom: 16px;
+          background: #f9fafb;
+        }
+        .filter-section.thread-filter {
+          background: linear-gradient(180deg, #f0f9ff 0%, #ffffff 100%);
+          border-color: #bae6fd;
+        }
+        .filter-section.comment-filter {
+          background: linear-gradient(180deg, #f0fdf4 0%, #ffffff 100%);
+          border-color: #bbf7d0;
+        }
+        .filter-section-title {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin: 0 0 12px;
+          font-size: 16px;
+          font-weight: 800;
+          color: #0f172a;
+        }
+        .filter-section-desc {
+          margin: -6px 0 14px;
+          font-size: 13px;
+          color: #64748b;
+          line-height: 1.55;
+        }
+
+  
+        .section-title-bar {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          margin-bottom: 12px;
+        }
+        .section-title-bar h2 {
+          margin: 0;
+        }
+        .section-actions {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+        }
+        .readonly-zone {
+          opacity: .68;
+          filter: grayscale(.12);
+        }
+        .readonly-zone .el-input__wrapper,
+        .readonly-zone .el-textarea__inner,
+        .readonly-zone .el-select__wrapper {
+          background-color: #f3f4f6 !important;
+        }
+        .readonly-tip {
+          color: #64748b;
+          font-size: 12px;
+          line-height: 1.5;
+          margin: -4px 0 12px;
+        }
+
+  
+        @media (max-width: 768px) {
+          .section-title-bar {
+            flex-direction: column;
+            align-items: flex-start;
+          }
+          .section-actions {
+            width: 100%;
+          }
+          .section-actions .el-button {
+            flex: 1;
+            min-width: 76px;
+          }
+        }
+
+  
+        /* 顶部/配置区按钮统一胶囊风格 */
+        .pill-button,
+        .hero-logout,
+        .section-actions .el-button,
+        .log-actions .el-button {
+          border-radius: 999px !important;
+          font-weight: 700;
+          transition: transform .16s ease, background .16s ease, box-shadow .16s ease;
+        }
+        .section-actions .el-button,
+        .log-actions .el-button {
+          padding: 7px 14px;
+        }
+        .section-actions .el-button:hover,
+        .log-actions .el-button:hover,
+        .hero-logout:hover {
+          transform: translateY(-1px);
+        }
+
+        .section-switch-line {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        .section-switch-line .el-switch {
+          margin-left: 4px;
+        }
+
+        .log-actions {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+          margin: 10px 0 12px;
+        }
+
+        @media (max-width: 768px) {
+          .log-actions {
+            display: grid;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            width: 100%;
+          }
+          .log-actions .el-button {
+            width: 100%;
+            margin: 0 !important;
+            padding: 8px 4px;
+            font-size: 13px;
+            border-radius: 999px !important;
+          }
+          .section-title-bar {
+            flex-direction: row;
+            align-items: center;
+            justify-content: space-between;
+          }
+          .section-actions {
+            justify-content: flex-end;
+          }
+          .section-actions .el-button {
+            padding: 7px 12px;
+            font-size: 13px;
+            border-radius: 999px !important;
+          }
+        }
+
+        @media (max-width: 420px) {
+          .log-actions {
+            gap: 6px;
+          }
+          .log-actions .el-button {
+            font-size: 12px;
+            padding: 7px 2px;
+          }
+          .section-title-bar {
+            gap: 8px;
+          }
+          .section-title-bar h2 {
+            font-size: 20px;
+          }
+          .section-actions .el-button {
+            font-size: 12px;
+            padding: 6px 10px;
+          }
+        }
+
+  
+        .top-apply-actions {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          flex-wrap: wrap;
+          justify-content: flex-end;
+        }
+        .top-apply-actions .el-button {
+          border-radius: 999px !important;
+          font-weight: 700;
+          padding: 8px 16px;
+        }
+        @media (max-width: 768px) {
+          .top-apply-actions {
+            width: 100%;
+            justify-content: flex-start;
+          }
+          .top-apply-actions .el-button {
+            flex: 1;
+            min-width: 90px;
+          }
+        }
+
+  
+        .hero-actions {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 12px;
+          flex-wrap: wrap;
+        }
+        .hero-actions .el-button,
+        .hero-actions .hero-logout,
+        .hero-actions button {
+          border-radius: 999px !important;
+          min-width: 82px;
+          height: 42px;
+          padding: 0 22px !important;
+          font-weight: 800;
+          font-size: 15px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          line-height: 1;
+        }
+        .hero-actions .hero-enable {
+          background: #63c83d !important;
+          border-color: #63c83d !important;
+          color: #fff !important;
+          box-shadow: none !important;
+        }
+        .hero-actions .hero-logout,
+        .hero-actions .hero-exit {
+          background: rgba(255,255,255,.12) !important;
+          border: 1px solid rgba(255,255,255,.28) !important;
+          color: #fff !important;
+          box-shadow: none !important;
+        }
+        @media (max-width: 768px) {
+          .hero-actions {
+            width: 100%;
+            justify-content: flex-start;
+            gap: 8px;
+            margin-top: 12px;
+          }
+          .hero-actions .el-button,
+          .hero-actions .hero-logout,
+          .hero-actions button {
+            min-width: 72px;
+            height: 38px;
+            padding: 0 16px !important;
+            font-size: 14px;
+          }
+        }
+
+  
+        .switch-line {
+          display: flex;
+          align-items: center;
+          gap: 12px;
+          flex-wrap: wrap;
+          margin: 8px 0;
+        }
+        .switch-line .switch-label {
+          min-width: 150px;
+          font-weight: 700;
+          color: #111827;
+        }
+        .switch-line .switch-desc {
+          color: #64748b;
+          font-size: 13px;
+        }
+        @media (max-width: 768px) {
+          .switch-line {
+            gap: 8px;
+          }
+          .switch-line .switch-label {
+            min-width: auto;
+            width: 100%;
+          }
+        }
+
+  
+        .scan-switch-list {
+          display: flex;
+          flex-direction: column;
+          gap: 12px;
+          margin: 4px 0 10px;
+        }
+        .scan-switch-row {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 14px;
+          padding: 12px 14px;
+          border-radius: 14px;
+          border: 1px solid #e5e7eb;
+          background: #f8fafc;
+        }
+        .scan-switch-row.rss-row {
+          background: #f0f9ff;
+          border-color: #bae6fd;
+        }
+        .scan-switch-row.manual-row {
+          background: #f0fdf4;
+          border-color: #bbf7d0;
+        }
+        .scan-switch-row.limit-row {
+          background: #fff7ed;
+          border-color: #fed7aa;
+        }
+        .scan-switch-title {
+          font-weight: 800;
+          color: #0f172a;
+          line-height: 1.3;
+        }
+        @media (max-width: 768px) {
+          .scan-switch-row {
+            padding: 11px 12px;
+          }
+        }
+
+  
+        .hero-mainline {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+          width: 100%;
+        }
+        .hero-mainline h1,
+        .hero-mainline .hero-title {
+          margin: 0;
+        }
+        .hero-mainline .hero-actions {
+          margin-left: auto;
+          flex-shrink: 0;
+        }
+        .hero-actions {
+          display: flex;
+          align-items: center;
+          justify-content: flex-end;
+          gap: 12px;
+          flex-wrap: nowrap;
+        }
+        .hero-actions .el-button,
+        .hero-actions .hero-logout,
+        .hero-actions button {
+          border-radius: 999px !important;
+          min-width: 82px;
+          height: 42px;
+          padding: 0 22px !important;
+          font-weight: 800;
+          font-size: 15px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          line-height: 1;
+        }
+        .hero-actions .hero-enable {
+          background: #63c83d !important;
+          border-color: #63c83d !important;
+          color: #fff !important;
+          box-shadow: none !important;
+        }
+        .hero-actions .hero-exit,
+        .hero-actions .hero-logout {
+          background: rgba(255,255,255,.12) !important;
+          border: 1px solid rgba(255,255,255,.28) !important;
+          color: #fff !important;
+          box-shadow: none !important;
+        }
+        .section-title-stack {
+          display: flex;
+          flex-direction: column;
+          align-items: flex-start;
+          gap: 10px;
+        }
+        .section-title-line {
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 12px;
+          width: 100%;
+        }
+        .section-toggle-only {
+          display: inline-flex;
+          align-items: center;
+        }
+        .section-edit-line {
+          width: 100%;
+        }
+        .section-edit-line .el-button {
+          width: 100%;
+          border-radius: 999px !important;
+          font-weight: 700;
+        }
+        @media (max-width: 768px) {
+          .page-hero,
+          .hero-card {
+            padding: 26px 24px !important;
+          }
+          .hero-mainline {
+            flex-direction: row;
+            align-items: center;
+            justify-content: space-between;
+            gap: 10px;
+          }
+          .hero-mainline h1,
+          .hero-mainline .hero-title {
+            font-size: 32px !important;
+            line-height: 1.1;
+            white-space: nowrap;
+          }
+          .hero-actions {
+            gap: 8px;
+            flex-wrap: nowrap;
+            width: auto;
+            margin-top: 0 !important;
+            justify-content: flex-end;
+          }
+          .hero-actions .el-button,
+          .hero-actions .hero-logout,
+          .hero-actions button {
+            min-width: 62px;
+            height: 36px;
+            padding: 0 14px !important;
+            font-size: 14px;
+          }
+          .section-title-bar {
+            align-items: stretch !important;
+          }
+          .section-title-line h2 {
+            font-size: 24px;
+            margin: 0;
+          }
+        }
+
+  
+        .unified-pill,
+        .section-edit-line .el-button,
+        .log-actions .el-button,
+        .runtime-log-actions .el-button,
+        .log-toolbar .el-button {
+          border-radius: 999px !important;
+          min-height: 38px;
+          padding: 0 18px !important;
+          font-weight: 800 !important;
+          font-size: 14px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          line-height: 1;
+        }
+        .section-edit-line .el-button,
+        .log-actions .el-button,
+        .runtime-log-actions .el-button,
+        .log-toolbar .el-button {
+          box-shadow: none !important;
+        }
+        .section-edit-line .el-button--primary,
+        .log-actions .el-button--primary,
+        .runtime-log-actions .el-button--primary,
+        .log-toolbar .el-button--primary {
+          background: #63c83d !important;
+          border-color: #63c83d !important;
+          color: #fff !important;
+        }
+        .section-edit-line .el-button--danger,
+        .log-actions .el-button--danger,
+        .runtime-log-actions .el-button--danger,
+        .log-toolbar .el-button--danger {
+          background: rgba(255,255,255,.12) !important;
+          border-color: rgba(239,68,68,.38) !important;
+          color: #ef4444 !important;
+        }
+        .log-actions,
+        .runtime-log-actions,
+        .log-toolbar {
+          display: flex;
+          align-items: center;
+          gap: 10px;
+          flex-wrap: wrap;
+        }
+        @media (max-width: 768px) {
+          .section-edit-line .el-button,
+          .log-actions .el-button,
+          .runtime-log-actions .el-button,
+          .log-toolbar .el-button {
+            min-height: 36px;
+            padding: 0 12px !important;
+            font-size: 13px;
+          }
+          .log-actions,
+          .runtime-log-actions,
+          .log-toolbar {
+            display: grid !important;
+            grid-template-columns: repeat(3, minmax(0, 1fr));
+            gap: 8px;
+            width: 100%;
+          }
+          .log-actions .el-button,
+          .runtime-log-actions .el-button,
+          .log-toolbar .el-button {
+            width: 100%;
+            margin: 0 !important;
+          }
+        }
+
+  
+        .filter-area-card {
+          border: 1px solid #e5e7eb;
+          border-radius: 18px;
+          padding: 16px 16px 8px;
+          margin: 14px 0;
+          background: #ffffff;
+        }
+        .filter-area-card.theme-area {
+          background: #f0f9ff;
+          border-color: #bae6fd;
+        }
+        .filter-area-card.comment-area {
+          background: #f0fdf4;
+          border-color: #bbf7d0;
+        }
+        .filter-area-card.ai-area {
+          background: #f8fafc;
+          border-color: #cbd5e1;
+        }
+        .filter-area-card.time-area {
+          background: #fff7ed;
+          border-color: #fed7aa;
+        }
+        .filter-area-title {
+          font-size: 16px;
+          font-weight: 900;
+          color: #0f172a;
+          margin-bottom: 12px;
+          display: flex;
+          align-items: center;
+          gap: 8px;
+        }
+
+  
+        /* final layout fixes */
+        .page-hero .hero-header {
+          width: 100%;
+          display: flex;
+          align-items: center;
+        }
+        .page-hero .hero-header > div {
+          width: 100%;
+        }
+        .hero-mainline {
+          width: 100%;
+          display: flex;
+          align-items: center;
+          justify-content: space-between;
+          gap: 16px;
+        }
+        .hero-mainline .hero-actions {
+          margin-left: auto;
+          justify-content: flex-end;
+          flex-shrink: 0;
+        }
+        .log-title-stack {
+          margin-bottom: 10px;
+        }
+        .log-title-stack .section-title-line {
+          align-items: center;
+        }
+        @media (min-width: 769px) {
+          .hero-mainline {
+            flex-direction: row;
+          }
+          .hero-mainline h1 {
+            flex: 0 0 auto;
+          }
+          .hero-mainline .hero-actions {
+            margin-left: auto;
+          }
+        }
+        @media (max-width: 768px) {
+          .hero-mainline {
+            flex-direction: row;
+            align-items: center;
+            justify-content: space-between;
+          }
+          .hero-mainline .hero-actions {
+            width: auto;
+            margin-left: auto;
+          }
+        }
+
+  
+        .log-limit-select {
+          width: 112px;
+        }
+        .log-limit-select .el-input__wrapper {
+          border-radius: 999px !important;
+          min-height: 38px;
+          box-shadow: 0 0 0 1px #d1d5db inset !important;
+        }
+        @media (max-width: 768px) {
+          .log-limit-select {
+            width: 100%;
+          }
+          .log-limit-select .el-input__wrapper {
+            min-height: 36px;
+          }
+        }
+
+  
+        .runtime-refresh-time {
+          margin-left: 10px;
+          font-size: 13px;
+          font-weight: 600;
+          color: #64748b;
+          white-space: nowrap;
+        }
+        @media (max-width: 768px) {
+          .runtime-refresh-time {
+            display: block;
+            margin-left: 0;
+            margin-top: 4px;
+            font-size: 12px;
+            white-space: normal;
+          }
+        }
+
+  </style>
+</head>
+<body class="auth-mode">
+<div id="app" v-cloak :class="{ 'auth-app': !isAuthenticated }">
+    <div class="page-hero" v-if="isAuthenticated">
+        <div class="hero-header">
+            <div>
+                <div class="hero-mainline">
+                    <h1>LET监控</h1>
+                    <div class="hero-actions" v-if="isAuthenticated">
+                        <el-button class="hero-enable" size="small" type="success" :loading="applyingConfig" @click="applyCurrentConfig">启用</el-button>
+                        <button class="hero-logout hero-exit" @click="logout">退出</button>
+                    </div>
+                </div>
+                <p></p>
+            </div>
+            
+        </div>
+    </div>
+
+    <template v-if="!isAuthenticated">
+        <div class="login-stage"></div>
+        <main class="login-page">
+            <section class="login-card">
+                <h1 class="login-title">LET监控</h1>
+                <div v-if="loginError" class="login-error">{{ loginError }}</div>
+
+                <form class="login-form" autocomplete="on" @submit.prevent="authenticate">
+                    <div class="login-field">
+                        <label for="username">用户名</label>
+                        <div class="login-input">
+                            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z" stroke="currentColor" stroke-width="1.8"/>
+                                <path d="M4.5 20a7.5 7.5 0 0 1 15 0" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                            </svg>
+                            <input id="username" v-model="username" name="username" type="text" placeholder="请输入用户名" autocomplete="username" required>
+                        </div>
+                    </div>
+
+                    <div class="login-field">
+                        <label for="password">密码</label>
+                        <div class="login-input">
+                            <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+                                <path d="M7 10V8a5 5 0 0 1 10 0v2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                                <path d="M6.5 10h11A1.5 1.5 0 0 1 19 11.5v7A1.5 1.5 0 0 1 17.5 20h-11A1.5 1.5 0 0 1 5 18.5v-7A1.5 1.5 0 0 1 6.5 10Z" stroke="currentColor" stroke-width="1.8"/>
+                            </svg>
+                            <input id="password" v-model="accessToken" name="password" type="password" placeholder="请输入密码" autocomplete="current-password" required>
+                        </div>
+                    </div>
+
+                    <button class="login-button" type="submit">登录</button>
+                </form>
+            </section>
+        </main>
+    </template>
+
+    <div v-else>
+        <div class="card">
+            <h2>扫描总开关</h2>
+            <el-form label-position="top">
+                <div class="scan-switch-list">
+                    <div class="scan-switch-row rss-row">
+                        <span class="scan-switch-title">RSS 新主题帖扫描</span>
+                        <el-switch v-model="config.enable_rss"></el-switch>
+                    </div>
+                    <div class="scan-switch-row manual-row">
+                        <span class="scan-switch-title">手动帖子楼层扫描</span>
+                        <el-switch v-model="config.enable_extra_urls"></el-switch>
+                    </div>
+                </div>
+
+            </el-form>
+        </div>
+
+        <div class="card">
+            <div class="section-title-bar section-title-stack">
+                <div class="section-title-line">
+                    <h2>基础配置</h2>
+                    <div class="section-toggle-only">
+                        <el-switch v-model="showBasicConfig"></el-switch>
+                    </div>
+                </div>
+                <div class="section-edit-line" v-if="showBasicConfig">
+                    <el-button class="unified-pill" v-if="!basicEditing" size="small" type="primary" plain @click="enterBasicEdit">修改</el-button>
+                    <el-button class="unified-pill" v-if="basicEditing" size="small" type="success" @click="saveBasicConfig">保存</el-button>
+                </div>
+            </div>
+            <div v-show="showBasicConfig">
+                
+                <el-form label-position="top" :disabled="!basicEditing" :class="{ 'readonly-zone': !basicEditing }">
+                <el-form-item label="RSS URLs（每行一个）">
+                    <el-input v-model="config.urls_text" type="textarea" :rows="3" placeholder="https://lowendspirit.com/categories/offers/feed.rss&#10;https://lowendtalk.com/categories/offers/feed.rss"></el-input>
+                    
+                </el-form-item>
+
+                <el-form-item label="自动添加命中主题帖到手动帖子链接">
+                    <el-switch v-model="config.auto_add_rss_hits_to_extra_urls"></el-switch>
+                    <div class="hint">默认关闭。开启后，RSS 命中的主题帖链接会自动追加到下方“手动帖子链接”，7 天后自动删除；是否扫描这些链接仍受顶部“手动帖子楼层扫描”开关控制。</div>
+                </el-form-item>
+
+                <el-form-item label="手动帖子链接（每行一个）">
+                    <el-input v-model="config.extra_urls_text" type="textarea" :rows="4" placeholder="https://example.com/discussion/xxxx"></el-input>
+                </el-form-item>
+
+
+
+                <el-form-item label="RSS 监控周期（秒）">
+                    <el-input-number v-model="config.rss_interval" :min="30" :step="10"></el-input-number>
+                </el-form-item>
+                <el-form-item label="爬楼监控间隔（秒）">
+                    <el-input-number v-model="config.comment_interval" :min="30" :step="10"></el-input-number>
+                </el-form-item>
+
+                <el-form-item label="选择通知方式">
+                    <el-select v-model="config.notice_type" placeholder="选择通知方式">
+                        <el-option label="Telegram" value="telegram"></el-option>
+                        <el-option label="PushPlus" value="wechat"></el-option>
+                        <el-option label="ntfy" value="ntfy"></el-option>
+                        <el-option label="Gotify" value="gotify"></el-option>
+                        <el-option label="自定义 URL" value="custom"></el-option>
+                    </el-select>
+                </el-form-item>
+
+                <template v-if="config.notice_type === 'telegram'">
+                    <el-form-item label="Telegram Bot Token">
+                        <el-input v-model="config.telegrambot" placeholder="Telegram Bot Token"></el-input>
+                    </el-form-item>
+                    <el-form-item label="Telegram Chat ID">
+                        <el-input v-model="config.chat_id" placeholder="Telegram Chat ID"></el-input>
+                    </el-form-item>
+                    <el-button :loading="testingTelegram" type="success" plain :disabled="!basicEditing" @click="testTelegram">测试 Telegram 连通性</el-button>
+                </template>
+
+                <template v-if="config.notice_type === 'wechat'">
+                    <el-form-item label="PushPlus Token">
+                        <el-input v-model="config.wechat_key" placeholder="PushPlus Token"></el-input>
+                    </el-form-item>
+                    <el-button :loading="testingPushPlus" type="success" plain :disabled="!basicEditing" @click="testPushPlus">测试 PushPlus</el-button>
+                </template>
+
+
+                    
+                    <template v-if="config.notice_type === 'gotify'">
+                        <el-form-item label="Gotify 服务地址">
+                            <el-input v-model="config.gotify_server" placeholder="例如：http://127.0.0.1:8080 或 https://gotify.example.com"></el-input>
+                        </el-form-item>
+                        <el-form-item label="Gotify Token">
+                            <el-input v-model="config.gotify_token" type="password" show-password placeholder="Gotify App Token"></el-input>
+                        </el-form-item>
+                        <el-form-item label="Gotify 优先级">
+                            <el-input-number v-model="config.gotify_priority" :min="0" :max="10" :step="1"></el-input-number>
+                        </el-form-item>
+                        <el-button :loading="testingGotify" type="success" plain :disabled="!basicEditing" @click="testGotify">测试 Gotify</el-button>
+                    </template>
+
+<template v-if="config.notice_type === 'ntfy'">
+                        <el-form-item label="ntfy 自建服务地址">
+                            <el-input v-model="config.ntfy_server" placeholder="同一台服务器本机调用推荐：http://127.0.0.1:8083；外部访问默认：https://sharq.eu.org:2085"></el-input>
+                        </el-form-item>
+                        <el-form-item label="ntfy Topic">
+                            <el-input v-model="config.ntfy_topic" placeholder="例如：let_xxxxx_random"></el-input>
+                        </el-form-item>
+                        <el-form-item label="ntfy 用户名">
+                            <el-input v-model="config.ntfy_username" placeholder="如果没有认证可留空"></el-input>
+                        </el-form-item>
+                        <el-form-item label="ntfy 密码">
+                            <el-input v-model="config.ntfy_password" type="password" show-password placeholder="如果没有认证可留空"></el-input>
+                        </el-form-item>
+                        <el-form-item label="ntfy 优先级">
+                            <el-input-number v-model="config.ntfy_priority" :min="1" :max="5" :step="1"></el-input-number>
+                            <div class="hint">ntfy 优先级范围 1-5，默认 1。</div>
+                        </el-form-item>
+                        <el-button :loading="testingNtfy" type="success" plain :disabled="!basicEditing" @click="testNtfy">测试 ntfy</el-button>
+                    </template>
+
+<template v-if="config.notice_type === 'custom'">
+                    <el-form-item label="自定义 URL">
+                        <el-input v-model="config.custom_url" placeholder="Custom Notification URL，使用 {message} 作为消息占位"></el-input>
+                    </el-form-item>
+                </template>
+            </el-form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="section-title-bar section-title-stack">
+                <div class="section-title-line">
+                    <h2>过滤配置</h2>
+                    <div class="section-toggle-only">
+                        <el-switch v-model="showFilterConfig"></el-switch>
+                    </div>
+                </div>
+                <div class="section-edit-line" v-if="showFilterConfig">
+                    <el-button class="unified-pill" v-if="!filterEditing" size="small" type="primary" plain @click="enterFilterEdit">修改</el-button>
+                    <el-button class="unified-pill" v-if="filterEditing" size="small" type="success" @click="saveFilterConfig">保存</el-button>
+                </div>
+            </div>
+            <div v-show="showFilterConfig">
+                
+                <el-form label-position="top" :disabled="!filterEditing" :class="{ 'readonly-zone': !filterEditing }">
+
+                <div class="filter-area-card theme-area">
+                    <div class="filter-area-title">① 主题过滤设置</div>
+                    <el-form-item label="主题关键词过滤">
+                        <el-checkbox v-model="config.use_thread_keywords_filter">启用</el-checkbox>
+                    </el-form-item>
+                    <template v-if="config.use_thread_keywords_filter">
+                        <el-form-item label="主题关键词规则（空格或逗号分隔规则，多个关键词采用 & 间隔）">
+                            <el-input v-model="config.thread_keywords_rule" placeholder="例如：greencloud greencloud&flash"></el-input>
+                        </el-form-item>
+                    </template>
+                </div>
+
+                <div class="filter-area-card comment-area">
+                    <div class="filter-area-title">② 楼层过滤设置</div>
+                    <el-form-item label="评论过滤模式">
+                        <el-select v-model="config.comment_filter" placeholder="选择评论过滤模式" clearable>
+                            <el-option label="不过滤评论作者/角色" value=""></el-option>
+                            <el-option label="按角色过滤" value="by_role"></el-option>
+                            <el-option label="仅作者评论" value="by_author"></el-option>
+                        </el-select>
+                    </el-form-item>
+                    <el-form-item label="楼层关键词过滤">
+                        <el-checkbox v-model="config.use_comment_keywords_filter">启用</el-checkbox>
+                    </el-form-item>
+                    <template v-if="config.use_comment_keywords_filter">
+                        <el-form-item label="楼层关键词规则（空格或逗号分隔规则，多个关键词采用 & 间隔）">
+                            <el-input v-model="config.comment_keywords_rule" placeholder="例如：restock stock coupon greencloudvps.com/billing"></el-input>
+                        </el-form-item>
+                    </template>
+                </div>
+
+                <div class="filter-area-card ai-area">
+                    <div class="filter-area-title">③ AI过滤设置</div>
+                    <el-form-item label="启用 AI 过滤">
+                        <el-checkbox v-model="config.use_ai_filter"></el-checkbox>
+                    </el-form-item>
+                    <template v-if="config.use_ai_filter">
+                        <el-form-item label="Cloudflare Account ID">
+                            <el-input v-model="config.cf_account_id" placeholder="Cloudflare Account ID"></el-input>
+                        </el-form-item>
+                        <el-form-item label="Cloudflare Token">
+                            <el-input v-model="config.cf_token" placeholder="Cloudflare Token" show-password></el-input>
+                        </el-form-item>
+                        <el-form-item label="模型">
+                            <el-input v-model="config.model" placeholder="@cf/qwen/qwen1.5-14b-chat-awq"></el-input>
+                        </el-form-item>
+                        <el-button :loading="testingAI" type="success" plain :disabled="!filterEditing" @click="testWorkersAI">测试 Workers AI 有效性</el-button>
+                        <el-form-item label="主题帖 AI 提示词">
+                            <el-input v-model="config.thread_prompt" type="textarea" :rows="3"></el-input>
+                        </el-form-item>
+                        <el-form-item label="楼层评论 AI 提示词">
+                            <el-input v-model="config.comment_prompt" type="textarea" :rows="3"></el-input>
+                        </el-form-item>
+                    </template>
+                </div>
+
+                <div class="filter-area-card time-area">
+                    <div class="filter-area-title">④ 时间设置</div>
+                    <el-form-item label="24H 命中推送限制">
+                        <el-select v-model="config.restrict_24h" placeholder="选择是否启用">
+                            <el-option label="启用" :value="true"></el-option>
+                            <el-option label="关闭" :value="false"></el-option>
+                        </el-select>
+                    </el-form-item>
+                </div>
+
+</el-form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="section-title-bar section-title-stack log-title-stack">
+                <div class="section-title-line">
+                    <h2 style="margin: 0;">运行日志 <span v-if="runtimeLastRefresh" class="runtime-refresh-time">上一次刷新：{{ runtimeLastRefresh }}</span> <span v-if="aiStats" class="runtime-refresh-time" style="color:#e6a23c;">AI今日：{{ aiStats.calls }}次 / 失败{{ aiStats.failures }}次</span></h2>
+                    <div class="section-toggle-only">
+                        <el-switch v-model="showLogs"></el-switch>
+                    </div>
+                </div>
+            </div>
+            <div class="log-actions" v-if="showLogs">
+                <el-button class="unified-pill" size="small" @click="fetchLogs">刷新</el-button>
+                <el-button class="unified-pill" size="small" :type="logMode === 'rss_all' ? 'success' : 'default'" plain @click="setLogMode('rss_all')">RSS全部</el-button>
+                <el-button class="unified-pill" size="small" :type="logMode === 'rss_hits' ? 'success' : 'default'" plain @click="setLogMode('rss_hits')">RSS命中</el-button>
+                <el-button class="unified-pill" size="small" :type="logMode === 'comment_all' ? 'success' : 'default'" plain @click="setLogMode('comment_all')">楼层全部</el-button>
+                <el-button class="unified-pill" size="small" :type="logMode === 'comment_hits' ? 'success' : 'default'" plain @click="setLogMode('comment_hits')">楼层命中</el-button>
+                <el-button class="unified-pill" size="small" type="danger" plain @click="clearRuntimeLogs">重置</el-button>
+            </div>
+            
+
+            <div v-show="showLogs">
+                <div class="table-scroll-wrap">
+                <el-table :data="displayRuntimeLogs" size="small" border style="width: 100%;" empty-text="暂无运行日志" :row-class-name="rowClassName">
+                    <el-table-column label="时间" width="118">
+                        <template #default="scope">
+                            <div class="compact-cell">
+                                <span v-if="scope.row.pinned" class="pin">📌</span>
+                                {{ compactTime(scope.row.checked_at) }}
+                            </div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="类型" width="58">
+                        <template #default="scope">
+                            <div class="compact-cell">{{ scope.row.type === 'thread' ? '主题' : '楼层' }}</div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="结果" width="62">
+                        <template #default="scope">
+                            <span :class="scope.row.matched ? 'matched' : 'missed'">
+                                {{ scope.row.matched ? '命中' : '未命中' }}
+                            </span>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="作者" width="82">
+                        <template #default="scope">
+                            <div class="compact-cell">{{ scope.row.author || '-' }}</div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="原因 / 特征" min-width="165">
+                        <template #default="scope">
+                            <div class="reason-cell">{{ scope.row.reason }}</div>
+                            <div>
+                                <el-tag v-for="f in visibleFeatures(scope.row.features)" :key="f" size="small" class="feature-tag" :type="featureTagType(f, scope.row)">{{ f }}</el-tag>
+                            </div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="标题 / 推送" min-width="260">
+                        <template #default="scope">
+                            <div class="title-text">{{ scope.row.thread_title }}</div>
+                            <div v-if="scope.row.matched && scope.row.push_message" class="push-preview" :title="scope.row.push_message" v-html="linkifyText(scope.row.push_message)"></div>
+                            <div v-else class="message-preview" :title="scope.row.message_preview" v-html="linkifyText(scope.row.message_preview)"></div>
+                        </template>
+                    </el-table-column>
+                    <el-table-column label="链接" width="58">
+                        <template #default="scope">
+                            <a v-if="scope.row.url" :href="scope.row.url" target="_blank">打开</a>
+                        </template>
+                    </el-table-column>
+                </el-table>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/vue@3.5.13/dist/vue.global.prod.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/axios@1.7.9/dist/axios.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/element-plus@2.8.8/dist/index.full.min.js"></script>
+<script>
+const { createApp } = Vue;
+
+createApp({
+    data() {
+        return {
+            isAuthenticated: false,
+            username: localStorage.getItem('username') || 'admin',
+            loginError: '',
+            accessToken: localStorage.getItem('accessToken') || '',
+            testingTelegram: false,
+            testingPushPlus: false,
+            testingNtfy: false,
+            testingGotify: false,
+            applyingConfig: false,
+            testingAI: false,
+            showLogs: localStorage.getItem('showRuntimeLogs') !== 'false',
+            // 四个独立视图各自的数据（与后端 rss_all / rss_hits / comment_all / comment_hits 一一对应）
+            rssAllLogs: [],
+            rssHitsLogs: [],
+            commentAllLogs: [],
+            commentHitsLogs: [],
+            runtimeLastRefresh: '',
+            aiStats: null,
+            logMode: localStorage.getItem('runtimeLogMode') || 'rss_all',
+            showBasicConfig: false,
+            showFilterConfig: false,
+            basicEditing: false,
+            filterEditing: false,
+            basicSnapshot: null,
+            filterSnapshot: null,
+            logTimer: null,
+            config: {
+                enable_rss: false,
+                enable_extra_urls: false,
+                auto_add_rss_hits_to_extra_urls: false,
+                auto_extra_urls: {},
+                restrict_24h: true,
+                rss_interval: 300,
+                comment_interval: 300,
+                rss_scan_limit: 10,
+                telegrambot: '',
+                chat_id: '',
+                notice_type: 'telegram',
+                wechat_key: '',
+                custom_url: '',
+                gotify_priority: 5,
+                gotify_token: '',
+                gotify_server: '',
+                ntfy_password: '',
+                ntfy_username: '',
+                ntfy_server: 'http://127.0.0.1:8083',
+                ntfy_priority: 1,
+                ntfy_topic: '',
+                cf_account_id: '',
+                cf_token: '',
+                model: '',
+                thread_prompt: '',
+                comment_prompt: '',
+                use_thread_keywords_filter: false,
+                thread_keywords_rule: '',
+                use_comment_keywords_filter: false,
+                comment_keywords_rule: '',
+                use_ai_filter: false,
+                comment_filter: 'by_author',
+                urls: [
+                    'https://lowendspirit.com/categories/offers/feed.rss',
+                    'https://lowendtalk.com/categories/offers/feed.rss'
+                ],
+                urls_text: '',
+                extra_urls: [],
+                extra_urls_text: ''
+            }
+        };
+    },
+    computed: {
+        displayRuntimeLogs() {
+            // 四个视图完全独立，各自从自己的数据数组取最近 50 条，互不干扰。
+            if (this.logMode === 'rss_hits') return (this.rssHitsLogs || []).slice(0, 50);
+            if (this.logMode === 'comment_all') return (this.commentAllLogs || []).slice(0, 50);
+            if (this.logMode === 'comment_hits') return (this.commentHitsLogs || []).slice(0, 50);
+            return (this.rssAllLogs || []).slice(0, 50);
+        }
+    },
+
+    watch: {
+        showLogs(val) {
+            localStorage.setItem('showRuntimeLogs', val ? 'true' : 'false');
+            if (val) this.fetchLogs();
+        }
+    },
+    methods: {
+        authHeader() { return { 'Authorization': `Bearer ${this.accessToken}` }; },
+        setLogMode(mode) {
+            const allowed = ['rss_all', 'rss_hits', 'comment_all', 'comment_hits'];
+            this.logMode = allowed.includes(mode) ? mode : 'rss_all';
+            localStorage.setItem('runtimeLogMode', this.logMode);
+            this.fetchLogs();
+        },
+        fetchLogs() {
+            if (!this.isAuthenticated || !this.showLogs) return;
+            axios.get(`/api/runtime-logs?view=${this.logMode}`, { headers: this.authHeader() }).then(response => {
+                this.runtimeLastRefresh = response.data.server_time || this.runtimeLastRefresh;
+                this.aiStats = response.data.ai_stats || null;
+                const rows = response.data.logs || [];
+                if (this.logMode === 'rss_all') this.rssAllLogs = rows;
+                else if (this.logMode === 'rss_hits') this.rssHitsLogs = rows;
+                else if (this.logMode === 'comment_all') this.commentAllLogs = rows;
+                else if (this.logMode === 'comment_hits') this.commentHitsLogs = rows;
+            });
+        },
+        normalizeConfig(data) {
+            this.config = Object.assign({}, this.config, data || {});
+            if (this.config.enable_rss === undefined) this.config.enable_rss = false;
+            if (this.config.enable_extra_urls === undefined) this.config.enable_extra_urls = false;
+            if (this.config.auto_add_rss_hits_to_extra_urls === undefined) this.config.auto_add_rss_hits_to_extra_urls = false;
+            if (!this.config.auto_extra_urls || typeof this.config.auto_extra_urls !== 'object' || Array.isArray(this.config.auto_extra_urls)) this.config.auto_extra_urls = {};
+            if (this.config.comment_filter === undefined || this.config.comment_filter === null || this.config.comment_filter === '') this.config.comment_filter = 'by_author';
+            if (this.config.restrict_24h === undefined) this.config.restrict_24h = true;
+            if (this.config.use_thread_keywords_filter === undefined) this.config.use_thread_keywords_filter = false;
+            if (this.config.thread_keywords_rule === undefined) this.config.thread_keywords_rule = '';
+            if (this.config.use_comment_keywords_filter === undefined) this.config.use_comment_keywords_filter = this.config.use_keywords_filter || false;
+            if (this.config.comment_keywords_rule === undefined) this.config.comment_keywords_rule = this.config.keywords_rule || '';
+            this.config.urls_text = this.config.urls ? this.config.urls.join('\n') : '';
+            this.config.extra_urls_text = this.config.extra_urls ? this.config.extra_urls.join('\n') : '';
+        },
+        buildConfigToSend() {
+            const configToSend = { ...this.config };
+            configToSend.urls = (this.config.urls_text || '').split('\n').map(url => url.trim()).filter(Boolean);
+            configToSend.extra_urls = (this.config.extra_urls_text || '').split('\n').map(url => url.trim()).filter(Boolean);
+            configToSend.rss_interval = Number(configToSend.rss_interval || 300);
+            configToSend.comment_interval = Number(configToSend.comment_interval || 300);
+            configToSend.rss_scan_limit = 20;
+            delete configToSend.frequency;
+            delete configToSend.urls_text;
+            delete configToSend.extra_urls_text;
+            return configToSend;
+        },
+        authenticate() {
+            this.loginError = '';
+            if ((this.username || '').trim() !== 'admin') {
+                this.loginError = '用户名错误';
+                return;
+            }
+            if (!this.accessToken.trim()) {
+                this.loginError = '请输入密码';
+                return;
+            }
+            axios.get('/api/config', { headers: this.authHeader() }).then(response => {
+                this.normalizeConfig(response.data);
+                this.isAuthenticated = true;
+                localStorage.setItem('username', this.username || 'admin');
+                localStorage.setItem('accessToken', this.accessToken);
+                document.body.classList.remove('auth-mode');
+                if (this.showLogs) this.fetchLogs();
+            }).catch(error => {
+                this.isAuthenticated = false;
+                document.body.classList.add('auth-mode');
+                this.loginError = error.response && error.response.status === 401 ? '密码无效' : '网络错误';
+            });
+        },
+        fetchConfig() {
+            axios.get('/api/config', { headers: this.authHeader() }).then(response => {
+                this.normalizeConfig(response.data);
+                ElementPlus.ElMessage.success('配置已刷新');
+            });
+        },
+        cloneConfig() {
+            return JSON.parse(JSON.stringify(this.config));
+        },
+        enterBasicEdit() {
+            this.basicSnapshot = this.cloneConfig();
+            this.basicEditing = true;
+        },
+        enterFilterEdit() {
+            this.filterSnapshot = this.cloneConfig();
+            this.filterEditing = true;
+        },
+        saveBasicConfig() {
+            this.updateConfig(() => {
+                this.basicEditing = false;
+                this.basicSnapshot = null;
+            });
+        },
+        saveFilterConfig() {
+            this.updateConfig(() => {
+                this.filterEditing = false;
+                this.filterSnapshot = null;
+            });
+        },
+        cancelBasicEdit() {
+            if (this.basicSnapshot) {
+                this.normalizeConfig(this.basicSnapshot);
+            }
+            this.basicEditing = false;
+            this.basicSnapshot = null;
+        },
+        cancelFilterEdit() {
+            if (this.filterSnapshot) {
+                this.normalizeConfig(this.filterSnapshot);
+            }
+            this.filterEditing = false;
+            this.filterSnapshot = null;
+        },
+        applyCurrentConfig() {
+            this.applyingConfig = true;
+            axios.post('/api/config', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                ElementPlus.ElMessage.success(response.data.message || '当前配置已启用');
+                this.fetchConfig();
+                if (this.showLogs) this.fetchLogs();
+            }).catch(() => {
+                ElementPlus.ElMessage.error('启用失败，请查看后端日志');
+            }).finally(() => {
+                this.applyingConfig = false;
+            });
+        },
+        updateConfig(callback) {
+            axios.post('/api/config', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                ElementPlus.ElMessage.success(response.data.message || '配置已保存');
+                this.fetchConfig();
+                if (typeof callback === 'function') callback();
+            }).catch(() => ElementPlus.ElMessage.error('保存失败'));
+        },
+        testTelegram() {
+            this.testingTelegram = true;
+            axios.post('/api/test/telegram', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                response.data.ok ? ElementPlus.ElMessage.success(response.data.message) : ElementPlus.ElMessage.error(response.data.message);
+            }).catch(error => {
+                ElementPlus.ElMessage.error((error.response && error.response.data && error.response.data.message) || 'Telegram 测试请求失败');
+            }).finally(() => this.testingTelegram = false);
+        },
+        testPushPlus() {
+            this.testingPushPlus = true;
+            axios.post('/api/test/pushplus', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                if (response.data.ok) {
+                    ElementPlus.ElMessage.success(response.data.message || 'PushPlus 测试成功');
+                } else {
+                    ElementPlus.ElMessage.error(response.data.message || 'PushPlus 测试失败');
+                }
+            }).catch(error => {
+                const msg = error.response && error.response.data && error.response.data.message ? error.response.data.message : 'PushPlus 测试请求失败';
+                ElementPlus.ElMessage.error(msg);
+            }).finally(() => {
+                this.testingPushPlus = false;
+            });
+        },
+        testGotify() {
+            this.testingGotify = true;
+            axios.post('/api/test/gotify', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                response.data.ok ? ElementPlus.ElMessage.success(response.data.message) : ElementPlus.ElMessage.error(response.data.message);
+            }).catch(() => ElementPlus.ElMessage.error('Gotify 测试请求失败')).finally(() => {
+                this.testingGotify = false;
+            });
+        },
+        testNtfy() {
+            this.testingNtfy = true;
+            axios.post('/api/test/ntfy', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                response.data.ok ? ElementPlus.ElMessage.success(response.data.message) : ElementPlus.ElMessage.error(response.data.message);
+            }).catch(() => ElementPlus.ElMessage.error('ntfy 测试请求失败')).finally(() => {
+                this.testingNtfy = false;
+            });
+        },
+        testWorkersAI() {
+            this.testingAI = true;
+            axios.post('/api/test/workers-ai', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                response.data.ok ? ElementPlus.ElMessage.success(response.data.message) : ElementPlus.ElMessage.error(response.data.message);
+            }).catch(error => {
+                ElementPlus.ElMessage.error((error.response && error.response.data && error.response.data.message) || 'Workers AI 测试请求失败');
+            }).finally(() => this.testingAI = false);
+        },
+        compactTime(value) {
+            if (!value) return '';
+            return String(value).replace(' UTC', '').replace('2026-', '').replace('2025-', '').replace(' ', '\n');
+        },
+        escapeHtml(text) {
+            return String(text || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        },
+        linkifyText(text) {
+            const escaped = this.escapeHtml(text);
+            const urlRegex = /(https?:\/\/[^\s<>"'，。；；、)）\]]+)/g;
+            return escaped.replace(urlRegex, (url) => {
+                return `<a href="${url}" target="_blank" rel="noopener noreferrer">${url}</a>`;
+            });
+        },
+        featureTagType(feature, row) {
+            const f = String(feature || '');
+            if (/已推送|已补推|命中/.test(f)) return 'success';
+            if (/未推送|未命中|超过24小时|AI过滤未通过|主题关键词未命中/.test(f)) return 'info';
+            if (/第\d+条|RSS前10条/.test(f)) return row && row.matched ? 'success' : 'info';
+            return row && row.matched ? 'success' : 'info';
+        },
+        visibleFeatures(features) {
+            const hidden = new Set([
+                'manual_latest',
+                'manual_done',
+                'manual_absolute_top',
+                'manual_pinned',
+                'fresh_start_done',
+                'rss_top10',
+                'already_seen_thread'
+            ]);
+
+            return (features || []).map(f => String(f || '').trim()).filter(f => {
+                if (!f) return false;
+                if (hidden.has(f)) return false;
+                if (/^rss_index=/i.test(f)) return false;
+                if (/^rss_limit=/i.test(f)) return false;
+                if (/^start_page=/i.test(f)) return false;
+                if (/^end_page=/i.test(f)) return false;
+                if (/^parsed=/i.test(f)) return false;
+                if (/^new=/i.test(f)) return false;
+                if (/^pushed=/i.test(f)) return false;
+                if (/^filtered=/i.test(f)) return false;
+                return true;
+            });
+        },
+        rowClassName({ row }) {
+            return row && row.pinned ? 'manual-pinned-row' : '';
+        },
+        clearRuntimeLogs() {
+            ElementPlus.ElMessageBox.confirm('重置后所有日志和数据库将被清空，立即从第一页重新爬楼。确定？', '确认重置', { type: 'warning' }).then(() => {
+                axios.delete('/api/runtime-logs', { headers: this.authHeader() }).then(response => {
+                    this.rssAllLogs = [];
+                    this.rssHitsLogs = [];
+                    this.commentAllLogs = [];
+                    this.commentHitsLogs = [];
+                    ElementPlus.ElMessage.success(response.data.message || '已重置');
+                    setTimeout(() => this.fetchLogs(), 1500);
+                });
+            }).catch(() => {});
+        },
+        logout() {
+            this.isAuthenticated = false;
+            this.accessToken = '';
+            this.rssAllLogs = [];
+            this.rssHitsLogs = [];
+            this.commentAllLogs = [];
+            this.commentHitsLogs = [];
+            localStorage.removeItem('accessToken');
+            localStorage.setItem('username', 'admin');
+            this.username = 'admin';
+            document.body.classList.add('auth-mode');
+            if (this.logTimer) clearInterval(this.logTimer);
+        }
+    },
+    mounted() {
+        document.body.classList.toggle('auth-mode', !this.isAuthenticated);
+        if (this.accessToken && this.accessToken.trim()) {
+            this.authenticate();
+        }
+        this.logTimer = setInterval(() => {
+            if (this.isAuthenticated && this.showLogs) this.fetchLogs();
+        }, 10000);
+    },
+    beforeUnmount() {
+        if (this.logTimer) clearInterval(this.logTimer);
+    }
+}).use(ElementPlus).mount('#app');
+</script>
+</body>
+</html>

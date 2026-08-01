@@ -1,0 +1,9 @@
+Flask
+requests==2.28.2
+beautifulsoup4
+cfscrape
+python-dotenv
+lxml
+curl_cffi
+markdownify
+rich
