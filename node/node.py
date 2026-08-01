@@ -45,6 +45,7 @@ WEB_LOCK_FILE = WORK_DIR / ".node_keyword_web.lock"
 LOG_RESET_FILE = WORK_DIR / ".log_last_reset_day"
 RUN_ENABLED_FILE = WORK_DIR / ".node_run_enabled"
 WEB_RESTART_FILE = WORK_DIR / ".node_web_restart"
+KEYWORDS_FILE = WORK_DIR / "keywords.json"
 
 DEFAULT_URL = "https://rss.nodeseek.com/?sortBy=postTime"
 DEFAULT_WEB_HOST = os.environ.get("NODE_WEB_HOST", "0.0.0.0")
@@ -214,25 +215,30 @@ def unescape_shell_value(value: str) -> str:
 
 
 def read_keywords() -> str:
+    if KEYWORDS_FILE.exists():
+        try:
+            with KEYWORDS_FILE.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            return str(data.get("keywords", "")).strip()
+        except Exception:
+            return ""
     cfg = parse_shell_config(CONFIG_FILE)
-    return cfg.get("KEYWORDS", "").strip()
+    kw = cfg.get("KEYWORDS", "").strip()
+    if kw:
+        _save_keywords_json(kw)
+    return kw
+
+
+def _save_keywords_json(value: str) -> None:
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = KEYWORDS_FILE.with_suffix(".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        json.dump({"keywords": value}, fh, ensure_ascii=False)
+    tmp.replace(KEYWORDS_FILE)
 
 
 def update_keywords(new_value: str) -> None:
-    cfg = parse_shell_config(CONFIG_FILE)
-    cfg["KEYWORDS"] = new_value
-    WORK_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_FILE.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        for key in ["TG_BOT_TOKEN", "TG_PUSH_CHAT_ID", "PUSH_CHANNEL", "NTFY_URL", "NTFY_USERNAME", "NTFY_PASSWORD", "NTFY_TOPIC", "NTFY_PRIORITY", "NS_URL", "KEYWORDS", "INTERVAL_SEC", "DEBUG_LOG", "WEB_HOST", "WEB_PORT", "WEB_PIN", "WEB_DOMAIN"]:
-            val = cfg.get(key, "")
-            escaped = val.replace("\\", "\\\\").replace('"', '\\"').replace("\r", "").replace("\n", " ")
-            fh.write(f'{key}="{escaped}"\n')
-    tmp.replace(CONFIG_FILE)
-    try:
-        os.chmod(str(CONFIG_FILE), 0o600)
-    except Exception:
-        pass
+    _save_keywords_json(new_value)
 
 
 def keyword_web_settings(cfg: Dict[str, str]) -> Dict[str, str]:
@@ -806,6 +812,8 @@ class NodeMonitor:
 
     def clear_rss_logs(self) -> None:
         self._save_rss_log_data({"all_logs": [], "hit_logs": []})
+        self.state.entries.clear()
+        self.state.save()
 
     def _update_rss_push_status(self, ids: List[str], status: str) -> None:
         if not ids:
@@ -1333,7 +1341,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     button:active { transform: translateY(1px); }
     button.secondary { background: rgba(255,255,255,.10); border-color: rgba(255,255,255,.24); color: #e8f7ff; box-shadow: none; }
     button.active { background: #63c83d; border-color: #63c83d; color: #fff; box-shadow: none; }
-    button.danger { background: rgba(255,255,255,.08); border-color: rgba(239,68,68,.38); color: #ff8d8d; box-shadow: none; }
+    button.danger { background: rgba(220,38,38,.85); border-color: rgba(220,38,38,.85); color: #fff; box-shadow: none; }
     .msg { min-height: 20px; text-align: center; font-size: 14px; font-weight: 800; padding-top: 8px; }
     .msg.ok { color: #7fe8d8; }
     .msg.err { color: #ff9aa2; }
@@ -1664,7 +1672,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     }
 
     async function clearLogs() {
-      if (!confirm('确定清除RSS日志吗？不会清除已推送状态。')) return;
+      if (!confirm('彻底清除所有RSS日志和推送状态？')) return;
       try {
         await fetch('/api/rss-logs', { method: 'DELETE' });
         await fetchLogs(false);

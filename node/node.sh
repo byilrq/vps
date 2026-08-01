@@ -263,24 +263,6 @@ init_default_vars() {
     WEB_DOMAIN="${WEB_DOMAIN:-}"
 }
 
-read_config() {
-    if [ ! -s "$CONFIG_FILE" ]; then
-        return 1
-    fi
-    # shellcheck disable=SC1090
-    source "$CONFIG_FILE"
-    TG_BOT_TOKEN="${TG_BOT_TOKEN:-}"
-    TG_PUSH_CHAT_ID="${TG_PUSH_CHAT_ID:-}"
-    PUSH_CHANNEL="${PUSH_CHANNEL:-tg}"
-    NTFY_URL="${NTFY_URL:-http://127.0.0.1:8083}"
-    NTFY_USERNAME="${NTFY_USERNAME:-}"
-    NTFY_PASSWORD="${NTFY_PASSWORD:-}"
-    NTFY_TOPIC="${NTFY_TOPIC:-node}"
-    NTFY_PRIORITY="${NTFY_PRIORITY:-3}"
-    NS_URL="${NS_URL:-$DEFAULT_NS_URL}"
-    INTERVAL_SEC="${INTERVAL_SEC:-$DEFAULT_INTERVAL_SEC}"
-    return 0
-}
 
 write_config() {
     ensure_runtime_files
@@ -310,15 +292,7 @@ CFGEOF
 }
 
 ensure_config_exists() {
-    if read_config; then
-        init_default_vars
-        INTERVAL_SEC="${INTERVAL_SEC:-$DEFAULT_INTERVAL_SEC}"
-        if ! [[ "$INTERVAL_SEC" =~ ^[0-9]+$ ]] || (( INTERVAL_SEC < 15 )); then
-            INTERVAL_SEC="$DEFAULT_INTERVAL_SEC"
-        fi
-        WEB_HOST="0.0.0.0"
-        WEB_PORT="$DEFAULT_WEB_PORT"
-        write_config >/dev/null
+    if [ -s "$CONFIG_FILE" ]; then
         return 0
     fi
     init_default_vars
