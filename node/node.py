@@ -1350,7 +1350,8 @@ def build_keyword_handler(cfg: Dict[str, str]):
     .log-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
     h2 { margin: 0; font-size: 22px; letter-spacing: .6px; color: #effcff; }
     .log-meta { color: var(--muted); font-size: 13px; }
-    .log-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin: 10px 0 12px; }
+    .log-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 12px; }
+    .log-left { display: flex; align-items: center; gap: 10px; }
     .log-card { display: block; }
     .log-body { display: none; }
     .log-body.show { display: block; }
@@ -1392,8 +1393,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
       textarea { min-height: 88px; font-size: 15px; }
       .side-actions { flex-direction: row; min-width: 0; }
       .side-actions button { flex: 1; }
-      .log-actions { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; }
-      .log-actions button { min-width: 0; padding: 0 6px; font-size: 12px; }
+      .log-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      .log-left { display: flex; align-items: center; gap: 8px; }
+      .log-actions button, .log-left button { min-width: 0; padding: 0 6px; font-size: 12px; }
       .log-head { align-items: flex-start; }
     }
     /* 自定义确认弹窗 */
@@ -1478,9 +1480,10 @@ def build_keyword_handler(cfg: Dict[str, str]):
       <div id="logBody" class="log-body">
         <div class="log-meta" id="logMeta">等待刷新</div>
         <div class="log-actions">
-          <button type="button" class="secondary" onclick="fetchLogs(true)">刷新</button>
-          <button id="btnAll" type="button" class="active" onclick="setMode('all')">RSS全部</button>
-          <button id="btnHits" type="button" class="secondary" onclick="setMode('hits')">命中</button>
+          <div class="log-left">
+            <button id="btnAll" type="button" class="active" onclick="setMode('all')">RSS全部</button>
+            <button id="btnHits" type="button" class="secondary" onclick="setMode('hits')">命中</button>
+          </div>
           <button type="button" class="danger" onclick="clearLogs()">清除</button>
         </div>
         <div class="table-wrap">
@@ -1584,7 +1587,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
         });
         const data = await res.json();
         if (data && data.ok) setRunVisible(Boolean(data.enabled));
-        if (isLogVisible()) fetchLogs(false);
+        if (isLogVisible()) fetchLogs()
       } catch (err) {
         await fetchRunStatus();
         alert('运行状态设置失败');
@@ -1603,7 +1606,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
       body.classList.toggle('show', Boolean(visible));
       localStorage.setItem('nodeRssLogVisible', visible ? 'true' : 'false');
       if (visible) {
-        if (shouldFetch) fetchLogs(false);
+        if (shouldFetch) fetchLogs();
       } else if (logTimer) {
         clearInterval(logTimer);
         logTimer = null;
@@ -1617,7 +1620,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
       document.getElementById('btnAll').classList.toggle('secondary', logMode !== 'all');
       document.getElementById('btnHits').classList.toggle('active', logMode === 'hits');
       document.getElementById('btnHits').classList.toggle('secondary', logMode !== 'hits');
-      if (isLogVisible()) fetchLogs(false);
+      if (isLogVisible()) fetchLogs()
     }
 
     function renderLogs(logs) {
@@ -1647,12 +1650,11 @@ def build_keyword_handler(cfg: Dict[str, str]):
       }).join('');
     }
 
-    async function fetchLogs(manual) {
+    async function fetchLogs() {
       if (!isLogVisible()) {
         setLogVisible(true, false);
       }
       const meta = document.getElementById('logMeta');
-      if (manual) meta.textContent = '刷新中...';
       try {
         const res = await fetch(`/api/rss-logs?mode=${encodeURIComponent(logMode)}`, { cache: 'no-store' });
         const data = await res.json();
@@ -1668,14 +1670,14 @@ def build_keyword_handler(cfg: Dict[str, str]):
     function resetTimer(intervalSec) {
       if (logTimer) clearInterval(logTimer);
       if (!isLogVisible()) return;
-      logTimer = setInterval(() => fetchLogs(false), Math.max(15, intervalSec) * 1000);
+      logTimer = setInterval(() => fetchLogs(), Math.max(15, intervalSec) * 1000);
     }
 
     async function clearLogs() {
       if (!confirm('彻底清除所有RSS日志和推送状态？')) return;
       try {
         await fetch('/api/rss-logs', { method: 'DELETE' });
-        await fetchLogs(false);
+        await fetchLogs()
       } catch (err) {
         alert('清除失败');
       }
