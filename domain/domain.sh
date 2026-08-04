@@ -444,23 +444,26 @@ add_cron_renew() {
         return
     fi
 
-    # 续签命令（注意：certbot renew 会自动使用之前的验证方式）
-    local renew_cmd="/usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx' >> /var/log/certbot-renew.log 2>&1"
+    # 每日检查续签命令（certbot renew 自动检查所有证书，仅续签剩余<30天的）
+    local renew_cmd="/usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx'"
+    local log_renew_cmd="${renew_cmd} && echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] RENEW SUCCESS - all\" >> ${LOG_FILE} || echo \"[\$(date '+%Y-%m-%d %H:%M:%S')] RENEW FAILED - all\" >> ${LOG_FILE}"
 
     # 移除所有旧版 certbot 续签任务
     crontab -l 2>/dev/null | grep -Fv "certbot renew" | crontab -
 
-    (crontab -l 2>/dev/null; echo "0 6 1 * * $renew_cmd") | crontab -
-    msg_ok "已添加每月自动续签任务（每月1日 6:00 执行）。"
-    echo "当前任务: 0 6 1 * * $renew_cmd"
-    echo "日志文件: /var/log/certbot-renew.log"
+    (crontab -l 2>/dev/null; echo "0 6 * * * $log_renew_cmd") | crontab -
+    msg_ok "已添加每日自动续签任务（每日6:00检查，仅续签剩余<30天的证书）。"
+    echo "当前任务: 0 6 * * * $renew_cmd"
+    echo "操作日志: ${LOG_FILE}"
 
-    if [[ -f /var/log/certbot-renew.log ]]; then
+    if [[ -f "$LOG_FILE" ]]; then
         local last_renew
-        last_renew=$(tail -5 /var/log/certbot-renew.log 2>/dev/null || true)
+        last_renew=$(grep "RENEW" "$LOG_FILE" 2>/dev/null | tail -3 || true)
         if [[ -n "$last_renew" ]]; then
-            echo "最近续签日志:"
+            echo "最近续签记录:"
             echo "$last_renew"
+        else
+            echo "暂无续签记录（今晚6:00将首次检查）。"
         fi
     fi
     pause
@@ -532,7 +535,7 @@ show_cert_status() {
         fi
 
         local last_log
-        last_log=$(grep -E "${domain}" "$LOG_FILE" 2>/dev/null | tail -1)
+        last_log=$(grep -E "${domain}|RENEW" "$LOG_FILE" 2>/dev/null | tail -1)
         if [[ -n "$last_log" ]]; then
             echo "上次操作日志: ${last_log}"
         else
