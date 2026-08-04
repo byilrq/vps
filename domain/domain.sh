@@ -447,19 +447,22 @@ add_cron_renew() {
     # 续签命令（注意：certbot renew 会自动使用之前的验证方式）
     local renew_cmd="/usr/bin/certbot renew --quiet --post-hook 'systemctl reload nginx' >> /var/log/certbot-renew.log 2>&1"
 
-    # 检查是否已存在
-    local existing
-    existing=$(crontab -l 2>/dev/null | grep -F "$renew_cmd" || true)
-    if [[ -n "$existing" ]]; then
-        msg_ok "已存在自动续签任务，无需重复添加。"
-        echo "当前任务: $existing"
-        pause
-        return
-    fi
+    # 移除所有旧版 certbot 续签任务
+    crontab -l 2>/dev/null | grep -Fv "certbot renew" | crontab -
 
-    (crontab -l 2>/dev/null; echo "0 3 * * 0 $renew_cmd") | crontab -
-    msg_ok "已添加每周自动续签任务（每周日 3:00 执行）。"
+    (crontab -l 2>/dev/null; echo "0 6 1 * * $renew_cmd") | crontab -
+    msg_ok "已添加每月自动续签任务（每月1日 6:00 执行）。"
+    echo "当前任务: 0 6 1 * * $renew_cmd"
     echo "日志文件: /var/log/certbot-renew.log"
+
+    if [[ -f /var/log/certbot-renew.log ]]; then
+        local last_renew
+        last_renew=$(tail -5 /var/log/certbot-renew.log 2>/dev/null || true)
+        if [[ -n "$last_renew" ]]; then
+            echo "最近续签日志:"
+            echo "$last_renew"
+        fi
+    fi
     pause
 }
 
@@ -484,6 +487,83 @@ show_cert_status() {
             local name=$(basename "$d")
             [[ -z "$name" || "$name" == ".*" ]] && continue
             cert_domains+=("$name")
+        fi
+    done
+
+    if [[ ${#cert_domains[@]} -eq 0 ]]; then
+        msg_err "未找到有效的证书目录。"
+        pause
+        return
+    fi
+
+    for domain in "${cert_domains[@]}"; do
+        local cert_info cert_file
+        cert_info=$(get_cert_paths "$domain" 2>/dev/null || true)
+        if [[ -z "$cert_info" ]]; then
+            echo "----------------------------------------------------------------"
+            echo "域名: ${domain}"
+            echo "无法获取证书路径。"
+            continue
+        fi
+        cert_file=$(echo "$cert_info" | cut -d'|' -f2)
+
+        local not_before not_after
+        not_before=$(openssl x509 -in "$cert_file" -noout -startdate 2>/dev/null | cut -d= -f2)
+        not_after=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)
+
+        local expire_epoch issue_epoch
+        expire_epoch=$(date -d "$not_after" +%s 2>/dev/null || echo 0)
+        current_epoch=$(date +%s)
+        days_left=$(( (expire_epoch - current_epoch) / 86400 ))
+
+        echo "----------------------------------------------------------------"
+        echo "域名: ${domain}"
+        echo "签发时间: ${not_before:-未知}"
+        echo "过期时间: ${not_after:-未知}"
+        if [[ $days_left -ge 0 ]]; then
+            echo "剩余天数: ${days_left} 天"
+            if [[ $days_left -lt 30 ]]; then
+                msg_err "警告：证书将在 ${days_left} 天后过期，建议续签。"
+            else
+                msg_ok "证书状态正常。"
+            fi
+        else
+            msg_err "证书已过期！"
+        fi
+
+        local last_log
+        last_log=$(grep -E "${domain}" "$LOG_FILE" 2>/dev/null | tail -1)
+        if [[ -n "$last_log" ]]; then
+            echo "上次操作日志: ${last_log}"
+        else
+            echo "暂无操作日志记录。"
+        fi
+    done
+    echo "----------------------------------------------------------------"
+    pause
+}
+
+# -----------------------------
+#  删除证书（菜单4）
+# -----------------------------
+delete_certificate() {
+    echo "----------------------------------------------------------------"
+    echo "删除证书"
+    echo "----------------------------------------------------------------"
+
+    if [[ ! -d /etc/letsencrypt/live ]]; then
+        msg_err "尚未发现任何证书。"
+        pause
+        return
+    fi
+
+    local cert_domains=()
+    local idx=0
+    for d in /etc/letsencrypt/live/*; do
+        if [[ -d "$d" && -f "$d/fullchain.pem" && -f "$d/privkey.pem" ]]; then
+            local name=$(basename "$d")
+            [[ -z "$name" || "$name" == ".*" ]] && continue
+            cert_domains+=("$name")
             echo "  $((++idx))) $name"
         fi
     done
@@ -496,73 +576,26 @@ show_cert_status() {
 
     local choice
     echo
-    read -rp "请输入要查询的证书域名（或输入序号）: " choice
+    read -rp "请输入要删除的证书序号: " choice
 
-    local domain=""
-    if [[ "$choice" =~ ^[0-9]+$ ]] && [[ "$choice" -ge 1 ]] && [[ "$choice" -le ${#cert_domains[@]} ]]; then
-        domain="${cert_domains[$((choice-1))]}"
-    else
-        domain="$choice"
-    fi
-
-    if ! cert_files_exist "$domain"; then
-        msg_err "域名 '$domain' 的证书不存在，请重新输入。"
+    if [[ ! "$choice" =~ ^[0-9]+$ ]] || [[ "$choice" -lt 1 ]] || [[ "$choice" -gt ${#cert_domains[@]} ]]; then
+        msg_err "无效的序号。"
         pause
         return
     fi
 
-    local cert_info cert_file
-    cert_info=$(get_cert_paths "$domain" 2>/dev/null || true)
-    if [[ -z "$cert_info" ]]; then
-        msg_err "无法获取证书路径。"
-        pause
-        return
-    fi
-    cert_file=$(echo "$cert_info" | cut -d'|' -f2)
+    local domain="${cert_domains[$((choice-1))]}"
 
-    local not_before not_after
-    not_before=$(openssl x509 -in "$cert_file" -noout -startdate 2>/dev/null | cut -d= -f2)
-    not_after=$(openssl x509 -in "$cert_file" -noout -enddate 2>/dev/null | cut -d= -f2)
-
-    if [[ -z "$not_before" || -z "$not_after" ]]; then
-        msg_err "无法解析证书日期，请检查证书文件是否有效。"
+    read -rp "确认删除证书 '${domain}'？(Y/n): " confirm
+    if [[ "$confirm" != "Y" && "$confirm" != "y" ]]; then
+        msg_inf "已取消删除。"
         pause
         return
     fi
 
-    local expire_epoch issue_epoch
-    expire_epoch=$(date -d "$not_after" +%s 2>/dev/null || echo 0)
-    issue_epoch=$(date -d "$not_before" +%s 2>/dev/null || echo 0)
-    current_epoch=$(date +%s)
-    days_left=$(( (expire_epoch - current_epoch) / 86400 ))
-
-    echo "----------------------------------------------------------------"
-    echo "证书域名: ${domain}"
-    echo "上次更新（签发时间）: ${not_before}"
-    echo "过期时间: ${not_after}"
-    if [[ $days_left -ge 0 ]]; then
-        echo "剩余有效天数: ${days_left} 天"
-        if [[ $days_left -lt 30 ]]; then
-            msg_err "警告：证书将在 ${days_left} 天后过期，建议续签。"
-        else
-            msg_ok "证书状态正常。"
-        fi
-    else
-        msg_err "证书已过期！"
-    fi
-
-    if [[ -f "$LOG_FILE" ]]; then
-        local last_log
-        last_log=$(grep -E "${domain}" "$LOG_FILE" | tail -1)
-        if [[ -n "$last_log" ]]; then
-            echo "最近日志记录: $last_log"
-        else
-            echo "暂无操作日志记录。"
-        fi
-    else
-        echo "日志文件不存在，未记录历史操作。"
-    fi
-    echo "----------------------------------------------------------------"
+    certbot delete --cert-name "$domain" --non-interactive
+    log_action "$domain" "DELETED"
+    msg_ok "证书 '${domain}' 已删除。"
     pause
 }
 
@@ -583,14 +616,15 @@ menu() {
         echo -e "${gray}--------------------------------------------------${none}"
 
         echo -e " ${blue}${bold}1)${none} ${blue}申请域名证书${none}"
-        echo -e " ${green}${bold}2)${none} ${green}添加自动续签计划任务（每周检测并续签）${none}"
+        echo -e " ${green}${bold}2)${none} ${green}添加自动续签计划任务（每月检测并续签）${none}"
         echo -e " ${yellow}${bold}3)${none} ${yellow}显示证书状态（过期时间/签发时间）${none}"
+        echo -e " ${red}${bold}4)${none} ${red}删除证书${none}"
         echo -e "${gray}--------------------------------------------------${none}"
         echo -e " ${red}${bold}0)${none} 退出"
 
         echo -e "${gray}--------------------------------------------------${none}"
         echo -e "${dim}${gray}提示：输入数字后回车${none}"
-        echo -ne "${green}${bold}请选择 [0-3]${none}${green}: ${none}"
+        echo -ne "${green}${bold}请选择 [0-4]${none}${green}: ${none}"
 
         local choice=""
         read -r choice
@@ -599,6 +633,7 @@ menu() {
             1) request_certificate ;;
             2) add_cron_renew ;;
             3) show_cert_status ;;
+            4) delete_certificate ;;
             0) exit 0 ;;
             *) msg_err "无效输入，请重新选择。"; pause ;;
         esac
