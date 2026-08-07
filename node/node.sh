@@ -13,10 +13,12 @@ export TZ='Asia/Shanghai'
 WORK_DIR="/root/node"
 CONFIG_FILE="$WORK_DIR/node_config.txt"
 PYTHON_SCRIPT="$WORK_DIR/node.py"
+PUSH_SCRIPT="$WORK_DIR/push.py"
 SCRIPT_PATH="/root/node.sh"
 SERVICE_NAME="node"
 SERVICE_FILE="/etc/systemd/system/${SERVICE_NAME}.service"
 GITHUB_NODE_PY_URL="https://raw.githubusercontent.com/byilrq/vps/main/node/node.py"
+GITHUB_PUSH_PY_URL="${GITHUB_NODE_PY_URL%/node.py}/push.py"
 
 CRON_LOG="$WORK_DIR/node_cron.log"
 BOOT_LOG="$WORK_DIR/node_boot.log"
@@ -31,7 +33,8 @@ DEFAULT_WEB_PORT="8068"
 DEFAULT_WEB_PIN="0819"
 
 RED="\033[31m"; GREEN="\033[32m"; YELLOW="\033[33m"
-BLUE="\033[34m"; PURPLE="\033[35m"; WHITE="\033[37m"; PLAIN="\033[0m"
+BLUE="\033[34m"; PURPLE="\033[35m"; CYAN="\033[36m"; WHITE="\033[37m"
+BOLD="\033[1m"; PLAIN="\033[0m"
 
 ensure_runtime_files() {
     mkdir -p "$WORK_DIR"
@@ -199,8 +202,10 @@ ensure_permissions() {
     ensure_runtime_files
     normalize_text_file "$SCRIPT_PATH"
     normalize_text_file "$PYTHON_SCRIPT"
+    normalize_text_file "$PUSH_SCRIPT"
     chmod_if_needed "$SCRIPT_PATH"
     chmod_if_needed "$PYTHON_SCRIPT"
+    chmod_if_needed "$PUSH_SCRIPT"
 }
 
 python_ready() {
@@ -331,6 +336,25 @@ download_node_py() {
     echo -e "${GREEN}✅ node.py 已更新到 $PYTHON_SCRIPT${PLAIN}"
 }
 
+download_push_py() {
+    ensure_runtime_files
+    local tmp_file="$WORK_DIR/push.py.tmp"
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL "$GITHUB_PUSH_PY_URL" -o "$tmp_file"
+    elif command -v wget >/dev/null 2>&1; then
+        wget -qO "$tmp_file" "$GITHUB_PUSH_PY_URL"
+    else
+        return 1
+    fi
+    if [ ! -s "$tmp_file" ]; then
+        rm -f "$tmp_file"
+        return 1
+    fi
+    mv -f "$tmp_file" "$PUSH_SCRIPT"
+    chmod 755 "$PUSH_SCRIPT" 2>/dev/null || true
+    echo -e "${GREEN}✅ push.py 已更新到 $PUSH_SCRIPT${PLAIN}"
+}
+
 install_dependencies() {
     echo -e "${BLUE}开始安装/检查依赖...${PLAIN}"
     if command -v apt-get >/dev/null 2>&1; then
@@ -432,6 +456,7 @@ restart_node_service() {
 deploy_from_github() {
     ensure_runtime_files
     download_node_py || return 1
+    download_push_py || true
     ensure_config_exists
     cleanup_old_cron >/dev/null 2>&1 || true
 	setup_firewall          # <--- 新增这一行
@@ -635,8 +660,21 @@ show_status() {
     echo -e "${BLUE}======================================${PLAIN}"
 }
 
+run_push() {
+    if ! python_ready; then
+        echo -e "${RED}❌ 未检测到 python3，请先安装依赖。${PLAIN}"
+        return 1
+    fi
+    if [ ! -f "$PUSH_SCRIPT" ]; then
+        echo -e "${RED}❌ 未找到 $PUSH_SCRIPT，请先执行菜单 2 部署。${PLAIN}"
+        return 1
+    fi
+    ensure_permissions
+    python3 "$PUSH_SCRIPT" "$@"
+}
+
 test_notification() {
-    run_py test
+    run_push test
 }
 
 update_node_domain() {
@@ -765,37 +803,36 @@ fi
 main_menu() {
     while true; do
         clear
-        echo -e "${BLUE}======================================${PLAIN}"
-        echo -e "${PURPLE} node Python 监控管理菜单 ${PLAIN}"
-        echo -e "${BLUE}======================================${PLAIN}"
-        echo -e "${GREEN}1.${PLAIN} 安装依赖"
-        echo -e "${GREEN}2.${PLAIN} 安装系统"
-        echo -e "${GREEN}3.${PLAIN} 配置参数"
-        echo -e "${GREEN}4.${PLAIN} 停止运行"
-        echo -e "${GREEN}5.${PLAIN} 查看状态"
-        echo -e "${GREEN}6.${PLAIN} 卸载"
-        echo -e "${GREEN}7.${PLAIN} 重启"
-        echo -e "${GREEN}8.${PLAIN} 推送测试消息"
-	echo -e "${GREEN}9.${PLAIN} 更新域名/HTTPS"
-        echo -e "${WHITE}0.${PLAIN} 退出"
-        echo -e "${BLUE}======================================${PLAIN}"
-        read -rp "请选择操作 [0-9]: " choice
+        echo -e "${CYAN}┌────────────────────────────────────────────────┐${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${BOLD}${PURPLE}node 关键词监控管理面板${PLAIN}              ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}├────────────────────────────────────────────────┤${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${GREEN}1${PLAIN}）安装依赖                              ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${GREEN}2${PLAIN}）安装系统                              ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${YELLOW}3${PLAIN}）配置参数                              ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${BLUE}4${PLAIN}）查看状态                              ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${PURPLE}5${PLAIN}）重启服务                              ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${CYAN}6${PLAIN}）推送测试消息                          ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${YELLOW}7${PLAIN}）更新域名 / HTTPS                      ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}├────────────────────────────────────────────────┤${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${RED}8${PLAIN}）${RED}卸载${PLAIN}                              ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}│${PLAIN}  ${WHITE}0${PLAIN}）退出                                ${CYAN}│${PLAIN}"
+        echo -e "${CYAN}└────────────────────────────────────────────────┘${PLAIN}"
+        read -rp "  请选择操作 [0-8]: " choice
         echo
         case "$choice" in
             1) install_dependencies ;;
             2) deploy_from_github ;;
             3) configure_params ;;
-            4) stop_running ;;
-            5) show_status ;;
-            6) uninstall_service ;;
-            7) restart_node_service ;;
-            8) test_notification ;;
-			9) update_node_domain ;;
+            4) show_status ;;
+            5) restart_node_service ;;
+            6) test_notification ;;
+            7) update_node_domain ;;
+            8) uninstall_service ;;
             0) exit 0 ;;
-            *) echo "无效选项" ;;
+            *) echo -e "${RED}  无效选项，请重新选择${PLAIN}" ;;
         esac
         echo
-        read -rp "按 Enter 返回菜单..."
+        read -rp "  按 Enter 返回菜单..."
     done
 }
 

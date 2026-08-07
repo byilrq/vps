@@ -666,6 +666,7 @@ class NodeMonitor:
         """记录 RSS 全部日志和独立命中日志。命中日志不会被 RSS 全部滚动挤掉。"""
         self.reload_config()
         matcher = KeywordMatcher(self.config.get("KEYWORDS", ""))
+        silent_matcher = KeywordMatcher(self.config.get("SILENT_KEYWORDS", ""))
         now_value = now_str()
         data = self._load_rss_log_data()
         all_logs = data.get("all_logs", [])
@@ -685,6 +686,8 @@ class NodeMonitor:
             title = str(post.get("title", ""))
             url = str(post.get("url", ""))
             hit = matcher.match(title)
+            silent_hit = silent_matcher.match(title)
+            display_hit = hit or (f"静默:{silent_hit}" if silent_hit else "")
             old_all = all_by_id.get(id_, {})
             old_hit = hit_by_id.get(id_, {})
             sent, push_status = self._push_status_for_id(
@@ -696,16 +699,16 @@ class NodeMonitor:
                 "id": id_,
                 "title": title,
                 "url": url,
-                "matched": bool(hit),
-                "hit": hit,
+                "matched": bool(display_hit),
+                "hit": display_hit,
                 "sent": sent,
-                "push_status": push_status if hit else "",
+                "push_status": push_status if display_hit else "",
                 "checked_at": now_value,
                 "first_seen_at": str(old_all.get("first_seen_at") or now_value),
             }
             new_all.append(row)
 
-            if hit:
+            if display_hit:
                 hit_row = dict(old_hit) if old_hit else {}
                 hit_row.update(row)
                 hit_row["matched_at"] = str(old_hit.get("matched_at") or now_value)
@@ -726,6 +729,7 @@ class NodeMonitor:
     def get_rss_logs(self, mode: str = "all", limit: int = 20) -> List[Dict[str, object]]:
         self.reload_config()
         matcher = KeywordMatcher(self.config.get("KEYWORDS", ""))
+        silent_matcher = KeywordMatcher(self.config.get("SILENT_KEYWORDS", ""))
         data = self._load_rss_log_data()
 
         if not data.get("all_logs"):
@@ -736,35 +740,39 @@ class NodeMonitor:
                 id_ = str(entry.get("id", ""))
                 title = str(entry.get("title", ""))
                 hit = matcher.match(title)
+                silent_hit = silent_matcher.match(title)
+                display_hit = hit or (f"静默:{silent_hit}" if silent_hit else "")
                 sent, push_status = self._push_status_for_id(id_, fallback_sent=bool(entry.get("sent", False)))
                 row = {
                     "id": id_,
                     "title": title,
                     "url": str(entry.get("url", "")),
-                    "matched": bool(hit),
-                    "hit": hit,
+                    "matched": bool(display_hit),
+                    "hit": display_hit,
                     "sent": sent,
-                    "push_status": push_status if hit else "",
+                    "push_status": push_status if display_hit else "",
                     "checked_at": str(entry.get("seen_at") or now_str()),
                     "first_seen_at": str(entry.get("seen_at") or ""),
                 }
                 all_logs.append(row)
-                if hit:
+                if display_hit:
                     hit_row = dict(row)
                     hit_row["matched_at"] = str(entry.get("seen_at") or now_str())
                     hit_logs.append(hit_row)
             data = {"all_logs": all_logs, "hit_logs": hit_logs}
             self._save_rss_log_data(data)
 
-        rows = list(data.get("hit_logs" if mode in {"hit", "hits", "matched"} else "all_logs", []))
+        rows = list(data.get("all_logs", []))
 
         normalized: List[Dict[str, object]] = []
         for item in rows:
             row = dict(item)
             title = str(row.get("title", ""))
             hit = matcher.match(title)
-            row["matched"] = bool(hit)
-            row["hit"] = hit
+            silent_hit = silent_matcher.match(title)
+            display_hit = hit or (f"静默:{silent_hit}" if silent_hit else "")
+            row["matched"] = bool(display_hit)
+            row["hit"] = display_hit
             sent, push_status = self._push_status_for_id(
                 str(row.get("id", "")),
                 fallback_sent=bool(row.get("sent", False)),
@@ -1350,9 +1358,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
     .msg.ok { color: #7fe8d8; }
     .msg.err { color: #ff9aa2; }
     .hint-line { margin-top: 9px; display: flex; align-items: center; justify-content: center; gap: 8px; color: var(--muted); font-size: 12px; }
-    .title-rule { margin-top: 8px; color: rgba(224,241,252,.68); font-size: 13px; line-height: 1.55; }
+    .title-rule { margin-top: 8px; color: #8fd8c6; font-size: 12px; font-weight: 600; line-height: 1.55; }
     .log-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; flex-wrap: wrap; }
-    h2 { margin: 0; font-size: 22px; letter-spacing: .6px; color: #effcff; }
+    h2 { margin: 0; font-size: 22px; letter-spacing: .6px; color: #a3b2c0; text-shadow: 0 1px 0 rgba(0,0,0,.35); }
     .log-meta { color: var(--muted); font-size: 13px; }
     .log-actions { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 10px 0 12px; }
     .log-left { display: flex; align-items: center; gap: 10px; }
@@ -1386,7 +1394,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     .empty { text-align: center; color: var(--muted); padding: 28px 12px; }
     .keyword-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
     .silent-header { margin-top: 16px; }
-    .keyword-title { margin: 0; font-size: 22px; letter-spacing: .6px; color: #effcff; }
+    .keyword-title { margin: 0; font-size: 22px; letter-spacing: .6px; color: #a3b2c0; text-shadow: 0 1px 0 rgba(0,0,0,.35); }
     @media (max-width: 640px) {
       body { padding: 14px 10px; }
       .hero { padding: 22px 18px; border-radius: 24px; }
@@ -1466,12 +1474,12 @@ def build_keyword_handler(cfg: Dict[str, str]):
     <section class="card keyword-card">
       <form id="keywordForm" method="post" autocomplete="off">
         <div class="keyword-header">
-          <h2 class="keyword-title">关键词 <span class="title-rule">空格或逗号分隔规则，多个关键词采用 &amp; 间隔</span></h2>
+          <h2 class="keyword-title">关键词 <span class="title-rule">采用空格间隔，&amp;表示与关系</span></h2>
           <button id="actionBtn" type="button" onclick="handleAction()">__ACTION_LABEL__</button>
         </div>
           <textarea id="keywords" name="keywords" spellcheck="false" __READONLY__ placeholder="例如：抽奖 甲&乙 amd&7950x&盒装&国行">__SAFE_KEYWORDS__</textarea>
         <div class="keyword-header silent-header">
-          <h2 class="keyword-title">静默关键词 <span class="title-rule">格式同上，命中后按1级优先级推送</span></h2>
+          <h2 class="keyword-title">静默关键词 <span class="title-rule">采用空格间隔，&amp;表示与关系</span></h2>
         </div>
           <textarea id="silent_keywords" name="silent_keywords" spellcheck="false" __READONLY__ placeholder="例如：开机 测速&结果">__SAFE_SILENT_KEYWORDS__</textarea>
         <div class="__MSG_CLASS__">__SAFE_MESSAGE__</div>
