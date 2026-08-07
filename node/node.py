@@ -149,36 +149,18 @@ def load_runtime_config() -> Dict[str, str]:
     cfg.setdefault("WEB_PORT", str(DEFAULT_WEB_PORT))
     cfg.setdefault("WEB_PIN", DEFAULT_WEB_PIN)
     cfg.setdefault("WEB_DOMAIN", "")
-    cfg.setdefault("PUSH_CHANNEL", "tg")
     cfg.setdefault("NTFY_URL", "http://127.0.0.1:8083")
     cfg.setdefault("NTFY_USERNAME", "")
     cfg.setdefault("NTFY_PASSWORD", "")
     cfg.setdefault("NTFY_TOPIC", "node")
     cfg.setdefault("NTFY_PRIORITY", "3")
+    skw = read_silent_keywords()
+    cfg["SILENT_KEYWORDS"] = skw if skw else ""
     return cfg
 
 
-def normalize_push_channel(cfg: Dict[str, str]) -> str:
-    channel = (cfg.get("PUSH_CHANNEL", "tg") or "tg").strip().lower()
-    if channel in {"telegram", "tg"}:
-        return "tg"
-    if channel == "ntfy":
-        return "ntfy"
-    # 配置异常时优先根据已有 ntfy 参数自愈，避免误判成 Telegram。
-    if cfg.get("NTFY_URL") or cfg.get("NTFY_TOPIC"):
-        return "ntfy"
-    return "tg"
-
-
 def validate_config(cfg: Dict[str, str]) -> Tuple[bool, str]:
-    channel = normalize_push_channel(cfg)
-
-    required = ["NS_URL"]
-    if channel == "tg":
-        required.extend(["TG_BOT_TOKEN", "TG_PUSH_CHAT_ID"])
-    elif channel == "ntfy":
-        required.extend(["NTFY_URL", "NTFY_TOPIC"])
-
+    required = ["NS_URL", "NTFY_URL", "NTFY_TOPIC"]
     for key in required:
         if not cfg.get(key):
             return False, f"配置不完整，缺少 {key}"
@@ -214,31 +196,49 @@ def unescape_shell_value(value: str) -> str:
     return "".join(out)
 
 
-def read_keywords() -> str:
+def _load_keywords_json() -> Dict[str, str]:
     if KEYWORDS_FILE.exists():
         try:
             with KEYWORDS_FILE.open("r", encoding="utf-8") as fh:
                 data = json.load(fh)
-            return str(data.get("keywords", "")).strip()
+            return {
+                "keywords": str(data.get("keywords", "")).strip(),
+                "silent_keywords": str(data.get("silent_keywords", "")).strip(),
+            }
         except Exception:
-            return ""
+            return {"keywords": "", "silent_keywords": ""}
+    return {"keywords": "", "silent_keywords": ""}
+
+
+def read_keywords() -> str:
+    kw = _load_keywords_json()["keywords"]
+    if kw:
+        return kw
     cfg = parse_shell_config(CONFIG_FILE)
     kw = cfg.get("KEYWORDS", "").strip()
     if kw:
-        _save_keywords_json(kw)
+        _save_keywords_json(kw, "")
     return kw
 
 
-def _save_keywords_json(value: str) -> None:
+def read_silent_keywords() -> str:
+    return _load_keywords_json()["silent_keywords"]
+
+
+def _save_keywords_json(keywords: str, silent_keywords: str) -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     tmp = KEYWORDS_FILE.with_suffix(".tmp")
     with tmp.open("w", encoding="utf-8") as fh:
-        json.dump({"keywords": value}, fh, ensure_ascii=False)
+        json.dump({"keywords": keywords, "silent_keywords": silent_keywords}, fh, ensure_ascii=False, indent=2)
     tmp.replace(KEYWORDS_FILE)
 
 
 def update_keywords(new_value: str) -> None:
-    _save_keywords_json(new_value)
+    _save_keywords_json(new_value, read_silent_keywords())
+
+
+def update_silent_keywords(new_value: str) -> None:
+    _save_keywords_json(read_keywords(), new_value)
 
 
 def keyword_web_settings(cfg: Dict[str, str]) -> Dict[str, str]:
@@ -563,42 +563,13 @@ class NodeMonitor:
             return "empty", []
         return "ok", posts
 
-    def telegram_send(self, content: str) -> bool:
-        token = self.config.get("TG_BOT_TOKEN", "")
-        chat_id = self.config.get("TG_PUSH_CHAT_ID", "")
-        if not token or not chat_id:
-            self.logger.error("[node] Telegram配置缺失，发送失败")
-            return False
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        data = {
-            "chat_id": chat_id,
-            "text": content,
-            "disable_web_page_preview": "true",
-        }
-        try:
-            code, _, body = self.transport.post_form(url, data, HTTP_TIMEOUT)
-            if code != 200:
-                self.logger.error(f"[node] Telegram发送失败 HTTP={code}")
-                return False
-            if body:
-                try:
-                    payload = json.loads(body.decode("utf-8", errors="ignore"))
-                    if payload.get("ok") is False:
-                        self.logger.error(f"[node] Telegram返回失败: {payload}")
-                        return False
-                except Exception:
-                    pass
-            return True
-        except Exception as exc:
-            self.logger.error(f"[node] Telegram发送异常: {exc}")
-            return False
-
-    def ntfy_send(self, content: str) -> bool:
+    def ntfy_send(self, content: str, priority: Optional[str] = None) -> bool:
         url = (self.config.get("NTFY_URL", "http://127.0.0.1:8083") or "http://127.0.0.1:8083").rstrip("/")
         topic = (self.config.get("NTFY_TOPIC", "node") or "node").strip().strip("/")
         username = self.config.get("NTFY_USERNAME", "")
         password = self.config.get("NTFY_PASSWORD", "")
-        priority = (self.config.get("NTFY_PRIORITY", "3") or "3").strip()
+        if priority is None:
+            priority = (self.config.get("NTFY_PRIORITY", "3") or "3").strip()
         if priority not in {"1", "2", "3", "4", "5"}:
             priority = "3"
         if not url or not topic:
@@ -639,10 +610,7 @@ class NodeMonitor:
             return False
 
     def send_message(self, content: str) -> bool:
-        channel = normalize_push_channel(self.config)
-        if channel == "ntfy":
-            return self.ntfy_send(content)
-        return self.telegram_send(content)
+        return self.ntfy_send(content)
 
 
     def _load_rss_log_data(self) -> Dict[str, List[Dict[str, object]]]:
@@ -898,9 +866,8 @@ class NodeMonitor:
             self.logger.info(f"[node] 缓存更新 {changes} 条")
         return "ok", changes
 
-    def _collect_matches(self, window: int, mark_sent: bool) -> Tuple[str, List[str]]:
-        self.reload_config()
-        matcher = KeywordMatcher(self.config.get("KEYWORDS", ""))
+    def _collect_matches_for(self, raw_keywords: str, window: int, mark_sent: bool, tag: str = "node") -> Tuple[str, List[str]]:
+        matcher = KeywordMatcher(raw_keywords)
         if not matcher.tokens:
             return "", []
         now_time = fmt_time()
@@ -914,7 +881,7 @@ class NodeMonitor:
             if not hit:
                 continue
             lines.extend([
-                f"🎯node:【{hit}】",
+                f"🎯{tag}:【{hit}】",
                 f"📆时间: {now_time}",
                 f"🔖标题: {title}",
                 f"🧬链接: {entry.get('url', '')}",
@@ -923,34 +890,68 @@ class NodeMonitor:
             ids_to_mark.append(str(entry.get("id", "")))
         return "\n".join(lines).rstrip(), ids_to_mark
 
-    def auto_push_once(self) -> int:
-        text, ids_to_mark = self._collect_matches(MATCH_WINDOW, mark_sent=True)
-        extra_lines, extra_ids = self._pending_hit_log_matches(exclude_ids=set(ids_to_mark))
-        if extra_lines:
-            text = (text + "\n\n" if text else "") + "\n".join(extra_lines).rstrip()
-            ids_to_mark.extend(extra_ids)
-        if not text or not ids_to_mark:
-            return 0
-        if not self.send_message(text):
-            self._update_rss_push_status(ids_to_mark, "推送失败")
-            return -1
+    def _collect_matches(self, window: int, mark_sent: bool) -> Tuple[str, List[str]]:
+        self.reload_config()
+        return self._collect_matches_for(self.config.get("KEYWORDS", ""), window, mark_sent)
+
+    def _collect_silent_matches(self, window: int, mark_sent: bool) -> Tuple[str, List[str]]:
+        self.reload_config()
+        return self._collect_matches_for(self.config.get("SILENT_KEYWORDS", ""), window, mark_sent, tag="node🔕")
+
+    def _mark_sent(self, ids: List[str]) -> None:
         changed = False
-        for id_ in ids_to_mark:
+        for id_ in ids:
             entry = self.state.entries.get(id_)
             if entry and not entry.get("sent"):
                 entry["sent"] = True
                 changed = True
         if changed:
             self.state.save()
-        self._update_rss_push_status(ids_to_mark, "已推送")
-        self.logger.event(f"[node] 自动推送成功 {len(ids_to_mark)} 条")
-        return len(ids_to_mark)
+
+    def auto_push_once(self) -> int:
+        text, ids_to_mark = self._collect_matches(MATCH_WINDOW, mark_sent=True)
+        extra_lines, extra_ids = self._pending_hit_log_matches(exclude_ids=set(ids_to_mark))
+        if extra_lines:
+            text = (text + "\n\n" if text else "") + "\n".join(extra_lines).rstrip()
+            ids_to_mark.extend(extra_ids)
+        silent_text, silent_ids = self._collect_silent_matches(MATCH_WINDOW, mark_sent=True)
+        total = 0
+        failed = 0
+        if text and ids_to_mark:
+            if self.send_message(text):
+                self._mark_sent(ids_to_mark)
+                self._update_rss_push_status(ids_to_mark, "已推送")
+                self.logger.event(f"[node] 自动推送成功 {len(ids_to_mark)} 条")
+                total += len(ids_to_mark)
+            else:
+                self._update_rss_push_status(ids_to_mark, "推送失败")
+                failed += 1
+        if silent_text and silent_ids:
+            if self.ntfy_send(silent_text, priority="1"):
+                self._mark_sent(silent_ids)
+                self._update_rss_push_status(silent_ids, "已推送")
+                self.logger.event(f"[node] 静默关键词推送成功 {len(silent_ids)} 条")
+                total += len(silent_ids)
+            else:
+                self._update_rss_push_status(silent_ids, "推送失败")
+                failed += 1
+        if total:
+            return total
+        if failed:
+            return -1
+        return 0
 
     def manual_push(self) -> int:
         text, ids_to_mark = self._collect_matches(MANUAL_PUSH_WINDOW, mark_sent=False)
-        if not text or not ids_to_mark:
+        silent_text, silent_ids = self._collect_silent_matches(MANUAL_PUSH_WINDOW, mark_sent=False)
+        if not text and not silent_text:
             return 0
-        return len(ids_to_mark) if self.send_message(text) else -1
+        total = 0
+        if text and ids_to_mark and self.send_message(text):
+            total += len(ids_to_mark)
+        if silent_text and silent_ids and self.ntfy_send(silent_text, priority="1"):
+            total += len(silent_ids)
+        return total if total else -1
 
     def print_latest(self, limit: int = 10) -> None:
         latest = self.state.latest_entries(limit)
@@ -1129,7 +1130,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
                         "runtime_enabled": is_run_enabled(),
                     })
                     return
-                self.respond_page(read_keywords(), "", False)
+                self.respond_page(read_keywords(), read_silent_keywords(), "", False)
             except Exception as exc:
                 try:
                     self._send_json({"ok": False, "error": str(exc)}, status=500)
@@ -1192,16 +1193,18 @@ def build_keyword_handler(cfg: Dict[str, str]):
 
                 form = self._read_form()
                 new_keywords = form.get("keywords", [""])[0].strip()
+                new_silent_keywords = form.get("silent_keywords", [""])[0].strip()
                 if not form:
-                    self.respond_page(read_keywords(), "表单数据读取失败", True, status=400)
+                    self.respond_page(read_keywords(), read_silent_keywords(), "表单数据读取失败", True, status=400)
                     return
                 try:
                     update_keywords(new_keywords)
+                    update_silent_keywords(new_silent_keywords)
                     self.send_response(303)
                     self.send_header("Location", "/")
                     self.end_headers()
                 except Exception as exc:
-                    self.respond_page(new_keywords, f"保存失败: {exc}", True, status=500)
+                    self.respond_page(new_keywords, new_silent_keywords, f"保存失败: {exc}", True, status=500)
             except Exception as exc:
                 try:
                     self._send_json({"ok": False, "error": str(exc)}, status=500)
@@ -1214,8 +1217,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
         def version_string(self):
             return ""
 
-        def respond_page(self, keywords: str, message: str, editing: bool, status: int = 200):
+        def respond_page(self, keywords: str, silent_keywords: str, message: str, editing: bool, status: int = 200):
             safe_keywords = html.escape(keywords, quote=True)
+            safe_silent_keywords = html.escape(silent_keywords, quote=True)
             safe_message = html.escape(message, quote=True)
             readonly_attr = "" if editing else "readonly"
             action_label = "保存" if editing else "修改"
@@ -1381,6 +1385,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     .tag.fail { color: #ffd2d2; background: rgba(239,68,68,.20); border: 1px solid rgba(239,68,68,.38); }
     .empty { text-align: center; color: var(--muted); padding: 28px 12px; }
     .keyword-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 12px; }
+    .silent-header { margin-top: 16px; }
     .keyword-title { margin: 0; font-size: 22px; letter-spacing: .6px; color: #effcff; }
     @media (max-width: 640px) {
       body { padding: 14px 10px; }
@@ -1465,6 +1470,10 @@ def build_keyword_handler(cfg: Dict[str, str]):
           <button id="actionBtn" type="button" onclick="handleAction()">__ACTION_LABEL__</button>
         </div>
           <textarea id="keywords" name="keywords" spellcheck="false" __READONLY__ placeholder="例如：抽奖 甲&乙 amd&7950x&盒装&国行">__SAFE_KEYWORDS__</textarea>
+        <div class="keyword-header silent-header">
+          <h2 class="keyword-title">静默关键词 <span class="title-rule">格式同上，命中后按1级优先级推送</span></h2>
+        </div>
+          <textarea id="silent_keywords" name="silent_keywords" spellcheck="false" __READONLY__ placeholder="例如：开机 测速&结果">__SAFE_SILENT_KEYWORDS__</textarea>
         <div class="__MSG_CLASS__">__SAFE_MESSAGE__</div>
       </form>
     </section>
@@ -1514,10 +1523,12 @@ def build_keyword_handler(cfg: Dict[str, str]):
     function handleAction() {
       const form = document.getElementById('keywordForm');
       const textarea = document.getElementById('keywords');
+      const silentTextarea = document.getElementById('silent_keywords');
       const actionBtn = document.getElementById('actionBtn');
 
       if (textarea.hasAttribute('readonly')) {
         textarea.removeAttribute('readonly');
+        silentTextarea.removeAttribute('readonly');
         actionBtn.textContent = '保存';
         setTimeout(() => {
           textarea.focus();
@@ -1716,6 +1727,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
 </html>'''
             html_doc = (html_doc
                 .replace("__SAFE_KEYWORDS__", safe_keywords)
+                .replace("__SAFE_SILENT_KEYWORDS__", safe_silent_keywords)
                 .replace("__SAFE_MESSAGE__", safe_message)
                 .replace("__READONLY__", readonly_attr)
                 .replace("__ACTION_LABEL__", action_label)
