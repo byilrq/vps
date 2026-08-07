@@ -1092,6 +1092,21 @@ def is_target_process(pid: int, markers: List[str]) -> bool:
         return False
 
 
+_WEB_MONITOR: Optional[NodeMonitor] = None
+_WEB_MONITOR_LOCK = threading.Lock()
+
+
+def web_log_monitor() -> NodeMonitor:
+    """日志接口复用的只读 monitor，避免每次轮询重建 Session 与重载状态。"""
+    global _WEB_MONITOR
+    with _WEB_MONITOR_LOCK:
+        if _WEB_MONITOR is None:
+            _WEB_MONITOR = NodeMonitor()
+        _WEB_MONITOR.reload_config()
+        _WEB_MONITOR.state.load()
+        return _WEB_MONITOR
+
+
 def build_keyword_handler(cfg: Dict[str, str]):
     settings = keyword_web_settings(cfg)
     save_pin = settings["pin"]
@@ -1125,7 +1140,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
                 if parsed.path == "/api/rss-logs":
                     query = parse_qs(parsed.query, keep_blank_values=True)
                     mode = (query.get("mode", ["all"])[0] or "all").strip().lower()
-                    monitor = NodeMonitor()
+                    monitor = web_log_monitor()
                     cfg_now = load_runtime_config()
                     interval = max(15, safe_int(cfg_now.get("INTERVAL_SEC", "20"), 20))
                     logs = monitor.get_rss_logs(mode=mode, limit=20)
@@ -1271,6 +1286,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
         radial-gradient(circle at 74% 12%, rgba(24, 210, 176, 0.18), transparent 30%),
         radial-gradient(circle at 18% 20%, rgba(78, 126, 180, 0.18), transparent 34%),
         linear-gradient(180deg, #0d2133 0%, var(--bg) 58%, var(--bg2) 100%);
+      background-attachment: fixed;
       padding: 20px 14px;
       overflow-x: hidden;
     }
@@ -1382,8 +1398,12 @@ def build_keyword_handler(cfg: Dict[str, str]):
     th, td { padding: 10px 12px; border-bottom: 1px solid rgba(126,232,216,.12); text-align: left; vertical-align: top; font-size: 14px; line-height: 1.45; }
     th { color: #dff8f4; background: rgba(126,232,216,.08); font-size: 13px; letter-spacing: .5px; }
     tr:last-child td { border-bottom: none; }
+    tr:nth-child(odd) td { background: rgba(255,255,255,.018); }
+    tr:nth-child(even) td { background: rgba(126,232,216,.05); }
     .time { color: rgba(224,241,252,.68); white-space: nowrap; }
-    .title { font-weight: 750; color: #edf7ff; word-break: break-all; }
+    .title { font-weight: 750; color: #a3b2c0; word-break: break-all; }
+    .title-link { color: #a3b2c0; text-decoration: none; cursor: pointer; }
+    .title-link:hover { color: #7fe8d8; text-decoration: underline; }
     .url a { color: #7fe8d8; text-decoration: none; font-weight: 800; }
     .url a:hover { text-decoration: underline; }
     .tag { display: inline-flex; align-items: center; border-radius: 999px; padding: 3px 9px; font-size: 12px; font-weight: 900; white-space: nowrap; }
@@ -1408,7 +1428,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
       .side-actions button { flex: 1; }
       .log-actions { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
       .log-left { display: flex; align-items: center; gap: 8px; }
-      .log-actions button, .log-left button { min-width: 0; padding: 0 6px; font-size: 12px; }
+      .log-actions button, .log-left button { min-width: 0; min-height: 30px; padding: 0 8px; font-size: 12px; border-radius: 999px; }
       .log-head { align-items: flex-start; }
     }
     /* 自定义确认弹窗 */
@@ -1512,7 +1532,6 @@ def build_keyword_handler(cfg: Dict[str, str]):
                 <th style="width:132px;">时间</th>
                 <th style="width:82px;">结果</th>
                 <th style="width:102px;">推送</th>
-                <th style="width:62px;">链接</th>
               </tr>
             </thead>
             <tbody id="rssLogBody"><tr><td class="empty" colspan="6"></td></tr></tbody>
@@ -1645,7 +1664,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     function renderLogs(logs) {
       const body = document.getElementById('rssLogBody');
       if (!logs || logs.length === 0) {
-        body.innerHTML = '<tr><td class="empty" colspan="6">暂无RSS日志</td></tr>';
+        body.innerHTML = '<tr><td class="empty" colspan="5">暂无RSS日志</td></tr>';
         return;
       }
       body.innerHTML = logs.map(row => {
@@ -1657,14 +1676,13 @@ def build_keyword_handler(cfg: Dict[str, str]):
         const hit = row.hit ? escapeHtml(row.hit) : '-';
         const title = escapeHtml(row.title || '');
         const url = escapeHtml(row.url || '');
-        const link = url ? `<a href="${url}" target="_blank" rel="noopener noreferrer">打开</a>` : '-';
+        const titleLink = url ? `<a class="title-link" href="${url}" target="_blank" rel="noopener noreferrer">${title}</a>` : title;
         return `<tr>
-          <td class="title">${title}</td>
+          <td class="title">${titleLink}</td>
           <td>${hit}</td>
           <td class="time">${compactTime(row.checked_at || row.first_seen_at || '')}</td>
           <td>${tag}</td>
           <td>${statusTag}</td>
-          <td class="url">${link}</td>
         </tr>`;
       }).join('');
     }
