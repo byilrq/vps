@@ -21,8 +21,6 @@ GITHUB_NODE_PY_URL="https://raw.githubusercontent.com/byilrq/vps/main/node/node.
 GITHUB_PUSH_PY_URL="${GITHUB_NODE_PY_URL%/node.py}/push.py"
 
 CRON_LOG="$WORK_DIR/node_cron.log"
-BOOT_LOG="$WORK_DIR/node_boot.log"
-WEB_LOG="$WORK_DIR/node_web.log"
 PID_FILE="$WORK_DIR/.node_python.pid"
 WEB_PID_FILE="$WORK_DIR/.node_keyword_web.pid"
 LAST_NODE_TXT="$WORK_DIR/last_node.txt"
@@ -38,7 +36,7 @@ BOLD="\033[1m"; PLAIN="\033[0m"
 
 ensure_runtime_files() {
     mkdir -p "$WORK_DIR"
-    touch "$CRON_LOG" "$BOOT_LOG" "$WEB_LOG"
+    touch "$CRON_LOG"
 }
 
 # ==================== 防火墙配置 ====================
@@ -747,7 +745,7 @@ update_node_domain() {
                 echo -e "${GREEN}✅ HTTPS 服务已正常响应。${PLAIN}"
             else
                 echo -e "${YELLOW}⚠️ HTTPS 服务未响应，请检查 node.py 日志和证书权限。${PLAIN}"
-                echo "   日志位置：$WORK_DIR/node_web.log"
+                echo "   日志位置：$WORK_DIR/node.log"
             fi
         else
             echo "未检测到 curl，请手动访问 https://${new_domain}:${DEFAULT_WEB_PORT}/ 验证。"

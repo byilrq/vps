@@ -32,8 +32,6 @@ WORK_DIR = Path(os.environ.get("NODE_WORK_DIR", "/root/node"))
 CONFIG_FILE = WORK_DIR / "node_config.txt"
 LOG_FILE = WORK_DIR / "node.log"
 CRON_LOG = WORK_DIR / "node_cron.log"
-BOOT_LOG = WORK_DIR / "node_boot.log"
-WEB_LOG = WORK_DIR / "node_web.log"
 STATE_JSON = WORK_DIR / "node_state.json"
 LAST_NODE_TXT = WORK_DIR / "last_node.txt"
 CACHE_JSON = WORK_DIR / ".node_http_cache.json"
@@ -70,7 +68,7 @@ USER_AGENT = (
 
 def ensure_workdir() -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    for p in (LOG_FILE, CRON_LOG, BOOT_LOG, WEB_LOG):
+    for p in (LOG_FILE, CRON_LOG):
         if not p.exists():
             p.touch()
 
