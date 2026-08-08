@@ -1162,11 +1162,11 @@
                 <div class="scan-switch-list">
                     <div class="scan-switch-row rss-row">
                         <span class="scan-switch-title">RSS 新主题帖扫描</span>
-                        <el-switch v-model="config.enable_rss"></el-switch>
+                        <el-switch v-model="config.enable_rss" @change="quickSaveScanSwitch"></el-switch>
                     </div>
                     <div class="scan-switch-row manual-row">
                         <span class="scan-switch-title">手动帖子楼层扫描</span>
-                        <el-switch v-model="config.enable_extra_urls"></el-switch>
+                        <el-switch v-model="config.enable_extra_urls" @change="quickSaveScanSwitch"></el-switch>
                     </div>
                 </div>
 
@@ -1608,10 +1608,10 @@ createApp({
                 this.loginError = error.response && error.response.status === 401 ? '密码无效' : '网络错误';
             });
         },
-        fetchConfig() {
+        fetchConfig(silent) {
             axios.get('/api/config', { headers: this.authHeader() }).then(response => {
                 this.normalizeConfig(response.data);
-                ElementPlus.ElMessage.success('配置已刷新');
+                if (!silent) ElementPlus.ElMessage.success('配置已刷新');
             });
         },
         cloneConfig() {
@@ -1669,6 +1669,12 @@ createApp({
                 this.fetchConfig();
                 if (typeof callback === 'function') callback();
             }).catch(() => ElementPlus.ElMessage.error('保存失败'));
+        },
+        quickSaveScanSwitch() {
+            axios.post('/api/config', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
+                ElementPlus.ElMessage.success(response.data.message || '扫描开关已生效');
+                this.fetchConfig(true);
+            }).catch(() => ElementPlus.ElMessage.error('扫描开关保存失败'));
         },
         testTelegram() {
             this.testingTelegram = true;

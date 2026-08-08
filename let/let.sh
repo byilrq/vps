@@ -8,7 +8,9 @@ set -o pipefail
 
 APP_NAME="let"
 SERVICE_NAME="let"
-REPO_URL="https://raw.githubusercontent.com/byilrq/vps/main/let"
+REPO_URL="https://github.com/byilrq/vps"
+REPO_LET_DIR="let"
+SRC_DIR="${INSTALL_PARENT}/.let-src"
 INSTALL_DIR="/root/let"
 INSTALL_PARENT="/root"
 VENV_DIR="${INSTALL_DIR}/.venv"
@@ -101,30 +103,39 @@ install_deps(){
 }
 
 safe_clone_or_update(){
-  step "准备项目目录：${INSTALL_DIR}"
+  step "准备项目源码仓库：${REPO_URL}"
 
   cd "$INSTALL_PARENT" || {
     err "无法进入父目录：$INSTALL_PARENT"
     return 1
   }
 
-  if [ -d "$INSTALL_DIR/.git" ]; then
-    step "检测到项目已存在，正在更新：$INSTALL_DIR"
-    cd "$INSTALL_DIR" || { err "进入项目目录失败：$INSTALL_DIR"; return 1; }
+  if [ -d "$SRC_DIR/.git" ]; then
+    step "检测到源码仓库已存在，正在更新：$SRC_DIR"
+    cd "$SRC_DIR" || { err "进入源码目录失败：$SRC_DIR"; return 1; }
     git remote set-url origin "$REPO_URL" || true
     git fetch --all || { err "git fetch 失败，请检查网络或仓库权限。"; return 1; }
     git reset --hard origin/HEAD || { err "git reset 失败，请检查仓库状态。"; return 1; }
   else
-    if [ -e "$INSTALL_DIR" ]; then
-      warn "检测到 $INSTALL_DIR 已存在但不是 Git 仓库，将备份后重新克隆。"
-      local backup="${INSTALL_DIR}.bak.$(date +%Y%m%d%H%M%S)"
-      mv "$INSTALL_DIR" "$backup" || { err "备份旧目录失败：$INSTALL_DIR"; return 1; }
+    if [ -e "$SRC_DIR" ]; then
+      warn "检测到 $SRC_DIR 已存在但不是 Git 仓库，将备份后重新克隆。"
+      local backup="${SRC_DIR}.bak.$(date +%Y%m%d%H%M%S)"
+      mv "$SRC_DIR" "$backup" || { err "备份旧目录失败：$SRC_DIR"; return 1; }
       warn "旧目录已备份到：$backup"
     fi
 
     step "正在克隆项目仓库"
-    git clone "$REPO_URL" "$INSTALL_DIR" || { err "克隆失败，请检查仓库地址、网络、权限。"; return 1; }
+    git clone "$REPO_URL" "$SRC_DIR" || { err "克隆失败，请检查仓库地址、网络、权限。"; return 1; }
   fi
+
+  if [ ! -d "$SRC_DIR/$REPO_LET_DIR" ]; then
+    err "仓库中未找到 let 子目录：$SRC_DIR/$REPO_LET_DIR"
+    return 1
+  fi
+
+  step "同步 let 源码到：${INSTALL_DIR}"
+  mkdir -p "$INSTALL_DIR"
+  find "$SRC_DIR/$REPO_LET_DIR" -mindepth 1 -maxdepth 1 ! -name data -exec cp -a {} "$INSTALL_DIR/" \;
 
   cd "$INSTALL_DIR" || { err "进入项目目录失败：$INSTALL_DIR"; return 1; }
 }
@@ -148,7 +159,10 @@ prepare_config(){
   mkdir -p "$DATA_DIR"
 
   if [ ! -f "$DATA_DIR/config.json" ]; then
-    if [ -f "$INSTALL_DIR/example.json" ]; then
+    if [ -f "$SRC_DIR/$REPO_LET_DIR/data/config.json" ]; then
+      cp "$SRC_DIR/$REPO_LET_DIR/data/config.json" "$DATA_DIR/config.json"
+      ok "已从源码 data/config.json 初始化配置：${DATA_DIR}/config.json"
+    elif [ -f "$INSTALL_DIR/example.json" ]; then
       cp "$INSTALL_DIR/example.json" "$DATA_DIR/config.json"
       ok "已从 example.json 初始化配置：${DATA_DIR}/config.json"
     elif [ -f "$INSTALL_DIR/config.json" ]; then
