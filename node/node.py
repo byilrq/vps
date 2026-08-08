@@ -687,7 +687,7 @@ class NodeMonitor:
             url = str(post.get("url", ""))
             hit = matcher.match(title)
             silent_hit = silent_matcher.match(title)
-            display_hit = hit or (f"静默:{silent_hit}" if silent_hit else "")
+            display_hit = hit or silent_hit
             old_all = all_by_id.get(id_, {})
             old_hit = hit_by_id.get(id_, {})
             sent, push_status = self._push_status_for_id(
@@ -741,7 +741,7 @@ class NodeMonitor:
                 title = str(entry.get("title", ""))
                 hit = matcher.match(title)
                 silent_hit = silent_matcher.match(title)
-                display_hit = hit or (f"静默:{silent_hit}" if silent_hit else "")
+                display_hit = hit or silent_hit
                 sent, push_status = self._push_status_for_id(id_, fallback_sent=bool(entry.get("sent", False)))
                 row = {
                     "id": id_,
@@ -770,7 +770,7 @@ class NodeMonitor:
             title = str(row.get("title", ""))
             hit = matcher.match(title)
             silent_hit = silent_matcher.match(title)
-            display_hit = hit or (f"静默:{silent_hit}" if silent_hit else "")
+            display_hit = hit or silent_hit
             row["matched"] = bool(display_hit)
             row["hit"] = display_hit
             sent, push_status = self._push_status_for_id(
