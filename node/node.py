@@ -765,7 +765,7 @@ class NodeMonitor:
             data = {"all_logs": all_logs, "hit_logs": hit_logs}
             self._save_rss_log_data(data)
 
-        rows = list(data.get("all_logs", []))
+        rows = list(data.get("hit_logs" if mode in {"hit", "hits", "matched"} else "all_logs", []))
 
         normalized: List[Dict[str, object]] = []
         for item in rows:
