@@ -47,6 +47,9 @@ RUN_ENABLED_FILE = WORK_DIR / ".node_run_enabled"
 WEB_RESTART_FILE = WORK_DIR / ".node_web_restart"
 KEYWORDS_FILE = WORK_DIR / "keywords.json"
 
+_RSS_LOG_WRITE_LOCK = threading.Lock()
+_STATE_WRITE_LOCK = threading.Lock()
+
 DEFAULT_URL = "https://rss.nodeseek.com/?sortBy=postTime"
 DEFAULT_WEB_HOST = os.environ.get("NODE_WEB_HOST", "0.0.0.0")
 DEFAULT_WEB_PORT = int(os.environ.get("NODE_WEB_PORT", "8068"))
@@ -408,13 +411,14 @@ class StateStore:
         self.entries = OrderedDict((str(item["id"]), item) for item in items)
 
     def save(self) -> None:
-        self._normalize()
-        payload = {"entries": list(self.entries.values())}
-        tmp = STATE_JSON.with_suffix(".tmp")
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-        tmp.replace(STATE_JSON)
-        self.export_last_node_txt()
+        with _STATE_WRITE_LOCK:
+            self._normalize()
+            payload = {"entries": list(self.entries.values())}
+            tmp = STATE_JSON.with_suffix(".tmp")
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            tmp.replace(STATE_JSON)
+            self.export_last_node_txt()
 
     def export_last_node_txt(self) -> None:
         tmp = LAST_NODE_TXT.with_suffix(".tmp")
@@ -639,14 +643,15 @@ class NodeMonitor:
         return data
 
     def _save_rss_log_data(self, data: Dict[str, List[Dict[str, object]]]) -> None:
-        tmp = RSS_LOG_JSON.with_suffix(".tmp")
-        payload = {
-            "all_logs": list(data.get("all_logs", []))[:MAX_RSS_LOG_ENTRIES],
-            "hit_logs": list(data.get("hit_logs", []))[:MAX_RSS_LOG_ENTRIES],
-        }
-        with tmp.open("w", encoding="utf-8") as fh:
-            json.dump(payload, fh, ensure_ascii=False, indent=2)
-        tmp.replace(RSS_LOG_JSON)
+        with _RSS_LOG_WRITE_LOCK:
+            tmp = RSS_LOG_JSON.with_suffix(".tmp")
+            payload = {
+                "all_logs": list(data.get("all_logs", []))[:MAX_RSS_LOG_ENTRIES],
+                "hit_logs": list(data.get("hit_logs", []))[:MAX_RSS_LOG_ENTRIES],
+            }
+            with tmp.open("w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+            tmp.replace(RSS_LOG_JSON)
 
     def _push_status_for_id(self, id_: str, fallback_sent: bool = False, fallback_status: str = "") -> Tuple[bool, str]:
         entry = self.state.entries.get(str(id_), {})
@@ -1033,13 +1038,18 @@ class NodeMonitor:
                 time.sleep(interval)
                 continue
 
-            status, changed = self.refresh_once()
-            if self.logger.debug:
-                self.logger.info(f"[node] 本轮刷新状态={status} 变化={changed}")
-            push_count = self.auto_push_once()
-            if self.logger.debug:
-                self.logger.info(f"[node] 本轮推送结果={push_count}")
-            self.trim_logs_if_needed(40, loop_count)
+            try:
+                status, changed = self.refresh_once()
+                if self.logger.debug:
+                    self.logger.info(f"[node] 本轮刷新状态={status} 变化={changed}")
+                push_count = self.auto_push_once()
+                if self.logger.debug:
+                    self.logger.info(f"[node] 本轮推送结果={push_count}")
+                self.trim_logs_if_needed(40, loop_count)
+            except Exception as exc:
+                import traceback
+                self.logger.error(f"[node] 监控循环异常: {exc}")
+                self.logger.error(traceback.format_exc())
             elapsed = time.monotonic() - started
             sleep_time = max(1.0, interval - elapsed)
             time.sleep(sleep_time)
