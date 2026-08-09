@@ -2653,6 +2653,342 @@ run_sys_conf() {
 }
 
 # -----------------------------
+# 函数：校验 IPv4 地址
+# -----------------------------
+is_valid_ipv4() {
+  local value="$1"
+  local a b c d extra octet
+
+  IFS='.' read -r a b c d extra <<< "$value"
+  [[ -n "$a" && -n "$b" && -n "$c" && -n "$d" && -z "$extra" ]] || return 1
+
+  for octet in "$a" "$b" "$c" "$d"; do
+    [[ "$octet" =~ ^[0-9]{1,3}$ ]] || return 1
+    ((10#$octet >= 0 && 10#$octet <= 255)) || return 1
+  done
+
+  return 0
+}
+
+# -----------------------------
+# 函数：将现有 Hysteria 2 配置为 SOCKS5 中转站
+# -----------------------------
+configure_hy2_relay() {
+  local config_file="/etc/hysteria/config.yaml"
+  local exit_host exit_port exit_user exit_password exit_addr
+  local backup_file hy_service
+
+  if [[ ! -s "$config_file" ]]; then
+    red "未检测到 Hysteria 2 配置：$config_file"
+    yellow "请先使用菜单 1 安装 Hy2，再执行中转配置。"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  green "配置 Hysteria 2 SOCKS5 中转出口"
+  yellow "请填写落地机菜单最终打印的 SOCKS5 参数。"
+
+  while true; do
+    read_confirmed exit_host "请输入落地机 IP 或域名（不带端口）: " || return 1
+    exit_host="$(normalize_host_input "$exit_host")"
+    exit_host="${exit_host#[}"
+    exit_host="${exit_host%]}"
+
+    if [[ "$exit_host" == *:* ]]; then
+      [[ "$exit_host" =~ ^[0-9A-Fa-f:]+$ ]] && break
+    elif [[ "$exit_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
+      break
+    fi
+
+    red "出口地址格式无效，请输入 IPv4、IPv6 或域名。"
+  done
+
+  while true; do
+    read_confirmed exit_port "请输入 SOCKS5 端口（回车默认 1080）: " "1080" || return 1
+    if [[ "$exit_port" =~ ^[0-9]+$ ]] && ((exit_port >= 1 && exit_port <= 65535)); then
+      break
+    fi
+    red "端口必须是 1-65535 之间的数字。"
+  done
+
+  while true; do
+    read_confirmed exit_user "请输入 SOCKS5 用户名（回车默认 hy2relay）: " "hy2relay" || return 1
+    [[ "$exit_user" =~ ^[A-Za-z0-9._~-]+$ ]] && break
+    red "用户名仅支持字母、数字和 . _ ~ -"
+  done
+
+  read_confirmed_password exit_password "请输入 SOCKS5 密码（回车随机）: " || return 1
+
+  if ! command -v python3 >/dev/null 2>&1; then
+    green "安装中转配置写入依赖"
+    pkg_install python3 >/dev/null 2>&1 || {
+      red "安装 python3 失败，无法安全写入 Hysteria 2 配置。"
+      read -erp "回车返回菜单..." _
+      return 1
+    }
+  fi
+
+  if [[ "$exit_host" == *:* ]]; then
+    exit_addr="[$exit_host]:$exit_port"
+  else
+    exit_addr="$exit_host:$exit_port"
+  fi
+
+  backup_file="${config_file}.bak.relay.$(date +%Y%m%d%H%M%S)"
+  cp -a "$config_file" "$backup_file" || {
+    red "备份 Hysteria 2 配置失败。"
+    return 1
+  }
+
+  if ! python3 - "$config_file" "$exit_addr" "$exit_user" "$exit_password" <<'PYC'
+from pathlib import Path
+import json
+import re
+import sys
+
+path = Path(sys.argv[1])
+addr, username, password = sys.argv[2:5]
+lines = path.read_text().splitlines(keepends=True)
+
+start = None
+end = None
+for index, line in enumerate(lines):
+    if re.match(r'^outbounds:\s*(?:#.*)?$', line.rstrip('\r\n')):
+        start = index
+        for next_index in range(index + 1, len(lines)):
+            candidate = lines[next_index]
+            if candidate.strip() and not candidate.startswith((' ', '\t', '#')):
+                end = next_index
+                break
+        if end is None:
+            end = len(lines)
+        break
+
+if start is not None:
+    del lines[start:end]
+
+content = ''.join(lines).rstrip() + '\n\n'
+content += (
+    'outbounds:\n'
+    '  - name: landing\n'
+    '    type: socks5\n'
+    '    socks5:\n'
+    f'      addr: {json.dumps(addr)}\n'
+    f'      username: {json.dumps(username)}\n'
+    f'      password: {json.dumps(password)}\n'
+)
+path.write_text(content)
+PYC
+  then
+    cp -a "$backup_file" "$config_file" >/dev/null 2>&1 || true
+    red "写入中转配置失败，已恢复原配置。"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  fix_hysteria_file_perms
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1
+
+  if ! systemctl is-active --quiet "$hy_service"; then
+    cp -a "$backup_file" "$config_file" >/dev/null 2>&1 || true
+    fix_hysteria_file_perms
+    systemctl restart "$hy_service" >/dev/null 2>&1 || true
+    red "中转配置启动失败，已恢复原配置。"
+    yellow "请检查：journalctl -u $hy_service -n 50 --no-pager"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  green "Hysteria 2 中转配置完成"
+  yellow "SOCKS5 出口地址：$exit_addr"
+  yellow "SOCKS5 用户名：$exit_user"
+  yellow "SOCKS5 密码：$exit_password"
+  yellow "配置备份：$backup_file"
+  green "当前所有 Hy2 代理流量将默认通过该 SOCKS5 落地机出站。"
+  read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
+# 函数：安装并配置 SOCKS5 落地机
+# -----------------------------
+install_socks5_exit() {
+  local relay_ip socks_port socks_user socks_password
+  local install_script="/tmp/sing-box-install.sh"
+  local singbox_bin config_dir config_file service_file
+  local exit_ip test_ip udp_port_start udp_port_end
+
+  green "安装并配置 SOCKS5 落地机"
+
+  while true; do
+    read_confirmed relay_ip "请输入中转机公网 IPv4（用于防火墙白名单）: " || return 1
+    is_valid_ipv4 "$relay_ip" && break
+    red "IPv4 地址格式无效，请重新输入。"
+  done
+
+  while true; do
+    read_confirmed socks_port "请输入 SOCKS5 监听端口（回车默认 1080）: " "1080" || return 1
+    if [[ "$socks_port" =~ ^[0-9]+$ ]] && ((socks_port >= 1 && socks_port <= 65535)); then
+      if ss -lntup 2>/dev/null | grep -Eq ":${socks_port}([^0-9]|$)" && ! systemctl is-active --quiet sing-box-socks5.service; then
+        red "端口 $socks_port 已被其他程序占用，请更换。"
+        continue
+      fi
+      break
+    fi
+    red "端口必须是 1-65535 之间的数字。"
+  done
+
+  while true; do
+    read_confirmed socks_user "请输入 SOCKS5 用户名（回车默认 hy2relay）: " "hy2relay" || return 1
+    [[ "$socks_user" =~ ^[A-Za-z0-9._~-]+$ ]] && break
+    red "用户名仅支持字母、数字和 . _ ~ -"
+  done
+
+  read_confirmed_password socks_password "请输入 SOCKS5 密码（回车随机）: " || return 1
+
+  green "安装 SOCKS5 服务依赖"
+  pkg_install curl ca-certificates iptables >/dev/null 2>&1 || {
+    red "安装基础依赖失败。"
+    read -erp "回车返回菜单..." _
+    return 1
+  }
+
+  green "安装 sing-box"
+  download_with_retry "https://sing-box.app/install.sh" "$install_script" || {
+    red "下载 sing-box 官方安装脚本失败。"
+    read -erp "回车返回菜单..." _
+    return 1
+  }
+
+  bash "$install_script" || {
+    rm -f "$install_script" >/dev/null 2>&1 || true
+    red "sing-box 安装失败。"
+    read -erp "回车返回菜单..." _
+    return 1
+  }
+  rm -f "$install_script" >/dev/null 2>&1 || true
+
+  singbox_bin=$(command -v sing-box 2>/dev/null || true)
+  if [[ -z "$singbox_bin" || ! -x "$singbox_bin" ]]; then
+    red "未检测到 sing-box 可执行文件。"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  config_dir="/etc/sing-box"
+  config_file="$config_dir/socks5-exit.json"
+  service_file="/etc/systemd/system/sing-box-socks5.service"
+  mkdir -p "$config_dir"
+
+  if [[ -f "$config_file" ]]; then
+    cp -a "$config_file" "${config_file}.bak.$(date +%Y%m%d%H%M%S)" >/dev/null 2>&1 || true
+  fi
+
+  cat > "$config_file" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "0.0.0.0",
+      "listen_port": $socks_port,
+      "users": [
+        {
+          "username": "$socks_user",
+          "password": "$socks_password"
+        }
+      ],
+      "udp_timeout": "5m"
+    }
+  ]
+}
+EOF
+
+  chmod 700 "$config_dir" >/dev/null 2>&1 || true
+  chmod 600 "$config_file" >/dev/null 2>&1 || true
+
+  if ! "$singbox_bin" check -c "$config_file"; then
+    red "SOCKS5 配置校验失败。"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  cat > "$service_file" <<EOF
+[Unit]
+Description=sing-box SOCKS5 exit service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=$singbox_bin run -c $config_file
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  chmod 644 "$service_file" >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl enable --now sing-box-socks5.service >/dev/null 2>&1 || true
+  systemctl restart sing-box-socks5.service >/dev/null 2>&1
+
+  if ! systemctl is-active --quiet sing-box-socks5.service; then
+    red "SOCKS5 服务启动失败，请检查："
+    systemctl status sing-box-socks5.service --no-pager -l || true
+    journalctl -u sing-box-socks5.service --no-pager -n 30 || true
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  green "配置 SOCKS5 防火墙白名单"
+  install_firewall_persistent >/dev/null 2>&1 || true
+  read -r udp_port_start udp_port_end < /proc/sys/net/ipv4/ip_local_port_range
+  [[ "$udp_port_start" =~ ^[0-9]+$ ]] || udp_port_start="32768"
+  [[ "$udp_port_end" =~ ^[0-9]+$ ]] || udp_port_end="60999"
+  iptables -N SOCKS5_EXIT_INPUT >/dev/null 2>&1 || true
+  iptables -F SOCKS5_EXIT_INPUT >/dev/null 2>&1 || true
+  iptables -C INPUT -j SOCKS5_EXIT_INPUT >/dev/null 2>&1 || iptables -I INPUT 1 -j SOCKS5_EXIT_INPUT >/dev/null 2>&1 || true
+  iptables -A SOCKS5_EXIT_INPUT -i lo -p tcp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+  iptables -A SOCKS5_EXIT_INPUT -i lo -p udp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+  iptables -A SOCKS5_EXIT_INPUT -s "$relay_ip/32" -p tcp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+  iptables -A SOCKS5_EXIT_INPUT -s "$relay_ip/32" -p udp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+  iptables -A SOCKS5_EXIT_INPUT -s "$relay_ip/32" -p udp --dport "$udp_port_start:$udp_port_end" -j ACCEPT >/dev/null 2>&1 || true
+  iptables -A SOCKS5_EXIT_INPUT -p tcp --dport "$socks_port" -j DROP >/dev/null 2>&1 || true
+  iptables -A SOCKS5_EXIT_INPUT -p udp --dport "$socks_port" -j DROP >/dev/null 2>&1 || true
+  save_firewall_rules
+
+  exit_ip=$(curl -4fsS --max-time 8 ip.sb 2>/dev/null || true)
+  [[ -z "$exit_ip" ]] && exit_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
+  test_ip=$(curl -4fsS --max-time 12 --socks5-hostname "127.0.0.1:$socks_port" --proxy-user "$socks_user:$socks_password" ip.sb 2>/dev/null || true)
+
+  red "======================================================================================"
+  green "SOCKS5 落地机安装配置完成"
+  yellow "出口地址：$exit_ip"
+  yellow "SOCKS5 端口：$socks_port"
+  yellow "SOCKS5 用户名：$socks_user"
+  yellow "SOCKS5 密码：$socks_password"
+  yellow "允许连接的中转机：$relay_ip"
+  yellow "TCP/UDP：已启用"
+  yellow "SOCKS5 UDP 动态中继端口：$udp_port_start-$udp_port_end"
+  [[ -n "$test_ip" ]] && green "本机代理出口测试：$test_ip"
+  echo ""
+  green "请在中转机菜单中依次输入："
+  green "地址：$exit_ip"
+  green "端口：$socks_port"
+  green "用户名：$socks_user"
+  green "密码：$socks_password"
+  yellow "如果云平台有安全组，请仅允许 $relay_ip 访问 TCP $socks_port、UDP $socks_port 和 UDP $udp_port_start-$udp_port_end。"
+  read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
 # 函数：显示主菜单
 # -----------------------------
 menu() {
@@ -2674,10 +3010,12 @@ menu() {
     echo -e " ${GREEN}9.${tianlan} IP质量检测"
     echo -e " ${GREEN}10.${tianlan} 系统查询"
     echo -e " ${GREEN}11.${tianlan} 系统更新"
+    echo -e " ${GREEN}12.${tianlan} 配置 Hy2 中转"
+    echo -e " ${GREEN}13.${tianlan} 安装 Socks5 落地机"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
-    read -erp "请输入选项 [0-11]: " menuInput
+    read -erp "请输入选项 [0-13]: " menuInput
 
     case $menuInput in
       1) insthysteria ;;
@@ -2691,6 +3029,8 @@ menu() {
       9) ipquality ;;
       10) linux_ps ;;
       11) linux_update ;;
+      12) configure_hy2_relay ;;
+      13) install_socks5_exit ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
