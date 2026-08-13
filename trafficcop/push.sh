@@ -55,7 +55,7 @@ read_config() {
     # shellcheck disable=SC1090
     source "$CONFIG_FILE" 2>/dev/null || return 1
 
-    PUSH_CHANNEL=${PUSH_CHANNEL:-tg}              # tg / pushplus / ntfy
+    PUSH_CHANNEL="ntfy"                            # 仅 ntfy
     TRAFFIC_SOURCE=${TRAFFIC_SOURCE:-vnstat}      # vnstat / bwh_api
     BWH_API_ENDPOINT=${BWH_API_ENDPOINT:-$BWH_API_ENDPOINT_DEFAULT}
 
@@ -102,7 +102,7 @@ MACHINE_NAME="$MACHINE_NAME"
 DAILY_REPORT_TIME="$DAILY_REPORT_TIME"
 EXPIRE_DATE="$EXPIRE_DATE"
 
-# ===== 推送渠道：tg / pushplus / ntfy =====
+# ===== 推送渠道：仅 ntfy =====
 PUSH_CHANNEL="$PUSH_CHANNEL"
 
 # ===== 流量来源：vnstat / bwh_api =====
@@ -291,10 +291,10 @@ build_report() {
 
     remain_emoji="🟢"
     if (( diff_days <= 0 )); then
-        remain_emoji="🏴‍☠️"; diff_days="已到期"
-    elif (( diff_days <= 30 )); then
+        remain_emoji="🔴"; diff_days="已到期"
+    elif (( diff_days <= 7 )); then
         remain_emoji="🔴"
-    elif (( diff_days <= 60 )); then
+    elif (( diff_days <= 14 )); then
         remain_emoji="🟡"
     fi
 
@@ -393,27 +393,24 @@ read_input() {
 }
 
 get_ntfy_effective_priority() {
-    local base_priority expire_ts today_ts remain_days
+    local expire_ts today_ts remain_days
 
-    base_priority="${NTFY_PRIORITY:-$NTFY_PRIORITY_DEFAULT}"
-    if ! [[ "$base_priority" =~ ^[1-5]$ ]]; then
-        base_priority="$NTFY_PRIORITY_DEFAULT"
-    fi
-
-    # VPS 剩余时间小于 30 天时，ntfy 使用高优先级 4；否则沿用配置/默认优先级。
     if [[ -n "${EXPIRE_DATE:-}" ]]; then
         expire_ts=$(date -d "${EXPIRE_DATE//./-}" +%s 2>/dev/null || echo "")
         today_ts=$(date -d "$(date +%Y-%m-%d)" +%s 2>/dev/null || echo "")
         if [[ "$expire_ts" =~ ^[0-9]+$ && "$today_ts" =~ ^[0-9]+$ ]]; then
             remain_days=$(( (expire_ts - today_ts) / 86400 ))
-            if (( remain_days < 30 )); then
+            if (( remain_days <= 7 )); then
                 echo "4"
+                return 0
+            elif (( remain_days <= 14 )); then
+                echo "3"
                 return 0
             fi
         fi
     fi
 
-    echo "$base_priority"
+    echo "1"
 }
 
 ntfy_send() {
@@ -451,110 +448,27 @@ ntfy_send() {
 }
 
 
-tg_send() {
-    local html="$1"
-    local resp http_code ok
-
-    resp=$(curl -sS -w "\nHTTP_CODE:%{http_code}\n" -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
-        -d "chat_id=${TG_CHAT_ID}" \
-        --data-urlencode "text=${html}" \
-        -d "parse_mode=HTML" \
-        -d "disable_web_page_preview=true" \
-        --connect-timeout 8 --max-time 15)
-
-    http_code=$(echo "$resp" | awk -F: '/HTTP_CODE:/{print $2}' | tail -n 1)
-    ok=$(echo "$resp" | sed '/HTTP_CODE:/d' | jq -r '.ok // empty' 2>/dev/null)
-
-    if [[ "$http_code" == "200" && "$ok" == "true" ]]; then
-        return 0
-    fi
-
-    log_cron "Telegram 发送失败：resp=$(echo "$resp" | sed '/HTTP_CODE:/d' | tr '\n' ' ' | cut -c1-1200)"
-    return 1
-}
-
-pushplus_send() {
-    local title="$1"
-    local content="$2"
-    local resp http_code code
-
-    local topic_arg=()
-    [[ -n "$PUSHPLUS_TOPIC" ]] && topic_arg=(-d "topic=${PUSHPLUS_TOPIC}")
-
-    resp=$(curl -sS -w "\nHTTP_CODE:%{http_code}\n" -X POST "$PUSHPLUS_ENDPOINT" \
-        -d "token=${PUSHPLUS_TOKEN}" \
-        "${topic_arg[@]}" \
-        --data-urlencode "title=${title}" \
-        --data-urlencode "content=${content}" \
-        -d "template=${PUSHPLUS_TEMPLATE}" \
-        --connect-timeout 8 --max-time 15)
-
-    http_code=$(echo "$resp" | awk -F: '/HTTP_CODE:/{print $2}' | tail -n 1)
-    code=$(echo "$resp" | sed '/HTTP_CODE:/d' | jq -r '.code // empty' 2>/dev/null)
-
-    if [[ "$http_code" == "200" && "$code" == "200" ]]; then
-        return 0
-    fi
-
-    log_cron "PushPlus 发送失败：resp=$(echo "$resp" | sed '/HTTP_CODE:/d' | tr '\n' ' ' | cut -c1-1200)"
-    return 1
-}
-
 test_push() {
     local title="🖥️ [${MACHINE_NAME}] 测试消息"
     local plain="${title}\n\n这是一条测试消息，如果您收到此推送，说明配置正常！"
-    local tg_html="<b>${title}</b>
-这是一条测试消息，如果您收到此推送，说明配置正常！"
-    local pp_html="<b>${title}</b><br><br>这是一条测试消息，如果您收到此推送，说明配置正常！"
 
-    case "$PUSH_CHANNEL" in
-        tg)
-            tg_send "$tg_html" && log_cron "Telegram 测试推送成功" || log_cron "Telegram 测试推送失败"
-            ;;
-        pushplus)
-            pushplus_send "$title" "$pp_html" && log_cron "PushPlus 测试推送成功" || log_cron "PushPlus 测试推送失败"
-            ;;
-        ntfy)
-            ntfy_send "$(printf "%b" "$plain")" && log_cron "ntfy 测试推送成功" || log_cron "ntfy 测试推送失败"
-            ;;
-    esac
+    ntfy_send "$(printf "%b" "$plain")" && log_cron "ntfy 测试推送成功" || log_cron "ntfy 测试推送失败"
 
     echo -e "$plain"
 }
 
 
 daily_report() {
-    local out title plain tg_html pp_html
+    local out plain
     out=$(build_report) || { log_cron "生成报告失败（流量来源/配置/依赖异常）"; return 1; }
 
-    title=$(echo "$out" | awk 'BEGIN{RS="__SPLIT__"; ORS=""} NR==1{print}' | sed 's/\n$//')
     plain=$(echo "$out" | awk 'BEGIN{RS="__SPLIT__"; ORS=""} NR==2{print}' | sed 's/\n$//')
-    tg_html=$(echo "$out" | awk 'BEGIN{RS="__SPLIT__"; ORS=""} NR==3{print}' | sed 's/\n$//')
-    pp_html=$(echo "$out" | awk 'BEGIN{RS="__SPLIT__"; ORS=""} NR==4{print}' | sed 's/\n$//')
 
-    case "$PUSH_CHANNEL" in
-        tg)
-            if tg_send "$tg_html"; then
-                log_cron "Telegram 推送成功"
-            else
-                log_cron "Telegram 推送失败"
-            fi
-            ;;
-        pushplus)
-            if pushplus_send "$title" "$pp_html"; then
-                log_cron "PushPlus 推送成功"
-            else
-                log_cron "PushPlus 推送失败"
-            fi
-            ;;
-        ntfy)
-            if ntfy_send "$plain"; then
-                log_cron "ntfy 推送成功"
-            else
-                log_cron "ntfy 推送失败"
-            fi
-            ;;
-    esac
+    if ntfy_send "$plain"; then
+        log_cron "ntfy 推送成功"
+    else
+        log_cron "ntfy 推送失败"
+    fi
 
     echo -e "$plain"
 }
@@ -603,7 +517,7 @@ flow_setting() {
 
 initial_config() {
     echo "======================================"
-    echo "     修改 Push（TG / PushPlus / ntfy）配置"
+    echo "     修改 Push（仅 ntfy）配置"
     echo "======================================"
     echo
 
@@ -628,82 +542,7 @@ initial_config() {
         read_input new_expire
     done
 
-    echo
-    echo "请选择推送渠道："
-    echo "1) Telegram"
-    echo "2) PushPlus"
-    echo "3) ntfy"
-    echo "当前: ${PUSH_CHANNEL:-tg}"
-    read_input ch "选择 (1-3) [回车保持当前]: "
-    if [[ -n "$ch" ]]; then
-        case "$ch" in
-            1) PUSH_CHANNEL="tg" ;;
-            2) PUSH_CHANNEL="pushplus" ;;
-            3) PUSH_CHANNEL="ntfy" ;;
-            *) echo "无效选择，保持当前：${PUSH_CHANNEL:-tg}" ;;
-        esac
-    else
-        PUSH_CHANNEL=${PUSH_CHANNEL:-tg}
-    fi
-
-    if [[ "$PUSH_CHANNEL" == "both" ]]; then
-        PUSH_CHANNEL="tg"
-    fi
-
-    if [[ "$PUSH_CHANNEL" == "tg" ]]; then
-        echo
-        echo "===== Telegram 配置 ====="
-        if [ -n "$TG_BOT_TOKEN" ]; then
-            local tshow="${TG_BOT_TOKEN:0:8}...${TG_BOT_TOKEN: -4}"
-            echo "请输入 Bot Token [当前: $tshow]: "
-        else
-            echo "请输入 Bot Token: "
-        fi
-        read_input new_token
-        [[ -z "$new_token" && -n "$TG_BOT_TOKEN" ]] && new_token="$TG_BOT_TOKEN"
-        while [ -z "$new_token" ]; do echo "不能为空！"; read_input new_token; done
-
-        if [ -n "$TG_CHAT_ID" ]; then
-            echo "请输入 Chat ID [当前: $TG_CHAT_ID]: "
-        else
-            echo "请输入 Chat ID: "
-        fi
-        read_input new_chat
-        [[ -z "$new_chat" && -n "$TG_CHAT_ID" ]] && new_chat="$TG_CHAT_ID"
-        while [ -z "$new_chat" ]; do echo "不能为空！"; read_input new_chat; done
-
-        TG_BOT_TOKEN="$new_token"
-        TG_CHAT_ID="$new_chat"
-    fi
-
-    if [[ "$PUSH_CHANNEL" == "pushplus" ]]; then
-        echo
-        echo "===== PushPlus 配置 ====="
-        if [[ -n "$PUSHPLUS_TOKEN" ]]; then
-            local pshow="${PUSHPLUS_TOKEN:0:6}...${PUSHPLUS_TOKEN: -4}"
-            echo "请输入 PushPlus Token [当前: $pshow]（回车保持）: "
-        else
-            echo "请输入 PushPlus Token: "
-        fi
-        read_input new_ptoken
-        [[ -z "$new_ptoken" && -n "$PUSHPLUS_TOKEN" ]] && new_ptoken="$PUSHPLUS_TOKEN"
-        while [ -z "$new_ptoken" ]; do echo "不能为空！"; read_input new_ptoken; done
-
-        echo "请输入 PushPlus Topic（可选，回车跳过）[当前: ${PUSHPLUS_TOPIC:-空}]: "
-        read_input new_topic
-        [[ -z "$new_topic" ]] && new_topic="$PUSHPLUS_TOPIC"
-
-        echo "PushPlus Template（默认 html）[当前: ${PUSHPLUS_TEMPLATE:-html}]："
-        read_input new_tpl
-        [[ -z "$new_tpl" ]] && new_tpl="${PUSHPLUS_TEMPLATE:-html}"
-
-        PUSHPLUS_TOKEN="$new_ptoken"
-        PUSHPLUS_TOPIC="$new_topic"
-        PUSHPLUS_TEMPLATE="$new_tpl"
-        PUSHPLUS_ENDPOINT="$PUSHPLUS_ENDPOINT_DEFAULT"
-    fi
-
-
+    PUSH_CHANNEL="ntfy"
 
     if [[ "$PUSH_CHANNEL" == "ntfy" ]]; then
         echo
@@ -905,7 +744,7 @@ main() {
     while true; do
         clear
         echo -e "${BLUE}======================================${PLAIN}"
-        echo -e "${PURPLE}     Push（TG / PushPlus / ntfy）管理菜单${PLAIN}"
+        echo -e "${PURPLE}     Push（仅 ntfy）管理菜单${PLAIN}"
         echo -e "${BLUE}======================================${PLAIN}"
         echo -e "${GREEN}1.${PLAIN} 修改${PURPLE}推送配置${PLAIN}"
         echo -e "${GREEN}2.${PLAIN} 发送${YELLOW}每日报告${PLAIN}"
