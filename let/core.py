@@ -1,5 +1,6 @@
 import json
 import time
+import threading
 from bs4 import BeautifulSoup
 from datetime import datetime, timezone, timedelta
 from send import NotificationSender
@@ -23,6 +24,9 @@ scraper = cfscrape.create_scraper()
 class ForumTask:
     def __init__(self, config_path='data/config.json'):
         self.config_path = config_path
+        self._shutdown = False
+        self._rss_wakeup = threading.Event()
+        self._comment_wakeup = threading.Event()
         self.load_config()
 
         # 原生轻量版：使用 SQLite 替代 MongoDB，但保留原始策略。
@@ -238,6 +242,15 @@ class ForumTask:
     def shutdown(self):
         """标记停机，主循环退出。"""
         self._shutdown = True
+        self._rss_wakeup.set()
+        self._comment_wakeup.set()
+
+    def request_immediate_scan(self, rss=False, comments=False):
+        """唤醒对应巡检线程，使已开启的扫描立即执行下一轮。"""
+        if rss:
+            self._rss_wakeup.set()
+        if comments:
+            self._comment_wakeup.set()
 
     # -------- RSS LET/LES -----------
     def check_lets(self, urls):
@@ -793,14 +806,15 @@ class ForumTask:
                     print(f"[{self.current_time()}] 手动链接扫描关闭：不扫描、不记录、不推送")
 
                 print(f"[{self.current_time()}] 手动爬楼结束，休眠 {freq} 秒...")
-                for _ in range(freq):
-                    if getattr(self, '_shutdown', False):
-                        print(f"[{self.current_time()}] 检测到停机信号，线程退出")
-                        return
-                    time.sleep(1)
+                self._comment_wakeup.wait(timeout=freq)
+                self._comment_wakeup.clear()
+                if getattr(self, '_shutdown', False):
+                    print(f"[{self.current_time()}] 检测到停机信号，线程退出")
+                    return
             except Exception as e:
                 print(f"发生错误: {e}")
-                time.sleep(60)
+                self._comment_wakeup.wait(timeout=60)
+                self._comment_wakeup.clear()
 
     def _rss_loop(self):
         """独立 RSS 巡检线程，不受爬楼阻塞。"""
@@ -821,13 +835,14 @@ class ForumTask:
                     print(f"[{self.current_time()}] RSS 扫描关闭：不扫描、不记录、不推送")
 
                 print(f"[{self.current_time()}] RSS 巡检结束，休眠 {freq} 秒...")
-                for _ in range(freq):
-                    if getattr(self, '_shutdown', False):
-                        return
-                    time.sleep(1)
+                self._rss_wakeup.wait(timeout=freq)
+                self._rss_wakeup.clear()
+                if getattr(self, '_shutdown', False):
+                    return
             except Exception as e:
                 print(f"RSS 巡检异常: {e}")
-                time.sleep(60)
+                self._rss_wakeup.wait(timeout=60)
+                self._rss_wakeup.clear()
 
     def reload(self):
         print("重新加载配置...")

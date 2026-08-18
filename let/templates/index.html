@@ -694,12 +694,6 @@
           justify-content: center;
           line-height: 1;
         }
-        .hero-actions .hero-enable {
-          background: #63c83d !important;
-          border-color: #63c83d !important;
-          color: #fff !important;
-          box-shadow: none !important;
-        }
         .hero-actions .hero-logout,
         .hero-actions .hero-exit {
           background: rgba(255,255,255,.12) !important;
@@ -827,12 +821,6 @@
           align-items: center;
           justify-content: center;
           line-height: 1;
-        }
-        .hero-actions .hero-enable {
-          background: #63c83d !important;
-          border-color: #63c83d !important;
-          color: #fff !important;
-          box-shadow: none !important;
         }
         .hero-actions .hero-exit,
         .hero-actions .hero-logout {
@@ -1109,7 +1097,6 @@
                 <div class="hero-mainline">
                     <h1>LET监控</h1>
                     <div class="hero-actions" v-if="isAuthenticated">
-                        <el-button class="hero-enable" size="small" type="success" :loading="applyingConfig" @click="applyCurrentConfig">启用</el-button>
                         <button class="hero-logout hero-exit" @click="logout">退出</button>
                     </div>
                 </div>
@@ -1380,7 +1367,7 @@
                 </div>
             </div>
             <div class="log-actions" v-if="showLogs">
-                <el-button class="unified-pill" size="small" @click="fetchLogs">刷新</el-button>
+                <el-button class="unified-pill" size="small" :loading="manualScanning" @click="manualScanNow">刷新</el-button>
                 <el-button class="unified-pill" size="small" :type="logMode === 'rss_all' ? 'success' : 'default'" plain @click="setLogMode('rss_all')">RSS全部</el-button>
                 <el-button class="unified-pill" size="small" :type="logMode === 'rss_hits' ? 'success' : 'default'" plain @click="setLogMode('rss_hits')">RSS命中</el-button>
                 <el-button class="unified-pill" size="small" :type="logMode === 'comment_all' ? 'success' : 'default'" plain @click="setLogMode('comment_all')">楼层全部</el-button>
@@ -1461,7 +1448,7 @@ createApp({
             testingPushPlus: false,
             testingNtfy: false,
             testingGotify: false,
-            applyingConfig: false,
+            manualScanning: false,
             testingAI: false,
             showLogs: localStorage.getItem('showRuntimeLogs') !== 'false',
             // 四个独立视图各自的数据（与后端 rss_all / rss_hits / comment_all / comment_hits 一一对应）
@@ -1558,6 +1545,20 @@ createApp({
                 else if (this.logMode === 'comment_hits') this.commentHitsLogs = rows;
             });
         },
+        manualScanNow() {
+            if (!this.isAuthenticated || this.manualScanning) return;
+            this.manualScanning = true;
+            axios.post('/api/scan-now', {}, { headers: this.authHeader() }).then(response => {
+                ElementPlus.ElMessage.success(response.data.message || '已手动触发一次扫描');
+                this.fetchLogs();
+                setTimeout(() => this.fetchLogs(), 1200);
+                setTimeout(() => this.fetchLogs(), 3000);
+            }).catch(() => {
+                ElementPlus.ElMessage.error('手动执行失败，请查看后端日志');
+            }).finally(() => {
+                this.manualScanning = false;
+            });
+        },
         normalizeConfig(data) {
             this.config = Object.assign({}, this.config, data || {});
             if (this.config.enable_rss === undefined) this.config.enable_rss = false;
@@ -1650,18 +1651,6 @@ createApp({
             }
             this.filterEditing = false;
             this.filterSnapshot = null;
-        },
-        applyCurrentConfig() {
-            this.applyingConfig = true;
-            axios.post('/api/config', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {
-                ElementPlus.ElMessage.success(response.data.message || '当前配置已启用');
-                this.fetchConfig();
-                if (this.showLogs) this.fetchLogs();
-            }).catch(() => {
-                ElementPlus.ElMessage.error('启用失败，请查看后端日志');
-            }).finally(() => {
-                this.applyingConfig = false;
-            });
         },
         updateConfig(callback) {
             axios.post('/api/config', { config: this.buildConfigToSend() }, { headers: this.authHeader() }).then(response => {

@@ -151,8 +151,34 @@ def config():
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump({"config": config_data}, f, indent=4, ensure_ascii=False)
         engine.reload()
+        engine.request_immediate_scan(
+            rss=bool(config_data.get('enable_rss', False)),
+            comments=bool(config_data.get('enable_extra_urls', False)),
+        )
         return jsonify({"status": "success", "message": "配置已保存并重新加载"})
     return jsonify(engine.config)
+
+
+@app.route('/api/scan-now', methods=['POST'])
+@require_auth
+def scan_now():
+    """手动执行一次当前已开启的扫描，不修改配置。"""
+    engine.reload()
+    rss_enabled = bool(engine.config.get('enable_rss', False))
+    extra_enabled = bool(engine.config.get('enable_extra_urls', False))
+    engine.request_immediate_scan(rss=rss_enabled, comments=extra_enabled)
+
+    triggered = []
+    if rss_enabled:
+        triggered.append("RSS 新主题帖")
+    if extra_enabled:
+        triggered.append("手动帖子楼层")
+
+    if triggered:
+        message = "已手动触发一次扫描：" + "、".join(triggered)
+    else:
+        message = "RSS 和手动帖子楼层扫描均未开启，本次未执行扫描"
+    return jsonify({"status": "success", "message": message, "triggered": triggered})
 
 
 @app.route('/api/runtime-logs', methods=['GET', 'DELETE'])
