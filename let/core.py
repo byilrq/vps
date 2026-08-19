@@ -370,20 +370,9 @@ class ForumTask:
     def handle_thread(self, thread):
         rss_index = thread.get('rss_index')
         rss_limit = thread.get('rss_limit') or self.config.get('rss_scan_limit', 10)
-        rss_trace_prefix = f"RSS 前{rss_limit}条第{rss_index}条：" if rss_index else f"RSS 前{rss_limit}条："
+        rss_prefix = f"RSS 主题帖 第{rss_index}条/前{rss_limit}条" if rss_index else f"RSS 主题帖 前{rss_limit}条"
 
-        # RSS 主题唯一键：以 thread['link'] 为准。
-        # 同一个主题不管 AI 每次总结是否不同，都只允许推送一次。
         thread_link = (thread.get('link') or '').strip()
-
-        def rss_features(*items):
-            features = [f"RSS前{rss_limit}条"]
-            if rss_index:
-                features.append(f"第{rss_index}条")
-            for item in items:
-                if item:
-                    features.append(str(item))
-            return features
 
         def log_thread(matched, reason, features, push_message=""):
             self.record_runtime_log(
@@ -441,8 +430,8 @@ class ForumTask:
 
         # 已推送过的主题，每周期记录一条日志，便于在 RSS 全部中看到状态跟踪。
         if already_pushed:
-            reason = f"{rss_trace_prefix}主题帖已存在，已推送"
-            features = rss_features("已存在", "已推送")
+            reason = rss_prefix
+            features = ["命中", "已推送", "已处理"]
             save_state(True, reason, features, exists.get('rss_push_message', '') if exists else '')
             log_thread(False, reason, features, exists.get('rss_push_message', '') if exists else '')
             return
@@ -459,8 +448,13 @@ class ForumTask:
             )
         )
         if already_processed:
-            reason = f"{rss_trace_prefix}主题帖已存在，已过滤处理，跳过重复过滤"
-            features = rss_features("已存在", "已处理跳过")
+            stored_reason = str(exists.get('rss_filter_reason', '') or '')
+            if '超24小时' in stored_reason:
+                reason = rss_prefix
+                features = ["超24小时", "未推送", "已处理"]
+            else:
+                reason = rss_prefix
+                features = ["过滤未通过", "未推送", "已处理"]
             save_state(False, reason, features)
             log_thread(False, reason, features)
             return
@@ -469,8 +463,8 @@ class ForumTask:
         restrict_24h = self.config.get('restrict_24h', False)
 
         if restrict_24h and age_seconds > 86400:
-            reason = f"{rss_trace_prefix}主题帖已存在，未推送，超过 24 小时限制" if exists else f"{rss_trace_prefix}新主题超过 24 小时，未推送"
-            features = rss_features("未推送", "超过24小时限制")
+            reason = rss_prefix
+            features = ["超24小时", "未推送", "已处理"]
             save_state(False, reason, features)
             log_thread(False, reason, features)
             return
@@ -481,8 +475,8 @@ class ForumTask:
                 self.config.get('thread_keywords_rule', '')
             )
         ):
-            reason = f"{rss_trace_prefix}主题帖已存在，未推送，主题关键词未命中" if exists else f"{rss_trace_prefix}新主题关键词未命中，未推送"
-            features = rss_features("未推送", "主题关键词未命中")
+            reason = rss_prefix
+            features = ["过滤未通过", "未推送", "已处理"]
             save_state(False, reason, features)
             log_thread(False, reason, features)
             return
@@ -490,8 +484,8 @@ class ForumTask:
         if self.config.get('use_ai_filter', False):
             ai_description = self.filter.ai_filter(thread['description'], self.config['thread_prompt'])
             if 'false' in ai_description.lower():
-                reason = f"{rss_trace_prefix}主题帖已存在，未推送，AI 过滤未通过" if exists else f"{rss_trace_prefix}新主题 AI 过滤未通过，未推送"
-                features = rss_features("未推送", "AI过滤未通过")
+                reason = f"{rss_prefix}，过滤未通过，未推送，已处理"
+                features = []
                 save_state(False, reason, features)
                 log_thread(False, reason, features)
                 return
@@ -503,8 +497,8 @@ class ForumTask:
         # 当前配置下命中，并且没有推送记录，只推送一次。
         self.notifier.send_message(msg)
 
-        reason = f"{rss_trace_prefix}主题帖已存在，已补推" if exists else f"{rss_trace_prefix}新主题命中，已推送"
-        features = rss_features("命中", "已推送")
+        reason = f"{rss_prefix}，命中，已推送，已处理"
+        features = []
         push_message = ai_description or msg
         save_state(True, reason, features, push_message)
         log_thread(True, reason, features, push_message)

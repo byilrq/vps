@@ -1733,9 +1733,9 @@ createApp({
         },
         featureTagType(feature, row) {
             const f = String(feature || '');
-            if (/已推送|已补推|命中/.test(f)) return 'success';
-            if (/未推送|未命中|超过24小时|AI过滤未通过|主题关键词未命中/.test(f)) return 'info';
-            if (/第\d+条|RSS前10条/.test(f)) return row && row.matched ? 'success' : 'info';
+            if (/命中|已推送|已处理/.test(f)) return 'success';
+            if (/超24小时/.test(f)) return 'warning';
+            if (/过滤未通过|未推送|未处理/.test(f)) return 'danger';
             return row && row.matched ? 'success' : 'info';
         },
         visibleFeatures(features) {
