@@ -2804,6 +2804,137 @@ test_socks5_landing() {
 }
 
 # -----------------------------
+# 函数：最终测试 Hy2 中转与 SOCKS5 落地连通性
+# -----------------------------
+run_hy2_relay_connectivity_test() {
+  local config_file="/etc/hysteria/config.yaml"
+  local addr user password host port hy_service
+  local ping_output ping_avg ping_loss
+  local result_file curl_meta test_ip connect_s start_s total_s http_code
+  local connect_ms start_ms total_ms
+  local hy_ok="false" landing_ok="false"
+
+  echo ""
+  green "================ 最终连通性测试 ================"
+
+  if [[ ! -s "$config_file" ]]; then
+    red "[中转] Hysteria 2 配置不存在：$config_file"
+    return 1
+  fi
+
+  hy_service=$(get_hysteria_service_name)
+  if systemctl is-active --quiet "$hy_service"; then
+    green "[中转] Hysteria 2 服务：正常运行"
+    hy_ok="true"
+  else
+    red "[中转] Hysteria 2 服务：未正常运行"
+  fi
+
+  if ! grep -qE '^outbounds:[[:space:]]*$' "$config_file"; then
+    yellow "[中转] 当前模式：日本本机直连，未配置 SOCKS5 落地。"
+    return 1
+  fi
+
+  addr=$(awk '/^outbounds:/{f=1;next} f && /addr:/{sub(/^[[:space:]]*addr:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$config_file")
+  user=$(awk '/^outbounds:/{f=1;next} f && /username:/{sub(/^[[:space:]]*username:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$config_file")
+  password=$(awk '/^outbounds:/{f=1;next} f && /password:/{sub(/^[[:space:]]*password:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$config_file")
+
+  if [[ ! "$addr" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+    red "[中转] 无法解析 SOCKS5 地址：$addr"
+    return 1
+  fi
+
+  host="${BASH_REMATCH[1]}"
+  port="${BASH_REMATCH[2]}"
+
+  yellow "[中转] 日本 -> 落地 IPv6：$host"
+  yellow "[落地] SOCKS5：[$host]:$port"
+
+  if command -v ping >/dev/null 2>&1; then
+    ping_output=$(ping -6 -c 4 -W 2 "$host" 2>/dev/null || true)
+    ping_avg=$(printf '%s\n' "$ping_output" | awk -F'=' '/rtt min|round-trip min/ {gsub(/ ms/,"",$2); gsub(/ /,"",$2); split($2,a,"/"); print a[2]; exit}')
+    ping_loss=$(printf '%s\n' "$ping_output" | awk -F',' '/packet loss/ {for(i=1;i<=NF;i++) if($i ~ /packet loss/) {gsub(/^[[:space:]]+|[[:space:]]+$/,"",$i); print $i; exit}}')
+    if [[ -n "$ping_avg" ]]; then
+      green "[中转] IPv6 Ping：正常，平均 RTT ${ping_avg} ms${ping_loss:+，$ping_loss}"
+    else
+      yellow "[中转] IPv6 Ping：无响应（可能禁 ICMP），继续进行 SOCKS5 实际连接测试。"
+    fi
+  else
+    yellow "[中转] 系统未安装 ping，跳过 ICMP 延迟测试。"
+  fi
+
+  result_file=$(mktemp /tmp/hy2-relay-test.XXXXXX)
+  curl_meta=$(curl -fsS --connect-timeout 6 --max-time 20 \
+    --proxy "socks5h://[$host]:$port" \
+    --proxy-user "$user:$password" \
+    -o "$result_file" \
+    -w '%{time_connect}|%{time_starttransfer}|%{time_total}|%{http_code}' \
+    https://api.ipify.org 2>/dev/null || true)
+  test_ip=$(tr -d '\r\n ' < "$result_file" 2>/dev/null || true)
+
+  if [[ -z "$test_ip" ]]; then
+    : > "$result_file"
+    curl_meta=$(curl -fsS --connect-timeout 6 --max-time 20 \
+      --proxy "socks5h://[$host]:$port" \
+      --proxy-user "$user:$password" \
+      -o "$result_file" \
+      -w '%{time_connect}|%{time_starttransfer}|%{time_total}|%{http_code}' \
+      https://ip.sb 2>/dev/null || true)
+    test_ip=$(tr -d '\r\n ' < "$result_file" 2>/dev/null || true)
+  fi
+  rm -f "$result_file" >/dev/null 2>&1 || true
+
+  IFS='|' read -r connect_s start_s total_s http_code <<< "$curl_meta"
+  if [[ "$connect_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    connect_ms=$(awk -v v="$connect_s" 'BEGIN {printf "%.1f", v*1000}')
+  fi
+  if [[ "$start_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    start_ms=$(awk -v v="$start_s" 'BEGIN {printf "%.1f", v*1000}')
+  fi
+  if [[ "$total_s" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+    total_ms=$(awk -v v="$total_s" 'BEGIN {printf "%.1f", v*1000}')
+  fi
+
+  if [[ -n "$test_ip" ]]; then
+    green "[中转] SOCKS5 连接：正常"
+    [[ -n "$connect_ms" ]] && green "[中转] 日本 -> 落地 TCP 建连耗时：约 ${connect_ms} ms"
+    [[ -n "$start_ms" ]] && yellow "[链路] 经落地到公网首包耗时：约 ${start_ms} ms"
+    [[ -n "$total_ms" ]] && yellow "[链路] 本次公网请求总耗时：约 ${total_ms} ms"
+
+    if is_valid_ipv4 "$test_ip"; then
+      green "[落地] IPv4 出口：$test_ip（正常）"
+      landing_ok="true"
+    else
+      red "[落地] 出口返回：$test_ip（不是 IPv4）"
+      yellow "请检查 Xray Freedom 出站是否仍为 ForceIPv4。"
+    fi
+  else
+    red "[中转] SOCKS5 实际连接：失败"
+    yellow "请检查落地机 IPv6、SOCKS5 服务、端口、用户名/密码及安全组。"
+  fi
+
+  echo " ---------------------------------------------------"
+  if [[ "$hy_ok" == "true" && "$landing_ok" == "true" ]]; then
+    green "最终结果：中转正常，落地正常，IPv4 出口正常。"
+    green "链路：用户 -> 日本 Hy2 -> IPv6 SOCKS5 -> 落地机 -> IPv4 Internet"
+    return 0
+  fi
+
+  red "最终结果：链路存在异常，请根据上方失败项检查。"
+  return 1
+}
+
+# -----------------------------
+# 函数：从中转菜单手动执行连通性测试
+# -----------------------------
+test_hy2_relay_connectivity_menu() {
+  clear
+  run_hy2_relay_connectivity_test || true
+  echo ""
+  read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
 # 函数：配置现有 Hysteria 2 使用固定 IPv6 SOCKS5 落地
 # -----------------------------
 configure_hy2_relay_fixed() {
@@ -2970,7 +3101,12 @@ PYC
   yellow "配置备份：$backup_file"
   echo ""
   green "当前所有 Hy2 代理流量将固定通过该 SOCKS5 落地机。"
+  echo ""
+  green "开始执行最终连通性测试..."
+  run_hy2_relay_connectivity_test || true
+  echo ""
   yellow "落地机不可用时，请在菜单 12 -> 2 手动恢复日本直连。"
+  yellow "需要重新检测时，请在菜单 12 -> 4 执行连通性测试。"
   read -erp "回车返回菜单..." _
 }
 
@@ -3088,15 +3224,17 @@ menu_hy2_relay() {
     echo -e " ${GREEN}1.${tianlan} 配置/更换 IPv6 SOCKS5 落地"
     echo -e " ${GREEN}2.${tianlan} 恢复日本本机直连"
     echo -e " ${GREEN}3.${tianlan} 查看当前中转状态"
+    echo -e " ${GREEN}4.${tianlan} 中转/落地连通性测试"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo ""
-    read -erp "请选择 [0-3]: " relayAnswer
+    read -erp "请选择 [0-4]: " relayAnswer
 
     case "$relayAnswer" in
       1) configure_hy2_relay_fixed ;;
       2) restore_hy2_direct ;;
       3) show_hy2_relay ;;
+      4) test_hy2_relay_connectivity_menu ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
