@@ -2671,12 +2671,145 @@ is_valid_ipv4() {
 }
 
 # -----------------------------
-# 函数：将现有 Hysteria 2 配置为 SOCKS5 中转站
+# 函数：校验 IPv6 地址（支持标准 IPv6 文本，不接受域名）
 # -----------------------------
-configure_hy2_relay() {
+is_valid_ipv6() {
+  local value="$1"
+  value="${value#[}"
+  value="${value%]}"
+  [[ -n "$value" && "$value" == *:* ]] || return 1
+
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$value" <<'PYC' >/dev/null 2>&1
+import ipaddress
+import sys
+try:
+    ipaddress.IPv6Address(sys.argv[1])
+except Exception:
+    raise SystemExit(1)
+PYC
+    return $?
+  fi
+
+  [[ "$value" =~ ^[0-9A-Fa-f:]+$ ]]
+}
+
+# -----------------------------
+# 函数：读取必须填写的密码（可用 Backspace/方向键修改）
+# -----------------------------
+read_required_password() {
+  local __var="$1"
+  local prompt="$2"
+  local value
+
+  read -erp "$prompt" value
+  if [[ -z "$value" ]]; then
+    red "密码不能为空。"
+    return 1
+  fi
+
+  if [[ ! "$value" =~ ^[A-Za-z0-9._~@%+-]+$ ]]; then
+    red "密码仅支持字母、数字和 . _ ~ @ % + -"
+    return 1
+  fi
+
+  printf -v "$__var" '%s' "$value"
+  return 0
+}
+
+# -----------------------------
+# 函数：获取本机公网 IPv6
+# -----------------------------
+get_public_ipv6() {
+  local v6
+  v6=$(curl -6fsS --max-time 8 ip.sb 2>/dev/null | tr -d '\r\n' || true)
+  if ! is_valid_ipv6 "$v6"; then
+    v6=$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | grep -v '^fd' | head -n1)
+  fi
+  is_valid_ipv6 "$v6" || return 1
+  printf '%s' "$v6"
+}
+
+# -----------------------------
+# 函数：读取 Xray 可执行文件
+# -----------------------------
+get_xray_bin() {
+  if [[ -x /usr/local/bin/xray ]]; then
+    echo "/usr/local/bin/xray"
+  elif [[ -x /usr/bin/xray ]]; then
+    echo "/usr/bin/xray"
+  elif command -v xray >/dev/null 2>&1; then
+    command -v xray
+  else
+    return 1
+  fi
+}
+
+# -----------------------------
+# 函数：删除 Hysteria 2 顶层 outbounds 配置块
+# -----------------------------
+remove_hy2_outbounds_block() {
+  local config_file="${1:-/etc/hysteria/config.yaml}"
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  python3 - "$config_file" <<'PYC'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+lines = path.read_text().splitlines(keepends=True)
+start = None
+end = None
+for index, line in enumerate(lines):
+    if re.match(r'^outbounds:\s*(?:#.*)?$', line.rstrip('\r\n')):
+        start = index
+        for next_index in range(index + 1, len(lines)):
+            candidate = lines[next_index]
+            if candidate.strip() and not candidate.startswith((' ', '\t', '#')):
+                end = next_index
+                break
+        if end is None:
+            end = len(lines)
+        break
+
+if start is not None:
+    del lines[start:end]
+
+path.write_text(''.join(lines).rstrip() + '\n')
+PYC
+}
+
+# -----------------------------
+# 函数：通过 SOCKS5 测试落地出口
+# -----------------------------
+test_socks5_landing() {
+  local host="$1" port="$2" user="$3" password="$4"
+  local result=""
+
+  result=$(curl -fsS --connect-timeout 5 --max-time 15 \
+    --proxy "socks5h://[$host]:$port" \
+    --proxy-user "$user:$password" \
+    https://api.ipify.org 2>/dev/null | tr -d '\r\n' || true)
+
+  if [[ -z "$result" ]]; then
+    result=$(curl -fsS --connect-timeout 5 --max-time 15 \
+      --socks5-hostname "[$host]:$port" \
+      --proxy-user "$user:$password" \
+      https://ip.sb 2>/dev/null | tr -d '\r\n' || true)
+  fi
+
+  [[ -n "$result" ]] || return 1
+  printf '%s' "$result"
+}
+
+# -----------------------------
+# 函数：配置现有 Hysteria 2 使用固定 IPv6 SOCKS5 落地
+# -----------------------------
+configure_hy2_relay_fixed() {
   local config_file="/etc/hysteria/config.yaml"
   local exit_host exit_port exit_user exit_password exit_addr
-  local backup_file hy_service
+  local backup_file hy_service test_ip continue_anyway
 
   if [[ ! -s "$config_file" ]]; then
     red "未检测到 Hysteria 2 配置：$config_file"
@@ -2685,22 +2818,29 @@ configure_hy2_relay() {
     return 1
   fi
 
-  green "配置 Hysteria 2 SOCKS5 中转出口"
-  yellow "请填写落地机菜单最终打印的 SOCKS5 参数。"
+  if ! command -v python3 >/dev/null 2>&1; then
+    green "安装配置写入依赖 python3"
+    pkg_install python3 >/dev/null 2>&1 || {
+      red "安装 python3 失败。"
+      read -erp "回车返回菜单..." _
+      return 1
+    }
+  fi
+
+  clear
+  green "Hysteria 2 固定中转配置"
+  echo ""
+  yellow "链路：用户 -> 日本 Hy2 -> IPv6 SOCKS5 -> 落地机 -> IPv4 Internet"
+  yellow "说明：该模式为固定出口；落地机故障时不会自动切回日本 IPv4。"
+  yellow "需要恢复日本直连时，请回到“中转配置”菜单选择“恢复日本直连”。"
+  echo ""
 
   while true; do
-    read_confirmed exit_host "请输入落地机 IP 或域名（不带端口）: " || return 1
-    exit_host="$(normalize_host_input "$exit_host")"
+    read_confirmed exit_host "请输入落地机公网 IPv6（不带 [] 和端口）: " || return 1
     exit_host="${exit_host#[}"
     exit_host="${exit_host%]}"
-
-    if [[ "$exit_host" == *:* ]]; then
-      [[ "$exit_host" =~ ^[0-9A-Fa-f:]+$ ]] && break
-    elif [[ "$exit_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
-      break
-    fi
-
-    red "出口地址格式无效，请输入 IPv4、IPv6 或域名。"
+    is_valid_ipv6 "$exit_host" && break
+    red "IPv6 地址格式无效，请重新输入。"
   done
 
   while true; do
@@ -2717,26 +2857,46 @@ configure_hy2_relay() {
     red "用户名仅支持字母、数字和 . _ ~ -"
   done
 
-  read_confirmed_password exit_password "请输入 SOCKS5 密码（回车随机）: " || return 1
+  while true; do
+    read_required_password exit_password "请输入落地机 SOCKS5 密码: " && break
+  done
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    green "安装中转配置写入依赖"
-    pkg_install python3 >/dev/null 2>&1 || {
-      red "安装 python3 失败，无法安全写入 Hysteria 2 配置。"
-      read -erp "回车返回菜单..." _
-      return 1
-    }
+  exit_addr="[$exit_host]:$exit_port"
+
+  echo ""
+  green "正在测试日本机 -> 落地机 IPv6 SOCKS5..."
+  if ping -6 -c 2 -W 2 "$exit_host" >/dev/null 2>&1; then
+    green "IPv6 基础连通：正常"
+  else
+    yellow "IPv6 Ping 未响应（可能是 ICMP 被禁），继续测试 SOCKS5。"
   fi
 
-  if [[ "$exit_host" == *:* ]]; then
-    exit_addr="[$exit_host]:$exit_port"
+  test_ip=$(test_socks5_landing "$exit_host" "$exit_port" "$exit_user" "$exit_password" || true)
+  if [[ -n "$test_ip" ]]; then
+    green "SOCKS5 连接测试：成功"
+    if is_valid_ipv4 "$test_ip"; then
+      green "落地出口测试：$test_ip（IPv4，符合预期）"
+    else
+      yellow "落地出口测试返回：$test_ip"
+      yellow "未识别为 IPv4，请确认落地机是否已强制 IPv4 出口。"
+    fi
   else
-    exit_addr="$exit_host:$exit_port"
+    red "SOCKS5 连接测试失败。"
+    yellow "请检查落地机 IPv6、端口、用户名、密码及安全组/防火墙。"
+    while true; do
+      read_confirmed continue_anyway "仍然写入固定中转配置吗？[y/N]（回车默认 N）: " "N" || return 1
+      case "$continue_anyway" in
+        y|Y) break ;;
+        n|N) yellow "已取消，中转配置未修改。"; read -erp "回车返回菜单..." _; return 1 ;;
+        *) red "请输入 y 或 n。" ;;
+      esac
+    done
   fi
 
   backup_file="${config_file}.bak.relay.$(date +%Y%m%d%H%M%S)"
   cp -a "$config_file" "$backup_file" || {
     red "备份 Hysteria 2 配置失败。"
+    read -erp "回车返回菜单..." _
     return 1
   }
 
@@ -2794,42 +2954,205 @@ PYC
     cp -a "$backup_file" "$config_file" >/dev/null 2>&1 || true
     fix_hysteria_file_perms
     systemctl restart "$hy_service" >/dev/null 2>&1 || true
-    red "中转配置启动失败，已恢复原配置。"
+    red "中转配置启动失败，已恢复修改前配置。"
     yellow "请检查：journalctl -u $hy_service -n 50 --no-pager"
     read -erp "回车返回菜单..." _
     return 1
   fi
 
-  green "Hysteria 2 中转配置完成"
-  yellow "SOCKS5 出口地址：$exit_addr"
+  red "======================================================================================"
+  green "Hysteria 2 固定中转配置完成"
+  yellow "中转方式：Hy2 -> IPv6 SOCKS5 -> 落地 IPv4"
+  yellow "SOCKS5 地址：$exit_addr"
   yellow "SOCKS5 用户名：$exit_user"
   yellow "SOCKS5 密码：$exit_password"
+  [[ -n "$test_ip" ]] && yellow "测试出口 IPv4：$test_ip"
   yellow "配置备份：$backup_file"
-  green "当前所有 Hy2 代理流量将默认通过该 SOCKS5 落地机出站。"
+  echo ""
+  green "当前所有 Hy2 代理流量将固定通过该 SOCKS5 落地机。"
+  yellow "落地机不可用时，请在菜单 12 -> 2 手动恢复日本直连。"
   read -erp "回车返回菜单..." _
 }
 
 # -----------------------------
-# 函数：安装并配置 SOCKS5 落地机
+# 函数：恢复 Hysteria 2 日本本机直连
 # -----------------------------
-install_socks5_exit() {
-  local relay_ip socks_port socks_user socks_password
-  local install_script="/tmp/sing-box-install.sh"
-  local singbox_bin config_dir config_file service_file
-  local exit_ip test_ip udp_port_start udp_port_end
+restore_hy2_direct() {
+  local config_file="/etc/hysteria/config.yaml"
+  local backup_file hy_service answer
 
-  green "安装并配置 SOCKS5 落地机"
+  if [[ ! -s "$config_file" ]]; then
+    red "未检测到 Hysteria 2 配置：$config_file"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  if ! grep -qE '^outbounds:[[:space:]]*$' "$config_file"; then
+    green "当前未配置自定义 outbound，已经是日本本机直连模式。"
+    read -erp "回车返回菜单..." _
+    return 0
+  fi
 
   while true; do
-    read_confirmed relay_ip "请输入中转机公网 IPv4（用于防火墙白名单）: " || return 1
-    is_valid_ipv4 "$relay_ip" && break
-    red "IPv4 地址格式无效，请重新输入。"
+    read_confirmed answer "确认取消落地机并恢复日本本机直连？[y/N]（回车默认 N）: " "N" || return 1
+    case "$answer" in
+      y|Y) break ;;
+      n|N) yellow "已取消。"; read -erp "回车返回菜单..." _; return 0 ;;
+      *) red "请输入 y 或 n。" ;;
+    esac
+  done
+
+  command -v python3 >/dev/null 2>&1 || pkg_install python3 >/dev/null 2>&1 || {
+    red "安装 python3 失败。"
+    read -erp "回车返回菜单..." _
+    return 1
+  }
+
+  backup_file="${config_file}.bak.direct.$(date +%Y%m%d%H%M%S)"
+  cp -a "$config_file" "$backup_file" || return 1
+
+  if ! remove_hy2_outbounds_block "$config_file"; then
+    cp -a "$backup_file" "$config_file" >/dev/null 2>&1 || true
+    red "恢复直连配置失败。"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  fix_hysteria_file_perms
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1
+  if ! systemctl is-active --quiet "$hy_service"; then
+    cp -a "$backup_file" "$config_file" >/dev/null 2>&1 || true
+    systemctl restart "$hy_service" >/dev/null 2>&1 || true
+    red "恢复直连后 Hy2 启动失败，已回滚。"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  green "已恢复：用户 -> 日本 Hy2 -> 日本本机 Internet"
+  yellow "原中转配置备份：$backup_file"
+  read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
+# 函数：查看 Hysteria 2 当前中转状态
+# -----------------------------
+show_hy2_relay() {
+  local config_file="/etc/hysteria/config.yaml"
+  local addr user password test_ip host port
+
+  if [[ ! -s "$config_file" ]]; then
+    red "未检测到 Hysteria 2 配置：$config_file"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  if ! grep -qE '^outbounds:[[:space:]]*$' "$config_file"; then
+    green "当前模式：日本本机直连"
+    read -erp "回车返回菜单..." _
+    return 0
+  fi
+
+  addr=$(awk '/^outbounds:/{f=1;next} f && /addr:/{sub(/^[[:space:]]*addr:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$config_file")
+  user=$(awk '/^outbounds:/{f=1;next} f && /username:/{sub(/^[[:space:]]*username:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$config_file")
+  password=$(awk '/^outbounds:/{f=1;next} f && /password:/{sub(/^[[:space:]]*password:[[:space:]]*/, ""); gsub(/^"|"$/, ""); print; exit}' "$config_file")
+
+  yellow "当前模式：固定 SOCKS5 落地"
+  yellow "SOCKS5 地址：$addr"
+  yellow "SOCKS5 用户名：$user"
+  yellow "SOCKS5 密码：$password"
+
+  if [[ "$addr" =~ ^\[([^]]+)\]:([0-9]+)$ ]]; then
+    host="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+    test_ip=$(test_socks5_landing "$host" "$port" "$user" "$password" || true)
+    if [[ -n "$test_ip" ]]; then
+      green "实时连通测试：正常，当前落地出口 $test_ip"
+    else
+      red "实时连通测试：失败"
+    fi
+  fi
+
+  read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
+# 函数：Hysteria 2 中转配置菜单
+# -----------------------------
+menu_hy2_relay() {
+  local relayAnswer
+  while true; do
+    clear
+    green "Hy2 中转配置："
+    echo ""
+    echo -e " ${GREEN}1.${tianlan} 配置/更换 IPv6 SOCKS5 落地"
+    echo -e " ${GREEN}2.${tianlan} 恢复日本本机直连"
+    echo -e " ${GREEN}3.${tianlan} 查看当前中转状态"
+    echo " ---------------------------------------------------"
+    echo -e " ${GREEN}0.${PLAIN} 返回"
+    echo ""
+    read -erp "请选择 [0-3]: " relayAnswer
+
+    case "$relayAnswer" in
+      1) configure_hy2_relay_fixed ;;
+      2) restore_hy2_direct ;;
+      3) show_hy2_relay ;;
+      0) break ;;
+      *) yellow "无效选项"; sleep 1 ;;
+    esac
+  done
+}
+
+# -----------------------------
+# 函数：配置 Xray SOCKS5 IPv6 落地机（IPv4 出口）
+# -----------------------------
+install_xray_socks5_exit() {
+  local relay_ipv6 landing_ipv6 detected_ipv6 socks_port socks_user socks_password
+  local install_script="/tmp/xray-install.sh"
+  local xray_bin config_dir config_file service_file current_port
+  local exit_ipv4 test_ip backup_file old_sing_service answer
+
+  clear
+  green "Xray SOCKS5 落地配置"
+  echo ""
+  yellow "链路：日本中转机 --IPv6--> 本机 Xray SOCKS5 --IPv4--> Internet"
+  yellow "SOCKS5 本身不加密，仅允许指定日本中转机 IPv6 访问。"
+  echo ""
+
+  detected_ipv6=$(get_public_ipv6 2>/dev/null || true)
+  if [[ -z "$detected_ipv6" ]]; then
+    red "未检测到可用公网 IPv6。"
+    yellow "该落地模式要求落地机具有公网 IPv6。"
+    read -erp "回车返回菜单..." _
+    return 1
+  fi
+
+  while true; do
+    read_confirmed landing_ipv6 "请输入本机公网 IPv6（回车默认 $detected_ipv6）: " "$detected_ipv6" || return 1
+    landing_ipv6="${landing_ipv6#[}"
+    landing_ipv6="${landing_ipv6%]}"
+    is_valid_ipv6 "$landing_ipv6" && break
+    red "IPv6 地址格式无效，请重新输入。"
   done
 
   while true; do
-    read_confirmed socks_port "请输入 SOCKS5 监听端口（回车默认 1080）: " "1080" || return 1
+    read_confirmed relay_ipv6 "请输入日本中转机公网 IPv6（用于防火墙白名单）: " || return 1
+    relay_ipv6="${relay_ipv6#[}"
+    relay_ipv6="${relay_ipv6%]}"
+    is_valid_ipv6 "$relay_ipv6" && break
+    red "IPv6 地址格式无效，请重新输入。"
+  done
+
+  config_dir="/etc/xray-socks5-exit"
+  config_file="$config_dir/config.json"
+  service_file="/etc/systemd/system/xray-socks5-exit.service"
+  current_port=""
+  [[ -f "$config_file" ]] && current_port=$(grep -m1 '"port"[[:space:]]*:' "$config_file" | grep -Eo '[0-9]+' | head -n1)
+
+  while true; do
+    read_confirmed socks_port "请输入 SOCKS5 监听端口（回车默认 1080）: " "${current_port:-1080}" || return 1
     if [[ "$socks_port" =~ ^[0-9]+$ ]] && ((socks_port >= 1 && socks_port <= 65535)); then
-      if ss -lntup 2>/dev/null | grep -Eq ":${socks_port}([^0-9]|$)" && ! systemctl is-active --quiet sing-box-socks5.service; then
+      if ss -lntup 2>/dev/null | grep -Eq ":${socks_port}([^0-9]|$)" && [[ "$socks_port" != "$current_port" ]]; then
         red "端口 $socks_port 已被其他程序占用，请更换。"
         continue
       fi
@@ -2846,88 +3169,161 @@ install_socks5_exit() {
 
   read_confirmed_password socks_password "请输入 SOCKS5 密码（回车随机）: " || return 1
 
-  green "安装 SOCKS5 服务依赖"
-  pkg_install curl ca-certificates iptables >/dev/null 2>&1 || {
+  echo ""
+  yellow "即将配置："
+  yellow "落地 IPv6：$landing_ipv6"
+  yellow "允许中转 IPv6：$relay_ipv6"
+  yellow "SOCKS5：[$landing_ipv6]:$socks_port"
+  yellow "用户名：$socks_user"
+  yellow "密码：$socks_password"
+  yellow "出口：强制 IPv4"
+  echo ""
+
+  while true; do
+    read_confirmed answer "确认继续？[Y/n]（回车默认 Y）: " "Y" || return 1
+    case "$answer" in
+      y|Y) break ;;
+      n|N) yellow "已取消。"; read -erp "回车返回菜单..." _; return 0 ;;
+      *) red "请输入 y 或 n。" ;;
+    esac
+  done
+
+  green "安装基础依赖"
+  pkg_install curl ca-certificates unzip iptables >/dev/null 2>&1 || {
     red "安装基础依赖失败。"
     read -erp "回车返回菜单..." _
     return 1
   }
 
-  green "安装 sing-box"
-  download_with_retry "https://sing-box.app/install.sh" "$install_script" || {
-    red "下载 sing-box 官方安装脚本失败。"
-    read -erp "回车返回菜单..." _
-    return 1
-  }
+  # 兼容旧版脚本：如果曾安装过本脚本专用的 sing-box 落地服务，仅停止并删除该专用 service/config。
+  # 不卸载 sing-box 二进制，避免影响用户其它用途。
+  if systemctl list-unit-files 2>/dev/null | grep -q '^sing-box-socks5\.service'; then
+    yellow "检测到旧版 sing-box-socks5 落地服务，正在迁移到 Xray..."
+    systemctl disable --now sing-box-socks5.service >/dev/null 2>&1 || true
+    rm -f /etc/systemd/system/sing-box-socks5.service /etc/sing-box/socks5-exit.json >/dev/null 2>&1 || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+  fi
 
-  bash "$install_script" || {
+  xray_bin=$(get_xray_bin 2>/dev/null || true)
+  if [[ -z "$xray_bin" ]]; then
+    green "未检测到 Xray，使用 XTLS 官方安装脚本安装 Xray-core"
+    download_with_retry "https://github.com/XTLS/Xray-install/raw/main/install-release.sh" "$install_script" || {
+      red "下载 Xray 官方安装脚本失败。"
+      read -erp "回车返回菜单..." _
+      return 1
+    }
+
+    bash "$install_script" install -u root --without-geodata --without-logfiles || {
+      rm -f "$install_script" >/dev/null 2>&1 || true
+      red "Xray-core 安装失败。"
+      read -erp "回车返回菜单..." _
+      return 1
+    }
     rm -f "$install_script" >/dev/null 2>&1 || true
-    red "sing-box 安装失败。"
-    read -erp "回车返回菜单..." _
-    return 1
-  }
-  rm -f "$install_script" >/dev/null 2>&1 || true
 
-  singbox_bin=$(command -v sing-box 2>/dev/null || true)
-  if [[ -z "$singbox_bin" || ! -x "$singbox_bin" ]]; then
-    red "未检测到 sing-box 可执行文件。"
+    # 官方安装会创建默认 xray.service。本脚本使用独立的 xray-socks5-exit.service，避免混用配置。
+    systemctl disable --now xray.service >/dev/null 2>&1 || true
+    xray_bin=$(get_xray_bin 2>/dev/null || true)
+  else
+    green "检测到现有 Xray-core：$xray_bin，将复用内核，不修改已有 xray.service 配置。"
+  fi
+
+  if [[ -z "$xray_bin" || ! -x "$xray_bin" ]]; then
+    red "未检测到可用 Xray-core。"
     read -erp "回车返回菜单..." _
     return 1
   fi
 
-  config_dir="/etc/sing-box"
-  config_file="$config_dir/socks5-exit.json"
-  service_file="/etc/systemd/system/sing-box-socks5.service"
   mkdir -p "$config_dir"
-
   if [[ -f "$config_file" ]]; then
-    cp -a "$config_file" "${config_file}.bak.$(date +%Y%m%d%H%M%S)" >/dev/null 2>&1 || true
+    backup_file="${config_file}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$config_file" "$backup_file" >/dev/null 2>&1 || true
   fi
 
   cat > "$config_file" <<EOF
 {
   "log": {
-    "level": "info",
-    "timestamp": true
+    "loglevel": "warning"
   },
   "inbounds": [
     {
-      "type": "socks",
-      "tag": "socks-in",
-      "listen": "0.0.0.0",
-      "listen_port": $socks_port,
-      "users": [
-        {
-          "username": "$socks_user",
-          "password": "$socks_password"
+      "tag": "socks6-in",
+      "listen": "::",
+      "port": $socks_port,
+      "protocol": "socks",
+      "settings": {
+        "auth": "password",
+        "accounts": [
+          {
+            "user": "$socks_user",
+            "pass": "$socks_password"
+          }
+        ],
+        "udp": true,
+        "ip": "$landing_ipv6"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "V6Only": true
         }
-      ],
-      "udp_timeout": "5m"
+      }
     }
-  ]
+  ],
+  "outbounds": [
+    {
+      "tag": "direct4",
+      "protocol": "freedom",
+      "settings": {
+        "domainStrategy": "ForceIPv4"
+      },
+      "streamSettings": {
+        "sockopt": {
+          "domainStrategy": "ForceIPv4"
+        }
+      }
+    },
+    {
+      "tag": "block6",
+      "protocol": "blackhole",
+      "settings": {}
+    }
+  ],
+  "routing": {
+    "rules": [
+      {
+        "type": "field",
+        "ip": ["::/0"],
+        "outboundTag": "block6"
+      }
+    ]
+  }
 }
 EOF
 
   chmod 700 "$config_dir" >/dev/null 2>&1 || true
   chmod 600 "$config_file" >/dev/null 2>&1 || true
 
-  if ! "$singbox_bin" check -c "$config_file"; then
-    red "SOCKS5 配置校验失败。"
+  if ! "$xray_bin" run -test -config "$config_file" >/dev/null 2>&1; then
+    red "Xray SOCKS5 配置校验失败。"
+    "$xray_bin" run -test -config "$config_file" || true
+    if [[ -n "$backup_file" && -f "$backup_file" ]]; then
+      cp -a "$backup_file" "$config_file" >/dev/null 2>&1 || true
+    fi
     read -erp "回车返回菜单..." _
     return 1
   fi
 
   cat > "$service_file" <<EOF
 [Unit]
-Description=sing-box SOCKS5 exit service
+Description=Xray IPv6 SOCKS5 landing -> IPv4 exit
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=$singbox_bin run -c $config_file
+ExecStart=$xray_bin run -config $config_file
 Restart=on-failure
-RestartSec=5s
+RestartSec=3s
 LimitNOFILE=1048576
 
 [Install]
@@ -2936,56 +3332,106 @@ EOF
 
   chmod 644 "$service_file" >/dev/null 2>&1 || true
   systemctl daemon-reload
-  systemctl enable --now sing-box-socks5.service >/dev/null 2>&1 || true
-  systemctl restart sing-box-socks5.service >/dev/null 2>&1
+  systemctl enable xray-socks5-exit.service >/dev/null 2>&1 || true
+  systemctl restart xray-socks5-exit.service >/dev/null 2>&1
 
-  if ! systemctl is-active --quiet sing-box-socks5.service; then
-    red "SOCKS5 服务启动失败，请检查："
-    systemctl status sing-box-socks5.service --no-pager -l || true
-    journalctl -u sing-box-socks5.service --no-pager -n 30 || true
+  if ! systemctl is-active --quiet xray-socks5-exit.service; then
+    red "Xray SOCKS5 落地服务启动失败，请检查："
+    systemctl status xray-socks5-exit.service --no-pager -l || true
+    journalctl -u xray-socks5-exit.service --no-pager -n 40 || true
     read -erp "回车返回菜单..." _
     return 1
   fi
 
-  green "配置 SOCKS5 防火墙白名单"
+  green "配置 IPv6 防火墙白名单"
   install_firewall_persistent >/dev/null 2>&1 || true
-  read -r udp_port_start udp_port_end < /proc/sys/net/ipv4/ip_local_port_range
-  [[ "$udp_port_start" =~ ^[0-9]+$ ]] || udp_port_start="32768"
-  [[ "$udp_port_end" =~ ^[0-9]+$ ]] || udp_port_end="60999"
-  iptables -N SOCKS5_EXIT_INPUT >/dev/null 2>&1 || true
-  iptables -F SOCKS5_EXIT_INPUT >/dev/null 2>&1 || true
-  iptables -C INPUT -j SOCKS5_EXIT_INPUT >/dev/null 2>&1 || iptables -I INPUT 1 -j SOCKS5_EXIT_INPUT >/dev/null 2>&1 || true
-  iptables -A SOCKS5_EXIT_INPUT -i lo -p tcp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
-  iptables -A SOCKS5_EXIT_INPUT -i lo -p udp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
-  iptables -A SOCKS5_EXIT_INPUT -s "$relay_ip/32" -p tcp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
-  iptables -A SOCKS5_EXIT_INPUT -s "$relay_ip/32" -p udp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
-  iptables -A SOCKS5_EXIT_INPUT -s "$relay_ip/32" -p udp --dport "$udp_port_start:$udp_port_end" -j ACCEPT >/dev/null 2>&1 || true
-  iptables -A SOCKS5_EXIT_INPUT -p tcp --dport "$socks_port" -j DROP >/dev/null 2>&1 || true
-  iptables -A SOCKS5_EXIT_INPUT -p udp --dport "$socks_port" -j DROP >/dev/null 2>&1 || true
-  save_firewall_rules
+  if command -v ip6tables >/dev/null 2>&1; then
+    ip6tables -N XRAY_SOCKS5_INPUT >/dev/null 2>&1 || true
+    ip6tables -F XRAY_SOCKS5_INPUT >/dev/null 2>&1 || true
+    ip6tables -C INPUT -j XRAY_SOCKS5_INPUT >/dev/null 2>&1 || ip6tables -I INPUT 1 -j XRAY_SOCKS5_INPUT >/dev/null 2>&1 || true
+    ip6tables -A XRAY_SOCKS5_INPUT -i lo -p tcp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+    ip6tables -A XRAY_SOCKS5_INPUT -i lo -p udp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+    ip6tables -A XRAY_SOCKS5_INPUT -s "$relay_ipv6/128" -p tcp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+    ip6tables -A XRAY_SOCKS5_INPUT -s "$relay_ipv6/128" -p udp --dport "$socks_port" -j ACCEPT >/dev/null 2>&1 || true
+    ip6tables -A XRAY_SOCKS5_INPUT -p tcp --dport "$socks_port" -j DROP >/dev/null 2>&1 || true
+    ip6tables -A XRAY_SOCKS5_INPUT -p udp --dport "$socks_port" -j DROP >/dev/null 2>&1 || true
+    save_firewall_rules
+  else
+    red "未检测到 ip6tables，无法写入本机 IPv6 白名单。"
+    yellow "请务必在云平台安全组中仅允许 $relay_ipv6/128 访问 TCP/UDP $socks_port。"
+  fi
 
-  exit_ip=$(curl -4fsS --max-time 8 ip.sb 2>/dev/null || true)
-  [[ -z "$exit_ip" ]] && exit_ip=$(hostname -I 2>/dev/null | awk '{print $1}')
-  test_ip=$(curl -4fsS --max-time 12 --socks5-hostname "127.0.0.1:$socks_port" --proxy-user "$socks_user:$socks_password" ip.sb 2>/dev/null || true)
+  exit_ipv4=$(curl -4fsS --max-time 8 ip.sb 2>/dev/null | tr -d '\r\n' || true)
+  test_ip=$(curl -fsS --connect-timeout 5 --max-time 15 \
+    --proxy "socks5h://[::1]:$socks_port" \
+    --proxy-user "$socks_user:$socks_password" \
+    https://api.ipify.org 2>/dev/null | tr -d '\r\n' || true)
 
   red "======================================================================================"
-  green "SOCKS5 落地机安装配置完成"
-  yellow "出口地址：$exit_ip"
-  yellow "SOCKS5 端口：$socks_port"
+  green "Xray SOCKS5 落地配置完成"
+  yellow "落地机 IPv6：$landing_ipv6"
+  yellow "SOCKS5 地址：[$landing_ipv6]:$socks_port"
   yellow "SOCKS5 用户名：$socks_user"
   yellow "SOCKS5 密码：$socks_password"
-  yellow "允许连接的中转机：$relay_ip"
-  yellow "TCP/UDP：已启用"
-  yellow "SOCKS5 UDP 动态中继端口：$udp_port_start-$udp_port_end"
-  [[ -n "$test_ip" ]] && green "本机代理出口测试：$test_ip"
+  yellow "允许连接的日本中转机 IPv6：$relay_ipv6"
+  yellow "入站协议：SOCKS5 TCP + UDP，仅 IPv6"
+  yellow "Internet 出口：强制 IPv4"
+  [[ -n "$exit_ipv4" ]] && yellow "本机公网 IPv4：$exit_ipv4"
+  if is_valid_ipv4 "$test_ip"; then
+    green "SOCKS5 实际出口测试：$test_ip（IPv4，正常）"
+  elif [[ -n "$test_ip" ]]; then
+    yellow "SOCKS5 实际出口测试返回：$test_ip"
+  else
+    yellow "SOCKS5 本机出口测试未返回结果，请稍后手动测试。"
+  fi
   echo ""
-  green "请在中转机菜单中依次输入："
-  green "地址：$exit_ip"
+  green "请在日本中转机的“中转配置 -> 配置/更换 IPv6 SOCKS5 落地”中填写："
+  green "落地 IPv6：$landing_ipv6"
   green "端口：$socks_port"
   green "用户名：$socks_user"
   green "密码：$socks_password"
-  yellow "如果云平台有安全组，请仅允许 $relay_ip 访问 TCP $socks_port、UDP $socks_port 和 UDP $udp_port_start-$udp_port_end。"
+  echo ""
+  yellow "云平台安全组建议：仅允许来源 $relay_ipv6/128 访问 TCP $socks_port 和 UDP $socks_port。"
+  yellow "配置文件：$config_file"
+  yellow "服务：xray-socks5-exit.service"
   read -erp "回车返回菜单..." _
+}
+
+# -----------------------------
+# 函数：查看/管理落地配置
+# -----------------------------
+menu_landing() {
+  local landingAnswer
+  while true; do
+    clear
+    green "落地配置："
+    echo ""
+    echo -e " ${GREEN}1.${tianlan} 安装/重新配置 Xray SOCKS5 落地"
+    echo -e " ${GREEN}2.${tianlan} 查看落地服务状态"
+    echo -e " ${GREEN}3.${tianlan} 重启落地服务"
+    echo " ---------------------------------------------------"
+    echo -e " ${GREEN}0.${PLAIN} 返回"
+    echo ""
+    read -erp "请选择 [0-3]: " landingAnswer
+
+    case "$landingAnswer" in
+      1) install_xray_socks5_exit ;;
+      2)
+        systemctl status xray-socks5-exit.service --no-pager -l 2>/dev/null || yellow "尚未安装 xray-socks5-exit.service"
+        read -erp "回车返回菜单..." _
+        ;;
+      3)
+        if systemctl restart xray-socks5-exit.service >/dev/null 2>&1; then
+          green "落地服务已重启。"
+        else
+          red "落地服务重启失败或尚未安装。"
+        fi
+        read -erp "回车返回菜单..." _
+        ;;
+      0) break ;;
+      *) yellow "无效选项"; sleep 1 ;;
+    esac
+  done
 }
 
 # -----------------------------
@@ -3010,8 +3456,8 @@ menu() {
     echo -e " ${GREEN}9.${tianlan} IP质量检测"
     echo -e " ${GREEN}10.${tianlan} 系统查询"
     echo -e " ${GREEN}11.${tianlan} 系统更新"
-    echo -e " ${GREEN}12.${tianlan} 配置 Hy2 中转"
-    echo -e " ${GREEN}13.${tianlan} 安装 Socks5 落地机"
+    echo -e " ${GREEN}12.${tianlan} 中转配置"
+    echo -e " ${GREEN}13.${tianlan} 落地配置"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 退出脚本"
     echo ""
@@ -3029,8 +3475,8 @@ menu() {
       9) ipquality ;;
       10) linux_ps ;;
       11) linux_update ;;
-      12) configure_hy2_relay ;;
-      13) install_socks5_exit ;;
+      12) menu_hy2_relay ;;
+      13) menu_landing ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
