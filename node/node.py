@@ -286,11 +286,21 @@ def read_silent_keywords() -> str:
     return _load_keywords_json()["silent_keywords"]
 
 
-def _save_keywords_json(keywords: str, silent_keywords: str, source: str = "internal", client_ip: str = "") -> None:
+def _save_keywords_json(
+    keywords: str,
+    silent_keywords: str,
+    source: str = "internal",
+    client_ip: str = "",
+    allow_all_empty: bool = False,
+) -> None:
     payload = {
         "keywords": str(keywords).strip(),
         "silent_keywords": str(silent_keywords).strip(),
     }
+    # 最后一层保险：任何内部代码都不能无意中把两类关键词同时写空。
+    # 只有 Web 端在 PIN 验证通过且用户再次确认“彻底清空”后，才显式放行。
+    if not payload["keywords"] and not payload["silent_keywords"] and not allow_all_empty:
+        raise ValueError("禁止未确认地清空全部关键词")
     WORK_DIR.mkdir(parents=True, exist_ok=True)
     with _KEYWORDS_WRITE_LOCK:
         current = _read_keywords_file(KEYWORDS_FILE)
@@ -1310,10 +1320,27 @@ def build_keyword_handler(cfg: Dict[str, str]):
                         return
                     new_keywords = (form.get("keywords", [""])[0] or "").strip()
                     new_silent_keywords = (form.get("silent_keywords", [""])[0] or "").strip()
+                    clear_all_confirmed = (form.get("clear_all_confirmed", [""])[0] or "").strip() == "1"
+                    is_all_empty = not new_keywords and not new_silent_keywords
+                    if is_all_empty and not clear_all_confirmed:
+                        self._send_json({
+                            "ok": False,
+                            "code": "confirm_clear_all_required",
+                            "message": "两类关键词均为空，必须再次确认彻底清空",
+                        }, status=409)
+                        return
                     try:
                         client_ip = self.client_address[0] if self.client_address else ""
-                        _save_keywords_json(new_keywords, new_silent_keywords, source="web", client_ip=client_ip)
+                        _save_keywords_json(
+                            new_keywords,
+                            new_silent_keywords,
+                            source="web-clear-all" if is_all_empty else "web",
+                            client_ip=client_ip,
+                            allow_all_empty=is_all_empty and clear_all_confirmed,
+                        )
                         self._send_json({"ok": True, "message": "保存成功", "server_time": now_str()})
+                    except ValueError as exc:
+                        self._send_json({"ok": False, "message": str(exc)}, status=409)
                     except Exception as exc:
                         self._send_json({"ok": False, "message": f"保存失败: {exc}"}, status=500)
                     return
@@ -1644,6 +1671,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     let logMode = localStorage.getItem('nodeRssLogMode') || 'all';
     let logTimer = null;
     let runStatusTimer = null;
+    let pendingKeywordPin = '';
 
     function setKeywordMessage(message, ok) {
       const el = document.getElementById('keywordMessage');
@@ -1684,7 +1712,6 @@ def build_keyword_handler(cfg: Dict[str, str]):
     async function submitKeywords() {
       const textarea = document.getElementById('keywords');
       const silentTextarea = document.getElementById('silent_keywords');
-      const actionBtn = document.getElementById('actionBtn');
       const pinInput = document.getElementById('pinInput');
       const pinError = document.getElementById('pinError');
       const pin = String(pinInput.value || '').trim();
@@ -1695,10 +1722,22 @@ def build_keyword_handler(cfg: Dict[str, str]):
         return;
       }
 
+      // 先发给后端校验 PIN。若两类关键词都为空，后端会在 PIN 正确后返回二次确认要求。
+      await saveKeywordsRequest(pin, false);
+    }
+
+    async function saveKeywordsRequest(pin, clearAllConfirmed) {
+      const textarea = document.getElementById('keywords');
+      const silentTextarea = document.getElementById('silent_keywords');
+      const actionBtn = document.getElementById('actionBtn');
+      const pinError = document.getElementById('pinError');
+      const clearError = document.getElementById('clearAllError');
+
       const body = new URLSearchParams();
       body.set('keywords', textarea.value || '');
       body.set('silent_keywords', silentTextarea.value || '');
       body.set('pin', pin);
+      if (clearAllConfirmed) body.set('clear_all_confirmed', '1');
 
       try {
         const res = await fetch('/api/keywords-save', {
@@ -1710,27 +1749,72 @@ def build_keyword_handler(cfg: Dict[str, str]):
         let data = {};
         try { data = await res.json(); } catch (err) {}
         if (!res.ok || !data.ok) {
-          pinError.textContent = (data && data.message) ? data.message : '保存失败';
-          pinInput.select();
+          // 只有 PIN 已被服务端验证通过后，才允许进入“彻底清空”的第二个弹窗。
+          if (!clearAllConfirmed && data && data.code === 'confirm_clear_all_required') {
+            pendingKeywordPin = pin;
+            closeConfirmModal(false);
+            openClearAllModal();
+            return;
+          }
+          const msg = (data && data.message) ? data.message : '保存失败';
+          if (clearAllConfirmed) {
+            if (clearError) clearError.textContent = msg;
+          } else {
+            if (pinError) pinError.textContent = msg;
+            const currentPinInput = document.getElementById('pinInput');
+            if (currentPinInput) currentPinInput.select();
+          }
           return;
         }
 
+        pendingKeywordPin = '';
         closeConfirmModal();
+        closeClearAllModal();
         textarea.setAttribute('readonly', 'readonly');
         silentTextarea.setAttribute('readonly', 'readonly');
         actionBtn.textContent = '修改';
-        setKeywordMessage('保存成功', true);
+        setKeywordMessage(clearAllConfirmed ? '全部关键词已清空' : '保存成功', true);
       } catch (err) {
-        pinError.textContent = '保存请求失败，请重试';
+        const msg = '保存请求失败，请重试';
+        if (clearAllConfirmed) {
+          if (clearError) clearError.textContent = msg;
+        } else if (pinError) {
+          pinError.textContent = msg;
+        }
       }
     }
 
-    function closeConfirmModal() {
+    function openClearAllModal() {
+      const modal = document.getElementById('clearAllModal');
+      const error = document.getElementById('clearAllError');
+      if (error) error.textContent = '';
+      modal.classList.remove('hidden');
+    }
+
+    async function confirmClearAllKeywords() {
+      const pin = pendingKeywordPin;
+      if (!pin) {
+        closeClearAllModal();
+        setKeywordMessage('PIN 验证状态已失效，请重新保存', false);
+        return;
+      }
+      await saveKeywordsRequest(pin, true);
+    }
+
+    function closeClearAllModal() {
+      const modal = document.getElementById('clearAllModal');
+      const error = document.getElementById('clearAllError');
+      if (error) error.textContent = '';
+      if (modal) modal.classList.add('hidden');
+    }
+
+    function closeConfirmModal(clearPendingPin = true) {
       const modal = document.getElementById('confirmModal');
       const pinInput = document.getElementById('pinInput');
       const pinError = document.getElementById('pinError');
       if (pinInput) pinInput.value = '';
       if (pinError) pinError.textContent = '';
+      if (clearPendingPin) pendingKeywordPin = '';
       modal.classList.add('hidden');
     }
     function escapeHtml(text) {
@@ -1888,6 +1972,12 @@ def build_keyword_handler(cfg: Dict[str, str]):
     document.getElementById('confirmModal').addEventListener('click', (e) => {
       if (e.target === e.currentTarget) closeConfirmModal();
     });
+    document.getElementById('clearAllModal').addEventListener('click', (e) => {
+      if (e.target === e.currentTarget) {
+        pendingKeywordPin = '';
+        closeClearAllModal();
+      }
+    });
     document.getElementById('pinInput').addEventListener('keydown', (e) => {
       if (e.key === 'Enter') {
         e.preventDefault();
@@ -1895,7 +1985,11 @@ def build_keyword_handler(cfg: Dict[str, str]):
       }
     });
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') closeConfirmModal();
+      if (e.key === 'Escape') {
+        pendingKeywordPin = '';
+        closeConfirmModal();
+        closeClearAllModal();
+      }
     });
   </script>
   <!-- Web端关键词保存 PIN 验证弹窗 -->
@@ -1908,6 +2002,18 @@ def build_keyword_handler(cfg: Dict[str, str]):
       <div class="modal-actions">
         <button class="secondary" type="button" onclick="closeConfirmModal()">取消</button>
         <button type="button" onclick="submitKeywords()">确认保存</button>
+      </div>
+    </div>
+  </div>
+  <!-- 两类关键词同时为空时的二次危险确认弹窗 -->
+  <div id="clearAllModal" class="modal-overlay hidden">
+    <div class="modal-box">
+      <div class="modal-title">确认彻底清空？</div>
+      <div class="modal-body">当前“关键词”和“静默关键词”都为空。继续后将清空全部关键词；这是高风险操作，需要再次明确确认。</div>
+      <div id="clearAllError" class="modal-error"></div>
+      <div class="modal-actions">
+        <button class="secondary" type="button" onclick="pendingKeywordPin=''; closeClearAllModal()">取消</button>
+        <button class="danger" type="button" onclick="confirmClearAllKeywords()">确认彻底清空</button>
       </div>
     </div>
   </div>
