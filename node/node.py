@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import errno
 import fcntl
+import hashlib
 import html
 import json
 import os
@@ -44,14 +45,17 @@ LOG_RESET_FILE = WORK_DIR / ".log_last_reset_day"
 RUN_ENABLED_FILE = WORK_DIR / ".node_run_enabled"
 WEB_RESTART_FILE = WORK_DIR / ".node_web_restart"
 KEYWORDS_FILE = WORK_DIR / "keywords.json"
+KEYWORDS_BACKUP_FILE = WORK_DIR / "keywords.json.bak"
+KEYWORDS_AUDIT_LOG = WORK_DIR / "keywords_audit.log"
 
 _RSS_LOG_WRITE_LOCK = threading.Lock()
 _STATE_WRITE_LOCK = threading.Lock()
+_KEYWORDS_WRITE_LOCK = threading.Lock()
 
 DEFAULT_URL = "https://rss.nodeseek.com/?sortBy=postTime"
 DEFAULT_WEB_HOST = os.environ.get("NODE_WEB_HOST", "0.0.0.0")
 DEFAULT_WEB_PORT = int(os.environ.get("NODE_WEB_PORT", "8068"))
-DEFAULT_WEB_PIN = os.environ.get("NODE_WEB_PIN", "0819")
+DEFAULT_WEB_PIN = "0819"
 MAX_REQUEST_SIZE = 1024 * 1024
 REQUEST_TIMEOUT = 30
 LETSENCRYPT_LIVE = Path("/etc/letsencrypt/live")
@@ -197,28 +201,84 @@ def unescape_shell_value(value: str) -> str:
     return "".join(out)
 
 
-def _load_keywords_json() -> Dict[str, str]:
-    if KEYWORDS_FILE.exists():
+def _read_keywords_file(path: Path) -> Optional[Dict[str, str]]:
+    if not path.exists() or path.stat().st_size <= 0:
+        return None
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if not isinstance(data, dict):
+            return None
+        return {
+            "keywords": str(data.get("keywords", "")).strip(),
+            "silent_keywords": str(data.get("silent_keywords", "")).strip(),
+        }
+    except Exception:
+        return None
+
+
+def _atomic_write_keywords_file(path: Path, payload: Dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=2)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp_name, path)
+    except Exception:
         try:
-            with KEYWORDS_FILE.open("r", encoding="utf-8") as fh:
-                data = json.load(fh)
-            return {
-                "keywords": str(data.get("keywords", "")).strip(),
-                "silent_keywords": str(data.get("silent_keywords", "")).strip(),
-            }
-        except Exception:
-            return {"keywords": "", "silent_keywords": ""}
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _keyword_digest(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+
+
+def _append_keywords_audit(source: str, client_ip: str, old_data: Dict[str, str], new_data: Dict[str, str], action: str = "save") -> None:
+    try:
+        line = (
+            f"{now_str()} action={action} source={source or '-'} ip={client_ip or '-'} "
+            f"keywords={_keyword_digest(old_data.get('keywords', ''))}->{_keyword_digest(new_data.get('keywords', ''))} "
+            f"silent={_keyword_digest(old_data.get('silent_keywords', ''))}->{_keyword_digest(new_data.get('silent_keywords', ''))}\n"
+        )
+        with KEYWORDS_AUDIT_LOG.open("a", encoding="utf-8") as fh:
+            fh.write(line)
+    except Exception:
+        pass
+
+
+def _load_keywords_json() -> Dict[str, str]:
+    data = _read_keywords_file(KEYWORDS_FILE)
+    if data is not None:
+        return data
+
+    backup = _read_keywords_file(KEYWORDS_BACKUP_FILE)
+    if backup is not None:
+        # 主文件损坏/为空时自动恢复最近一次有效备份。
+        with _KEYWORDS_WRITE_LOCK:
+            current = _read_keywords_file(KEYWORDS_FILE)
+            if current is None:
+                _atomic_write_keywords_file(KEYWORDS_FILE, backup)
+                _append_keywords_audit("recovery", "", backup, backup, action="restore")
+        return backup
+
     return {"keywords": "", "silent_keywords": ""}
 
 
 def read_keywords() -> str:
-    kw = _load_keywords_json()["keywords"]
-    if kw:
-        return kw
+    data = _load_keywords_json()
+    # keywords.json 只要是有效 JSON，就以它为准；即使关键词被用户主动清空，也不再从旧配置复活。
+    if _read_keywords_file(KEYWORDS_FILE) is not None:
+        return data["keywords"]
+
     cfg = parse_shell_config(CONFIG_FILE)
     kw = cfg.get("KEYWORDS", "").strip()
     if kw:
-        _save_keywords_json(kw, "")
+        _save_keywords_json(kw, data.get("silent_keywords", ""), source="config-recovery")
     return kw
 
 
@@ -226,20 +286,35 @@ def read_silent_keywords() -> str:
     return _load_keywords_json()["silent_keywords"]
 
 
-def _save_keywords_json(keywords: str, silent_keywords: str) -> None:
+def _save_keywords_json(keywords: str, silent_keywords: str, source: str = "internal", client_ip: str = "") -> None:
+    payload = {
+        "keywords": str(keywords).strip(),
+        "silent_keywords": str(silent_keywords).strip(),
+    }
     WORK_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = KEYWORDS_FILE.with_suffix(".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump({"keywords": keywords, "silent_keywords": silent_keywords}, fh, ensure_ascii=False, indent=2)
-    tmp.replace(KEYWORDS_FILE)
+    with _KEYWORDS_WRITE_LOCK:
+        current = _read_keywords_file(KEYWORDS_FILE)
+        if current is None:
+            current = _read_keywords_file(KEYWORDS_BACKUP_FILE)
+        old_data = current or {"keywords": "", "silent_keywords": ""}
+
+        # 只用有效的旧数据刷新备份，避免把损坏/空文件覆盖到 .bak。
+        if current is not None:
+            _atomic_write_keywords_file(KEYWORDS_BACKUP_FILE, current)
+
+        _atomic_write_keywords_file(KEYWORDS_FILE, payload)
+        # 首次创建时也生成一份可恢复备份；后续保存则保留保存前的上一版。
+        if current is None and _read_keywords_file(KEYWORDS_BACKUP_FILE) is None:
+            _atomic_write_keywords_file(KEYWORDS_BACKUP_FILE, payload)
+        _append_keywords_audit(source, client_ip, old_data, payload)
 
 
 def update_keywords(new_value: str) -> None:
-    _save_keywords_json(new_value, read_silent_keywords())
+    _save_keywords_json(new_value, read_silent_keywords(), source="cli")
 
 
 def update_silent_keywords(new_value: str) -> None:
-    _save_keywords_json(read_keywords(), new_value)
+    _save_keywords_json(read_keywords(), new_value, source="cli")
 
 
 def keyword_web_settings(cfg: Dict[str, str]) -> Dict[str, str]:
@@ -247,9 +322,8 @@ def keyword_web_settings(cfg: Dict[str, str]) -> Dict[str, str]:
     port = safe_int(cfg.get("WEB_PORT", str(DEFAULT_WEB_PORT)), DEFAULT_WEB_PORT)
     if port <= 0 or port > 65535:
         port = DEFAULT_WEB_PORT
-    pin = (cfg.get("WEB_PIN", DEFAULT_WEB_PIN) or DEFAULT_WEB_PIN).strip()
-    if not re.fullmatch(r"\d{4}", pin):
-        pin = DEFAULT_WEB_PIN
+    # Web 端修改关键词的服务端鉴权 PIN 固定为 0819。
+    pin = DEFAULT_WEB_PIN
     domain = (cfg.get("WEB_DOMAIN", "") or "").strip()
     cert_path = ""
     key_path = ""
@@ -1161,7 +1235,10 @@ def build_keyword_handler(cfg: Dict[str, str]):
                         "runtime_enabled": is_run_enabled(),
                     })
                     return
-                self.respond_page(read_keywords(), read_silent_keywords(), "", False)
+                if parsed.path in {"/", "/keywords"}:
+                    self.respond_page(read_keywords(), read_silent_keywords(), "", False)
+                    return
+                self._send_json({"ok": False, "message": "Not found"}, status=404)
             except Exception as exc:
                 try:
                     self._send_json({"ok": False, "error": str(exc)}, status=500)
@@ -1221,21 +1298,28 @@ def build_keyword_handler(cfg: Dict[str, str]):
                     NodeMonitor().clear_rss_logs()
                     self._send_json({"ok": True, "message": "RSS日志已清除", "server_time": now_str()})
                     return
-
-                form = self._read_form()
-                new_keywords = form.get("keywords", [""])[0].strip()
-                new_silent_keywords = form.get("silent_keywords", [""])[0].strip()
-                if not form:
-                    self.respond_page(read_keywords(), read_silent_keywords(), "表单数据读取失败", True, status=400)
+                if parsed.path == "/api/keywords-save":
+                    form = self._read_form()
+                    required = {"keywords", "silent_keywords", "pin"}
+                    if not form or not required.issubset(form.keys()):
+                        self._send_json({"ok": False, "message": "关键词保存请求不完整"}, status=400)
+                        return
+                    submitted_pin = (form.get("pin", [""])[0] or "").strip()
+                    if submitted_pin != save_pin:
+                        self._send_json({"ok": False, "message": "PIN码错误"}, status=403)
+                        return
+                    new_keywords = (form.get("keywords", [""])[0] or "").strip()
+                    new_silent_keywords = (form.get("silent_keywords", [""])[0] or "").strip()
+                    try:
+                        client_ip = self.client_address[0] if self.client_address else ""
+                        _save_keywords_json(new_keywords, new_silent_keywords, source="web", client_ip=client_ip)
+                        self._send_json({"ok": True, "message": "保存成功", "server_time": now_str()})
+                    except Exception as exc:
+                        self._send_json({"ok": False, "message": f"保存失败: {exc}"}, status=500)
                     return
-                try:
-                    update_keywords(new_keywords)
-                    update_silent_keywords(new_silent_keywords)
-                    self.send_response(303)
-                    self.send_header("Location", "/")
-                    self.end_headers()
-                except Exception as exc:
-                    self.respond_page(new_keywords, new_silent_keywords, f"保存失败: {exc}", True, status=500)
+
+                # 未知 POST 一律拒绝，绝不能再落入关键词保存逻辑。
+                self._send_json({"ok": False, "message": "Not found"}, status=404)
             except Exception as exc:
                 try:
                     self._send_json({"ok": False, "error": str(exc)}, status=500)
@@ -1473,8 +1557,16 @@ def build_keyword_handler(cfg: Dict[str, str]):
     }
     .modal-body {
       font-size: 15px; line-height: 1.6; color: rgba(224,241,252,0.82);
-      margin-bottom: 24px;
+      margin-bottom: 16px;
     }
+    .pin-input {
+      width: 100%; height: 48px; margin: 2px 0 8px; padding: 0 14px;
+      border: 1px solid rgba(126,232,216,0.28); border-radius: 14px;
+      background: rgba(7,17,29,0.72); color: #edf7ff; font-size: 20px;
+      letter-spacing: 8px; text-align: center; outline: none;
+    }
+    .pin-input:focus { border-color: rgba(37,221,191,.80); box-shadow: 0 0 0 4px rgba(37,221,191,.10); }
+    .modal-error { min-height: 22px; margin-bottom: 12px; color: #ff9aa2; font-size: 13px; font-weight: 800; text-align: center; }
     .modal-actions {
       display: flex; gap: 12px; justify-content: flex-end;
     }
@@ -1500,7 +1592,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
     </section>
 
     <section class="card keyword-card">
-      <form id="keywordForm" method="post" autocomplete="off">
+      <form id="keywordForm" autocomplete="off" onsubmit="return false;">
         <div class="keyword-header">
           <h2 class="keyword-title">关键词 <span class="title-rule">采用空格间隔，&amp;表示与关系</span></h2>
           <button id="actionBtn" type="button" onclick="handleAction()">__ACTION_LABEL__</button>
@@ -1510,7 +1602,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
           <h2 class="keyword-title">静默关键词 <span class="title-rule">采用空格间隔，&amp;表示与关系</span></h2>
         </div>
           <textarea id="silent_keywords" name="silent_keywords" spellcheck="false" __READONLY__ placeholder="例如：开机 测速&结果">__SAFE_SILENT_KEYWORDS__</textarea>
-        <div class="__MSG_CLASS__">__SAFE_MESSAGE__</div>
+        <div id="keywordMessage" class="__MSG_CLASS__">__SAFE_MESSAGE__</div>
       </form>
     </section>
 
@@ -1553,10 +1645,14 @@ def build_keyword_handler(cfg: Dict[str, str]):
     let logTimer = null;
     let runStatusTimer = null;
 
-    let pendingConfirmCallback = null;
+    function setKeywordMessage(message, ok) {
+      const el = document.getElementById('keywordMessage');
+      if (!el) return;
+      el.textContent = message || '';
+      el.className = message ? (ok ? 'msg ok' : 'msg err') : 'msg';
+    }
 
     function handleAction() {
-      const form = document.getElementById('keywordForm');
       const textarea = document.getElementById('keywords');
       const silentTextarea = document.getElementById('silent_keywords');
       const actionBtn = document.getElementById('actionBtn');
@@ -1565,27 +1661,77 @@ def build_keyword_handler(cfg: Dict[str, str]):
         textarea.removeAttribute('readonly');
         silentTextarea.removeAttribute('readonly');
         actionBtn.textContent = '保存';
+        setKeywordMessage('', true);
         setTimeout(() => {
           textarea.focus();
           textarea.setSelectionRange(textarea.value.length, textarea.value.length);
         }, 50);
         return;
       }
-      document.getElementById('confirmMessage').textContent = '确认修改关键词并保存吗？';
-      pendingConfirmCallback = () => form.submit();
-      document.getElementById('confirmModal').classList.remove('hidden');
+      openPinModal();
     }
 
-    function submitKeywords() {
-      const cb = pendingConfirmCallback;
-      pendingConfirmCallback = null;
-      document.getElementById('confirmModal').classList.add('hidden');
-      if (cb) cb();
+    function openPinModal() {
+      const modal = document.getElementById('confirmModal');
+      const pinInput = document.getElementById('pinInput');
+      document.getElementById('confirmMessage').textContent = '请输入 PIN 码以确认保存关键词修改';
+      document.getElementById('pinError').textContent = '';
+      pinInput.value = '';
+      modal.classList.remove('hidden');
+      setTimeout(() => pinInput.focus(), 50);
+    }
+
+    async function submitKeywords() {
+      const textarea = document.getElementById('keywords');
+      const silentTextarea = document.getElementById('silent_keywords');
+      const actionBtn = document.getElementById('actionBtn');
+      const pinInput = document.getElementById('pinInput');
+      const pinError = document.getElementById('pinError');
+      const pin = String(pinInput.value || '').trim();
+
+      if (!/^\\d{4}$/.test(pin)) {
+        pinError.textContent = '请输入4位数字 PIN';
+        pinInput.focus();
+        return;
+      }
+
+      const body = new URLSearchParams();
+      body.set('keywords', textarea.value || '');
+      body.set('silent_keywords', silentTextarea.value || '');
+      body.set('pin', pin);
+
+      try {
+        const res = await fetch('/api/keywords-save', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=UTF-8' },
+          body: body.toString(),
+          cache: 'no-store'
+        });
+        let data = {};
+        try { data = await res.json(); } catch (err) {}
+        if (!res.ok || !data.ok) {
+          pinError.textContent = (data && data.message) ? data.message : '保存失败';
+          pinInput.select();
+          return;
+        }
+
+        closeConfirmModal();
+        textarea.setAttribute('readonly', 'readonly');
+        silentTextarea.setAttribute('readonly', 'readonly');
+        actionBtn.textContent = '修改';
+        setKeywordMessage('保存成功', true);
+      } catch (err) {
+        pinError.textContent = '保存请求失败，请重试';
+      }
     }
 
     function closeConfirmModal() {
-      pendingConfirmCallback = null;
-      document.getElementById('confirmModal').classList.add('hidden');
+      const modal = document.getElementById('confirmModal');
+      const pinInput = document.getElementById('pinInput');
+      const pinError = document.getElementById('pinError');
+      if (pinInput) pinInput.value = '';
+      if (pinError) pinError.textContent = '';
+      modal.classList.add('hidden');
     }
     function escapeHtml(text) {
       return String(text || '')
@@ -1742,18 +1888,26 @@ def build_keyword_handler(cfg: Dict[str, str]):
     document.getElementById('confirmModal').addEventListener('click', (e) => {
       if (e.target === e.currentTarget) closeConfirmModal();
     });
+    document.getElementById('pinInput').addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        submitKeywords();
+      }
+    });
     document.addEventListener('keydown', (e) => {
       if (e.key === 'Escape') closeConfirmModal();
     });
   </script>
-  <!-- 自定义确认弹窗 -->
+  <!-- Web端关键词保存 PIN 验证弹窗 -->
   <div id="confirmModal" class="modal-overlay hidden">
     <div class="modal-box">
-      <div class="modal-title">确认操作</div>
-      <div class="modal-body" id="confirmMessage">确认修改关键词并保存吗？</div>
+      <div class="modal-title">关键词保存验证</div>
+      <div class="modal-body" id="confirmMessage">请输入 PIN 码以确认保存关键词修改</div>
+      <input id="pinInput" class="pin-input" type="password" inputmode="numeric" maxlength="4" autocomplete="off" aria-label="PIN码" placeholder="••••">
+      <div id="pinError" class="modal-error"></div>
       <div class="modal-actions">
-        <button class="secondary" onclick="closeConfirmModal()">取消</button>
-        <button onclick="submitKeywords()">确认</button>
+        <button class="secondary" type="button" onclick="closeConfirmModal()">取消</button>
+        <button type="button" onclick="submitKeywords()">确认保存</button>
       </div>
     </div>
   </div>

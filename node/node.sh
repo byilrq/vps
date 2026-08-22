@@ -243,7 +243,7 @@ read_config() {
     DEBUG_LOG="${DEBUG_LOG:-0}"
     WEB_HOST="${WEB_HOST:-0.0.0.0}"
     WEB_PORT="${WEB_PORT:-$DEFAULT_WEB_PORT}"
-    WEB_PIN="${WEB_PIN:-$DEFAULT_WEB_PIN}"
+    WEB_PIN="$DEFAULT_WEB_PIN"
     WEB_DOMAIN="${WEB_DOMAIN:-}"
     return 0
 }
@@ -262,7 +262,7 @@ init_default_vars() {
     DEBUG_LOG="${DEBUG_LOG:-0}"
     WEB_HOST="0.0.0.0"
     WEB_PORT="$DEFAULT_WEB_PORT"
-    WEB_PIN="${WEB_PIN:-$DEFAULT_WEB_PIN}"
+    WEB_PIN="$DEFAULT_WEB_PIN"
     WEB_DOMAIN="${WEB_DOMAIN:-}"
 }
 
@@ -286,7 +286,7 @@ INTERVAL_SEC="$(escape_config_value "${INTERVAL_SEC:-$DEFAULT_INTERVAL_SEC}")"
 DEBUG_LOG="$(escape_config_value "${DEBUG_LOG:-0}")"
 WEB_HOST="0.0.0.0"
 WEB_PORT="$DEFAULT_WEB_PORT"
-WEB_PIN="$(escape_config_value "${WEB_PIN:-$DEFAULT_WEB_PIN}")"
+WEB_PIN="$DEFAULT_WEB_PIN"
 WEB_DOMAIN="$(escape_config_value "${WEB_DOMAIN:-}")"
 CFGEOF
     chmod 600 "$CONFIG_FILE" 2>/dev/null || true
@@ -591,10 +591,8 @@ configure_params() {
     [[ "$new_debug" != "1" ]] && new_debug="0"
     DEBUG_LOG="$new_debug"
 
-    read -rp "关键词网页 PIN [当前: ${WEB_PIN:-$DEFAULT_WEB_PIN}]（4位数字）: " new_web_pin
-    [[ -z "$new_web_pin" ]] && new_web_pin="${WEB_PIN:-$DEFAULT_WEB_PIN}"
-    [[ ! "$new_web_pin" =~ ^[0-9]{4}$ ]] && new_web_pin="$DEFAULT_WEB_PIN"
-    WEB_PIN="$new_web_pin"
+    WEB_PIN="$DEFAULT_WEB_PIN"
+    echo "关键词网页 PIN: $DEFAULT_WEB_PIN（固定，仅用于 Web 端保存关键词）"
 
     echo
     echo "域名可选：留空=HTTP 2068；填写域名则 node.py 会继续使用 /etc/letsencrypt/live/<域名>/fullchain.pem 和 privkey.pem。"
