@@ -13,11 +13,16 @@ import sys
 import tempfile
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import parse_qs
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:  # Python < 3.9 fallback
+    ZoneInfo = None
 
 try:
     import requests  # type: ignore
@@ -69,6 +74,22 @@ USER_AGENT = (
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36"
 )
 
+try:
+    SHANGHAI_TZ = ZoneInfo("Asia/Shanghai") if ZoneInfo is not None else timezone(timedelta(hours=8), name="Asia/Shanghai")
+except Exception:
+    # 极简系统若缺少 tzdata，上海当前长期固定为 UTC+8，可安全回退。
+    SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
+
+
+def shanghai_now() -> datetime:
+    """始终返回上海时间，不受 VPS 本机时区影响。"""
+    return datetime.now(SHANGHAI_TZ)
+
+
+def is_shanghai_quiet_hours() -> bool:
+    """上海时间 00:00 <= time < 08:00 时强制静默。"""
+    return 0 <= shanghai_now().hour < 8
+
 
 def ensure_workdir() -> None:
     WORK_DIR.mkdir(parents=True, exist_ok=True)
@@ -78,11 +99,11 @@ def ensure_workdir() -> None:
 
 
 def now_str() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return shanghai_now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def fmt_time() -> str:
-    return datetime.now().strftime("%Y.%m.%d.%H:%M")
+    return shanghai_now().strftime("%Y.%m.%d.%H:%M")
 
 
 def is_run_enabled() -> bool:
@@ -658,6 +679,10 @@ class NodeMonitor:
             priority = (self.config.get("NTFY_PRIORITY", "3") or "3").strip()
         if priority not in {"1", "2", "3", "4", "5"}:
             priority = "3"
+        # 夜间静默规则放在最终发送层：覆盖普通、手动、测试以及显式高优先级推送。
+        # 上海时间 00:00-08:00 强制 Priority=1；08:00 后恢复调用方/配置原有优先级。
+        if is_shanghai_quiet_hours():
+            priority = "1"
         if not url or not topic:
             self.logger.error("[node] ntfy配置缺失，发送失败")
             return False
@@ -1071,7 +1096,7 @@ class NodeMonitor:
     def trim_logs_if_needed(self, every_n_loops: int, loop_count: int) -> None:
         if every_n_loops <= 0 or loop_count % every_n_loops != 0:
             return
-        today = datetime.now().strftime("%Y-%m-%d")
+        today = shanghai_now().strftime("%Y-%m-%d")
         last_day = ""
         if LOG_RESET_FILE.exists():
             try:
