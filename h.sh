@@ -1733,6 +1733,10 @@ EOF
   green "1) 普通浏览器访问: https://$hy_domain"
   green "2) 查看日志: journalctl -u $hy_service -f"
 
+  yellow "内核自动更新任务："
+  green '0 2 1 * * root "/usr/local/bin/hysteria-core-update" >/dev/null 2>&1'
+  green "每月 1 日凌晨 2:00，以 root 身份执行一次内核更新检查。"
+
   read -erp "回车返回菜单..." _
 }
 
