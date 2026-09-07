@@ -404,7 +404,7 @@ get_ntfy_effective_priority() {
                 echo "4"
                 return 0
             elif (( remain_days <= 14 )); then
-                echo "3"
+                echo "1"
                 return 0
             fi
         fi
