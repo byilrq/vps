@@ -21,6 +21,8 @@ NTFY_COMPOSE_FILE="${NTFY_ROOT}/docker-compose.yml"
 NTFY_SERVER_FILE="${NTFY_ETC_DIR}/server.yml"
 NTFY_STATE_FILE="/root/.ntfy_install.conf"
 ISM_STATE_FILE="/root/.asset_manager_install.conf"
+NTFY_BOOT_GUARD_SCRIPT="/usr/local/sbin/ntfy-boot-guard.sh"
+NTFY_BOOT_GUARD_SERVICE="/etc/systemd/system/ntfy-boot-guard.service"
 
 SERVICE_NAME="ntfy"
 CONTAINER_NAME="ntfy"
@@ -161,6 +163,72 @@ wait_for_port() {
         sleep 1
     done
     return 1
+}
+
+wait_for_ntfy_health() {
+    # 端口监听 != ntfy 已可用；必须等健康接口真正返回 healthy=true。
+    local tries="${1:-45}"
+    local i body
+    for i in $(seq 1 "$tries"); do
+        body="$(curl -fsS --max-time 3 "http://127.0.0.1:${INTERNAL_PORT}/v1/health" 2>/dev/null || true)"
+        if printf '%s' "$body" | grep -Eq '"healthy"[[:space:]]*:[[:space:]]*true'; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_for_proxy_health() {
+    # 从本机穿过 Nginx 反代检查，不依赖公网 NAT 回环。
+    local tries="${1:-30}"
+    local i body scheme="http"
+    if [[ "${NTFY_BASE_URL:-}" == https://* ]]; then
+        scheme="https"
+    fi
+    for i in $(seq 1 "$tries"); do
+        if [ -n "${DOMAIN:-}" ]; then
+            body="$(curl -kfsS --max-time 4 \
+                --resolve "${DOMAIN}:${PUBLIC_PORT}:127.0.0.1" \
+                "${scheme}://${DOMAIN}:${PUBLIC_PORT}/v1/health" 2>/dev/null || true)"
+        else
+            body="$(curl -fsS --max-time 4 \
+                "http://127.0.0.1:${PUBLIC_PORT}/v1/health" 2>/dev/null || true)"
+        fi
+        if printf '%s' "$body" | grep -Eq '"healthy"[[:space:]]*:[[:space:]]*true'; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+get_local_ws_code() {
+    # 返回本机经 Nginx 到 ntfy 的 WebSocket 握手 HTTP 状态码。
+    local scheme="http"
+    local -a args
+    if [[ "${NTFY_BASE_URL:-}" == https://* ]]; then
+        scheme="https"
+    fi
+
+    args=(-k -sS --http1.1 --max-time 4 -o /dev/null -w '%{http_code}'
+          -H 'Connection: Upgrade'
+          -H 'Upgrade: websocket'
+          -H 'Sec-WebSocket-Version: 13'
+          -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==')
+
+    if [ "${NTFY_ENABLE_AUTH:-false}" = "true" ] && [ -n "${NTFY_ADMIN_USER:-}" ] && [ -n "${NTFY_ADMIN_PASS:-}" ]; then
+        args+=(-u "${NTFY_ADMIN_USER}:${NTFY_ADMIN_PASS}")
+    fi
+
+    if [ -n "${DOMAIN:-}" ]; then
+        args+=(--resolve "${DOMAIN}:${PUBLIC_PORT}:127.0.0.1"
+              "${scheme}://${DOMAIN}:${PUBLIC_PORT}/${NTFY_DEFAULT_TOPIC}/ws")
+    else
+        args+=("http://127.0.0.1:${PUBLIC_PORT}/${NTFY_DEFAULT_TOPIC}/ws")
+    fi
+
+    curl "${args[@]}" 2>/dev/null || true
 }
 
 compose_cmd() {
@@ -900,6 +968,184 @@ configure_nginx() {
     fi
 }
 
+install_boot_guard() {
+    load_state
+    info "安装/刷新 ntfy 开机自愈服务"
+
+    cat > "$NTFY_BOOT_GUARD_SCRIPT" <<'EOF_BOOT_GUARD'
+#!/usr/bin/env bash
+set -u
+
+STATE_FILE="/root/.ntfy_install.conf"
+LOG_TAG="ntfy-boot-guard"
+
+log() {
+    printf '[%s] %s\n' "$(date '+%F %T')" "$*"
+    logger -t "$LOG_TAG" -- "$*" 2>/dev/null || true
+}
+
+[ -f "$STATE_FILE" ] || { log "state file missing: $STATE_FILE"; exit 1; }
+# shellcheck disable=SC1090
+. "$STATE_FILE"
+
+: "${NTFY_ROOT:=/root/ntfy}"
+: "${NTFY_COMPOSE_FILE:=${NTFY_ROOT}/docker-compose.yml}"
+: "${INTERNAL_PORT:=8083}"
+: "${PUBLIC_PORT:=8183}"
+: "${DOMAIN:=}"
+: "${NTFY_BASE_URL:=}"
+: "${NTFY_ENABLE_AUTH:=true}"
+: "${NTFY_ADMIN_USER:=admin}"
+: "${NTFY_ADMIN_PASS:=}"
+: "${NTFY_DEFAULT_TOPIC:=let-rss}"
+
+compose_cmd() {
+    if docker compose version >/dev/null 2>&1; then
+        echo "docker compose"
+    elif command -v docker-compose >/dev/null 2>&1; then
+        echo "docker-compose"
+    else
+        return 1
+    fi
+}
+
+wait_internal_health() {
+    local i body
+    for i in $(seq 1 60); do
+        body="$(curl -fsS --max-time 3 "http://127.0.0.1:${INTERNAL_PORT}/v1/health" 2>/dev/null || true)"
+        if printf '%s' "$body" | grep -Eq '"healthy"[[:space:]]*:[[:space:]]*true'; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+wait_proxy_health() {
+    local i body scheme="http"
+    [[ "${NTFY_BASE_URL:-}" == https://* ]] && scheme="https"
+    for i in $(seq 1 30); do
+        if [ -n "${DOMAIN:-}" ]; then
+            body="$(curl -kfsS --max-time 4 --resolve "${DOMAIN}:${PUBLIC_PORT}:127.0.0.1" \
+                "${scheme}://${DOMAIN}:${PUBLIC_PORT}/v1/health" 2>/dev/null || true)"
+        else
+            body="$(curl -fsS --max-time 4 "http://127.0.0.1:${PUBLIC_PORT}/v1/health" 2>/dev/null || true)"
+        fi
+        if printf '%s' "$body" | grep -Eq '"healthy"[[:space:]]*:[[:space:]]*true'; then
+            return 0
+        fi
+        sleep 1
+    done
+    return 1
+}
+
+ws_code() {
+    local scheme="http"
+    local -a args
+    [[ "${NTFY_BASE_URL:-}" == https://* ]] && scheme="https"
+    args=(-k -sS --http1.1 --max-time 4 -o /dev/null -w '%{http_code}'
+          -H 'Connection: Upgrade'
+          -H 'Upgrade: websocket'
+          -H 'Sec-WebSocket-Version: 13'
+          -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==')
+    if [ "${NTFY_ENABLE_AUTH:-false}" = "true" ] && [ -n "${NTFY_ADMIN_USER:-}" ] && [ -n "${NTFY_ADMIN_PASS:-}" ]; then
+        args+=(-u "${NTFY_ADMIN_USER}:${NTFY_ADMIN_PASS}")
+    fi
+    if [ -n "${DOMAIN:-}" ]; then
+        args+=(--resolve "${DOMAIN}:${PUBLIC_PORT}:127.0.0.1"
+              "${scheme}://${DOMAIN}:${PUBLIC_PORT}/${NTFY_DEFAULT_TOPIC}/ws")
+    else
+        args+=("http://127.0.0.1:${PUBLIC_PORT}/${NTFY_DEFAULT_TOPIC}/ws")
+    fi
+    curl "${args[@]}" 2>/dev/null || true
+}
+
+# systemd 已声明 After=network-online/docker/nginx，这里再做运行态兜底。
+for _ in $(seq 1 30); do
+    systemctl is-active --quiet docker 2>/dev/null && break
+    sleep 1
+done
+if ! systemctl is-active --quiet docker 2>/dev/null; then
+    systemctl start docker 2>/dev/null || true
+    sleep 3
+fi
+
+cmd="$(compose_cmd || true)"
+[ -n "$cmd" ] || { log "docker compose unavailable"; exit 1; }
+[ -f "$NTFY_COMPOSE_FILE" ] || { log "compose file missing: $NTFY_COMPOSE_FILE"; exit 1; }
+
+cd "$NTFY_ROOT" || exit 1
+$cmd up -d ntfy >/dev/null 2>&1 || true
+
+if ! wait_internal_health; then
+    log "first start unhealthy; force recreating ntfy container"
+    $cmd stop ntfy >/dev/null 2>&1 || true
+    $cmd up -d --force-recreate ntfy >/dev/null 2>&1 || true
+    wait_internal_health || { log "internal health failed after recovery"; exit 1; }
+fi
+
+if ! systemctl is-active --quiet nginx 2>/dev/null; then
+    if nginx -t >/dev/null 2>&1; then
+        systemctl start nginx >/dev/null 2>&1 || true
+    fi
+fi
+
+wait_proxy_health || { log "nginx proxy health failed"; exit 1; }
+code="$(ws_code)"
+if [ "$code" != "101" ]; then
+    log "websocket handshake=${code:-000}; retrying ntfy once"
+    $cmd restart ntfy >/dev/null 2>&1 || true
+    wait_internal_health || { log "retry internal health failed"; exit 1; }
+    wait_proxy_health || { log "retry proxy health failed"; exit 1; }
+    code="$(ws_code)"
+fi
+
+if [ "$code" = "101" ]; then
+    log "ntfy boot recovery OK: internal/proxy/websocket all healthy"
+    exit 0
+fi
+
+log "websocket still unhealthy after recovery: HTTP ${code:-000}"
+exit 1
+EOF_BOOT_GUARD
+    chmod 700 "$NTFY_BOOT_GUARD_SCRIPT"
+
+    cat > "$NTFY_BOOT_GUARD_SERVICE" <<EOF_BOOT_SERVICE
+[Unit]
+Description=ntfy boot health recovery
+Wants=network-online.target docker.service nginx.service
+After=network-online.target docker.service nginx.service
+StartLimitIntervalSec=180
+StartLimitBurst=4
+
+[Service]
+Type=oneshot
+ExecStart=${NTFY_BOOT_GUARD_SCRIPT}
+Restart=on-failure
+RestartSec=15s
+TimeoutStartSec=360
+
+[Install]
+WantedBy=multi-user.target
+EOF_BOOT_SERVICE
+
+    systemctl daemon-reload
+    systemctl enable ntfy-boot-guard.service >/dev/null 2>&1
+    systemctl reset-failed ntfy-boot-guard.service >/dev/null 2>&1 || true
+    if systemctl start ntfy-boot-guard.service; then
+        ok "开机自愈已启用，并已完成一次即时健康检查：ntfy-boot-guard.service"
+    else
+        warn "开机自愈已启用，但即时健康检查未完全通过；可查看下面日志定位"
+    fi
+    echo "  查看本次自愈日志：journalctl -u ntfy-boot-guard.service -b --no-pager"
+}
+
+remove_boot_guard() {
+    systemctl disable --now ntfy-boot-guard.service >/dev/null 2>&1 || true
+    rm -f "$NTFY_BOOT_GUARD_SERVICE" "$NTFY_BOOT_GUARD_SCRIPT"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+
 install_ntfy_all() {
     load_state
     install_dependencies
@@ -909,28 +1155,60 @@ install_ntfy_all() {
     start_ntfy
     ensure_admin_user
     configure_nginx
+    install_boot_guard
 }
 
 restart_ntfy() {
     load_state
-    local cmd
+    local cmd ws_code
     cmd="$(compose_cmd)"
-    info "仅重启 ntfy 容器"
+
+    info "重启 ntfy，并等待应用/反代/WebSocket 真正恢复"
     repair_docker_iptables
     (cd "$NTFY_ROOT" && $cmd restart ntfy)
 
-    if wait_for_port "$INTERNAL_PORT" 10; then
-        ok "ntfy 已重启，内部端口 ${INTERNAL_PORT} 正常"
+    if ! wait_for_port "$INTERNAL_PORT" 30; then
+        warn "第一次重启后端口仍未监听，准备执行一次强制重建恢复"
+    elif ! wait_for_ntfy_health 45; then
+        warn "第一次重启后端口已监听，但 /v1/health 未恢复，准备执行一次强制重建恢复"
+    elif ! wait_for_proxy_health 30; then
+        warn "ntfy 本体已健康，但 Nginx 反代尚未恢复，准备执行一次强制重建恢复"
     else
-        warn "ntfy 重启后内部端口 ${INTERNAL_PORT} 尚未监听，请运行菜单 [4] 查看状态"
+        ws_code="$(get_local_ws_code)"
+        if [ "$ws_code" = "101" ]; then
+            ok "ntfy 重启完成：内部健康、Nginx 反代、WebSocket 订阅均正常"
+            return 0
+        fi
+        warn "第一次重启后 WebSocket 握手为 HTTP ${ws_code:-000}，自动执行一次干净重建"
     fi
 
-    # 这里只检查，不 reload/restart/start Nginx，避免影响其它站点。
-    if systemctl is-active --quiet nginx 2>/dev/null; then
-        ok "Nginx 当前 active（本操作未 reload/restart Nginx）"
-    else
-        warn "Nginx 当前未运行；本菜单不会自动操作 Nginx。请运行菜单 [4] 查看原因。"
+    # 第二阶段：不动 Nginx，只强制重建 ntfy 容器。持久化目录均为 bind mount，不会丢订阅/账号数据。
+    (cd "$NTFY_ROOT" && $cmd stop ntfy) || true
+    sleep 2
+    (cd "$NTFY_ROOT" && $cmd up -d --force-recreate ntfy) || true
+
+    if ! wait_for_port "$INTERNAL_PORT" 30 || ! wait_for_ntfy_health 60; then
+        err "ntfy 强制重建后仍未健康"
+        echo "最近日志："
+        (cd "$NTFY_ROOT" && $cmd logs --tail=80 ntfy) || true
+        return 1
     fi
+
+    if ! wait_for_proxy_health 30; then
+        err "ntfy 已健康，但 Nginx -> ntfy 反代检查失败"
+        echo "建议立即运行菜单 [4] 查看 Nginx/端口状态。"
+        return 1
+    fi
+
+    ws_code="$(get_local_ws_code)"
+    if [ "$ws_code" = "101" ]; then
+        ok "ntfy 已自动恢复：内部健康、Nginx 反代、WebSocket 订阅均正常"
+        return 0
+    fi
+
+    err "ntfy 本体和反代已健康，但 WebSocket 仍异常：HTTP ${ws_code:-000}"
+    echo "建议立即运行菜单 [4]；脚本不会重启 Nginx，以免影响其它站点。"
+    return 1
 }
 
 show_status() {
@@ -1017,6 +1295,19 @@ show_status() {
         green "  [OK] Nginx 开机自启：enabled"
     else
         yellow "  [WARN] Nginx 开机自启：disabled/unknown（服务器重启后可能再次失联）"
+    fi
+
+    if systemctl is-enabled --quiet ntfy-boot-guard.service 2>/dev/null; then
+        local guard_result
+        guard_result="$(systemctl show ntfy-boot-guard.service -p Result --value 2>/dev/null || true)"
+        if [ -z "$guard_result" ] || [ "$guard_result" = "success" ]; then
+            green "  [OK] ntfy 开机自愈：enabled（最近结果 ${guard_result:-success}）"
+        else
+            yellow "  [WARN] ntfy 开机自愈：enabled，但最近结果 ${guard_result}"
+            echo "       日志：journalctl -u ntfy-boot-guard.service -b --no-pager"
+        fi
+    else
+        yellow "  [WARN] ntfy 开机自愈：未启用（可执行菜单 [7]）"
     fi
 
     if nginx -t >/tmp/ntfy_nginx_test.out 2>&1; then
@@ -1162,6 +1453,7 @@ uninstall_ntfy() {
     fi
 
     local cmd removed_nginx="false" foreign_configs
+    remove_boot_guard
     cmd="$(compose_cmd || true)"
     foreign_configs="$(get_foreign_nginx_configs || true)"
 
@@ -1232,6 +1524,7 @@ show_menu() {
     printf "${BOLD}${YELLOW} [4] 查看状态${NC}                   ${WHITE}检查容器、Nginx、健康接口与 WebSocket${NC}\n"
     printf "${BOLD}${MAGENTA} [5] 设置/重置登录账号${NC}         ${WHITE}创建或更新 ntfy 管理员账号${NC}\n"
     printf "${BOLD}${RED}   [6] 卸载 ntfy${NC}                 ${YELLOW}仅删除自管反代；外部 Nginx 配置保留${NC}\n"
+    printf "${BOLD}${GREEN} [7] 安装/刷新开机自愈${NC}          ${WHITE}首轮启动异常时自动健康检查并恢复${NC}\n"
     printf "${BOLD}${RED}   [0] 退出${NC}\n"
     printf "${BOLD}${BLUE}-------------------------------------------------------------------------${NC}\n"
     printf "${BOLD}${YELLOW} ★ 默认外部端口：${NC}${GREEN}${PUBLIC_PORT}${NC}${WHITE}，避免与你现有 asset_manager / gotify 端口冲突${NC}\n"
@@ -1253,11 +1546,12 @@ main() {
         echo
         case "${choice:-}" in
             1) install_ntfy_all ;;
-            2) prompt_basic_config; configure_nginx ;;
+            2) prompt_basic_config; configure_nginx; install_boot_guard ;;
             3) restart_ntfy ;;
             4) show_status ;;
             5) reset_admin_user ;;
             6) uninstall_ntfy ;;
+            7) install_boot_guard ;;
             0) exit 0 ;;
             *) warn "无效选项" ;;
         esac
