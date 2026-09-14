@@ -1211,6 +1211,61 @@ restart_ntfy() {
     return 1
 }
 
+show_boot_guard_status() {
+    local unit="ntfy-boot-guard.service"
+    local load_state unit_state active_state sub_state result exit_status
+    local start_ts exit_ts restarts last_log
+
+    load_state="$(systemctl show "$unit" -p LoadState --value 2>/dev/null || true)"
+    if [ -z "$load_state" ] || [ "$load_state" = "not-found" ]; then
+        yellow "  [WARN] ntfy 开机自愈：service 未安装（可执行菜单 [7]）"
+        return 0
+    fi
+
+    unit_state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+    active_state="$(systemctl show "$unit" -p ActiveState --value 2>/dev/null || true)"
+    sub_state="$(systemctl show "$unit" -p SubState --value 2>/dev/null || true)"
+    result="$(systemctl show "$unit" -p Result --value 2>/dev/null || true)"
+    exit_status="$(systemctl show "$unit" -p ExecMainStatus --value 2>/dev/null || true)"
+    start_ts="$(systemctl show "$unit" -p ExecMainStartTimestamp --value 2>/dev/null || true)"
+    exit_ts="$(systemctl show "$unit" -p ExecMainExitTimestamp --value 2>/dev/null || true)"
+    restarts="$(systemctl show "$unit" -p NRestarts --value 2>/dev/null || true)"
+    last_log="$(journalctl -u "$unit" -b -n 1 --no-pager -o cat 2>/dev/null | tail -n 1 || true)"
+
+    case "$unit_state" in
+        enabled) green "  [OK] ntfy 开机自愈：enabled" ;;
+        *) yellow "  [WARN] ntfy 开机自愈：${unit_state:-disabled/unknown}（可执行菜单 [7] 重新启用）" ;;
+    esac
+
+    if [ "$active_state" = "inactive" ] && [ "$sub_state" = "dead" ] && { [ -z "$result" ] || [ "$result" = "success" ]; }; then
+        green "       service 状态：inactive/dead（oneshot 已执行完成，正常）"
+    elif [ "$active_state" = "active" ] || [ "$active_state" = "activating" ]; then
+        green "       service 状态：${active_state:-unknown}/${sub_state:-unknown}"
+    elif [ "$active_state" = "failed" ] || { [ -n "$result" ] && [ "$result" != "success" ]; }; then
+        red "       service 状态：${active_state:-unknown}/${sub_state:-unknown}"
+    else
+        yellow "       service 状态：${active_state:-unknown}/${sub_state:-unknown}"
+    fi
+
+    if [ -z "$result" ] || [ "$result" = "success" ]; then
+        green "       最近结果：${result:-success} | 退出码：${exit_status:-0} | 自动重试：${restarts:-0} 次"
+    else
+        red "       最近结果：${result} | 退出码：${exit_status:-unknown} | 自动重试：${restarts:-0} 次"
+    fi
+
+    echo "       最近启动：${start_ts:-无记录}"
+    echo "       最近结束：${exit_ts:-无记录}"
+    if [ -n "$last_log" ]; then
+        echo "       本次开机最后日志：${last_log}"
+    else
+        echo "       本次开机最后日志：无记录"
+    fi
+
+    if [ "$active_state" = "failed" ] || { [ -n "$result" ] && [ "$result" != "success" ]; }; then
+        echo "       完整日志：journalctl -u ${unit} -b --no-pager"
+    fi
+}
+
 show_status() {
     load_state
     local cmd internal_health proxy_health public_health ws_code
@@ -1297,18 +1352,7 @@ show_status() {
         yellow "  [WARN] Nginx 开机自启：disabled/unknown（服务器重启后可能再次失联）"
     fi
 
-    if systemctl is-enabled --quiet ntfy-boot-guard.service 2>/dev/null; then
-        local guard_result
-        guard_result="$(systemctl show ntfy-boot-guard.service -p Result --value 2>/dev/null || true)"
-        if [ -z "$guard_result" ] || [ "$guard_result" = "success" ]; then
-            green "  [OK] ntfy 开机自愈：enabled（最近结果 ${guard_result:-success}）"
-        else
-            yellow "  [WARN] ntfy 开机自愈：enabled，但最近结果 ${guard_result}"
-            echo "       日志：journalctl -u ntfy-boot-guard.service -b --no-pager"
-        fi
-    else
-        yellow "  [WARN] ntfy 开机自愈：未启用（可执行菜单 [7]）"
-    fi
+    show_boot_guard_status
 
     if nginx -t >/tmp/ntfy_nginx_test.out 2>&1; then
         nginx_config_ok="true"
