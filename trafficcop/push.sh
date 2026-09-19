@@ -236,29 +236,94 @@ get_traffic_usage_vnstat() {
 }
 
 get_bwh_info() {
+    local max_attempts=3 retry_wait=15 attempt
     local json err used_bytes plan_bytes next_reset
-
-    json=$(curl -fsS -G "$BWH_API_ENDPOINT" \
-        --data-urlencode "veid=$BWH_VEID" \
-        --data-urlencode "api_key=$BWH_API_KEY" 2>/dev/null) || return 1
-
-    err=$(echo "$json" | jq -r '.error // 1' 2>/dev/null)
-    [[ "$err" == "0" ]] || return 1
-
-    used_bytes=$(echo "$json" | jq -r '.data_counter // empty' 2>/dev/null)
-    plan_bytes=$(echo "$json" | jq -r '.plan_monthly_data // empty' 2>/dev/null)
-    next_reset=$(echo "$json" | jq -r '.data_next_reset // empty' 2>/dev/null)
-
-    [[ "$used_bytes" =~ ^[0-9]+$ ]] || return 1
-    [[ "$plan_bytes" =~ ^[0-9]+$ ]] || plan_bytes=0
-    [[ "$next_reset" =~ ^[0-9]+$ ]] || next_reset=0
-
     local used_gb plan_gb
-    used_gb=$(awk "BEGIN{printf \"%.3f\", $used_bytes/1024/1024/1024}")
-    plan_gb=$(awk "BEGIN{printf \"%.3f\", $plan_bytes/1024/1024/1024}")
+    local tmp_body tmp_err http_code curl_rc curl_err body_preview last_error
 
-    echo "$used_gb $plan_gb $next_reset $used_bytes $plan_bytes"
-    return 0
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        tmp_body=$(mktemp) || {
+            last_error="无法创建临时文件"
+            log_cron "KiwiVM API 第${attempt}次请求失败：${last_error}"
+            if (( attempt < max_attempts )); then
+                log_cron "KiwiVM API 将在 ${retry_wait} 秒后重试（下一次：$((attempt+1))/${max_attempts}）"
+                sleep "$retry_wait"
+                continue
+            fi
+            break
+        }
+        tmp_err=$(mktemp) || {
+            rm -f "$tmp_body"
+            last_error="无法创建错误日志临时文件"
+            log_cron "KiwiVM API 第${attempt}次请求失败：${last_error}"
+            if (( attempt < max_attempts )); then
+                log_cron "KiwiVM API 将在 ${retry_wait} 秒后重试（下一次：$((attempt+1))/${max_attempts}）"
+                sleep "$retry_wait"
+                continue
+            fi
+            break
+        }
+
+        http_code=$(curl -sS -G "$BWH_API_ENDPOINT" \
+            --data-urlencode "veid=$BWH_VEID" \
+            --data-urlencode "api_key=$BWH_API_KEY" \
+            --connect-timeout 8 --max-time 15 \
+            -o "$tmp_body" -w "%{http_code}" 2>"$tmp_err")
+        curl_rc=$?
+        json=$(cat "$tmp_body" 2>/dev/null)
+        curl_err=$(tr '\n' ' ' < "$tmp_err" 2>/dev/null | sed 's/[[:space:]]\+/ /g' | cut -c1-500)
+        rm -f "$tmp_body" "$tmp_err"
+
+        if (( curl_rc != 0 )); then
+            last_error="curl exit=${curl_rc}"
+            [[ -n "$curl_err" ]] && last_error+="，${curl_err}"
+            log_cron "KiwiVM API 第${attempt}次请求失败：${last_error}"
+        elif ! [[ "$http_code" =~ ^2[0-9][0-9]$ ]]; then
+            body_preview=$(printf '%s' "$json" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-500)
+            last_error="HTTP ${http_code:-未知}"
+            [[ -n "$body_preview" ]] && last_error+="，resp=${body_preview}"
+            log_cron "KiwiVM API 第${attempt}次请求失败：${last_error}"
+        elif ! command -v jq >/dev/null 2>&1; then
+            last_error="缺少 jq 依赖"
+            log_cron "KiwiVM API 第${attempt}次请求失败：${last_error}"
+        else
+            err=$(printf '%s' "$json" | jq -r '.error // 1' 2>/dev/null)
+            if [[ "$err" != "0" ]]; then
+                body_preview=$(printf '%s' "$json" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g' | cut -c1-500)
+                last_error="API error=${err:-无法解析}"
+                [[ -n "$body_preview" ]] && last_error+="，resp=${body_preview}"
+                log_cron "KiwiVM API 第${attempt}次请求失败：${last_error}"
+            else
+                used_bytes=$(printf '%s' "$json" | jq -r '.data_counter // empty' 2>/dev/null)
+                plan_bytes=$(printf '%s' "$json" | jq -r '.plan_monthly_data // empty' 2>/dev/null)
+                next_reset=$(printf '%s' "$json" | jq -r '.data_next_reset // empty' 2>/dev/null)
+
+                if ! [[ "$used_bytes" =~ ^[0-9]+$ ]]; then
+                    last_error="data_counter 缺失或不是数字"
+                    log_cron "KiwiVM API 第${attempt}次请求失败：${last_error}"
+                else
+                    [[ "$plan_bytes" =~ ^[0-9]+$ ]] || plan_bytes=0
+                    [[ "$next_reset" =~ ^[0-9]+$ ]] || next_reset=0
+
+                    used_gb=$(awk "BEGIN{printf \"%.3f\", $used_bytes/1024/1024/1024}")
+                    plan_gb=$(awk "BEGIN{printf \"%.3f\", $plan_bytes/1024/1024/1024}")
+
+                    log_cron "KiwiVM API 第${attempt}次请求成功"
+                    echo "$used_gb $plan_gb $next_reset $used_bytes $plan_bytes"
+                    return 0
+                fi
+            fi
+        fi
+
+        if (( attempt < max_attempts )); then
+            log_cron "KiwiVM API 将在 ${retry_wait} 秒后重试（下一次：$((attempt+1))/${max_attempts}）"
+            sleep "$retry_wait"
+        fi
+    done
+
+    log_cron "KiwiVM API 连续${max_attempts}次失败"
+    log_cron "KiwiVM API 最后错误：${last_error:-未知错误}"
+    return 1
 }
 
 get_bwh_cycle_dates() {
@@ -281,7 +346,7 @@ get_bwh_cycle_dates() {
 build_report() {
     local today expire_ts today_ts diff_days remain_emoji
     local disk_used disk_total disk_pct disk_line
-    local start end usage limit
+    local start end usage limit usage_display limit_display traffic_warning
 
     today=$(date +%Y-%m-%d)
 
@@ -315,24 +380,38 @@ build_report() {
         start="未知"; end="未知"
     fi
 
+    traffic_warning=""
     if [[ "$TRAFFIC_SOURCE" == "bwh_api" ]]; then
         local info used_gb plan_gb next_reset cy
-        info=$(get_bwh_info) || return 1
-        used_gb=$(echo "$info" | awk '{print $1}')
-        plan_gb=$(echo "$info" | awk '{print $2}')
-        next_reset=$(echo "$info" | awk '{print $3}')
+        if info=$(get_bwh_info); then
+            used_gb=$(echo "$info" | awk '{print $1}')
+            plan_gb=$(echo "$info" | awk '{print $2}')
+            next_reset=$(echo "$info" | awk '{print $3}')
 
-        cy=$(get_bwh_cycle_dates "$next_reset" 2>/dev/null) && {
-            start=$(echo "$cy" | awk '{print $1}')
-            end=$(echo "$cy" | awk '{print $2}')
-        }
+            cy=$(get_bwh_cycle_dates "$next_reset" 2>/dev/null) && {
+                start=$(echo "$cy" | awk '{print $1}')
+                end=$(echo "$cy" | awk '{print $2}')
+            }
 
-        usage="$used_gb"
-        limit="${plan_gb} GB"
+            usage="$used_gb"
+            limit="${plan_gb} GB"
+            usage_display="${usage} GB"
+            limit_display="$limit"
+        else
+            # API 连续失败时不丢日报：流量字段降级为“获取失败”，继续发送 ntfy。
+            usage="获取失败"
+            limit="获取失败"
+            usage_display="获取失败"
+            limit_display="获取失败"
+            traffic_warning="⚠️ 流量来源：KiwiVM API 暂时不可用"
+            log_cron "KiwiVM API 不可用，本次日报使用降级内容继续推送"
+        fi
     else
         read_traffic_config || return 1
         usage=$(get_traffic_usage_vnstat)
         limit="${TRAFFIC_LIMIT} GB"
+        usage_display="${usage} GB"
+        limit_display="$limit"
     fi
 
     local title="🎯 [${MACHINE_NAME}] 流量统计"
@@ -343,9 +422,10 @@ build_report() {
 🕒日期：${today}
 ${remain_emoji}剩余：${diff_days}天
 🔄周期：${start} 到 ${end}
-⌛已用：${usage} GB
-🌐套餐：${limit}
-💾空间：${disk_line}
+⌛已用：${usage_display}
+🌐套餐：${limit_display}
+${traffic_warning:+${traffic_warning}
+}💾空间：${disk_line}
 "
 
     # Telegram-safe HTML：只保留<b>，不用<br>，用换行符
@@ -353,9 +433,10 @@ ${remain_emoji}剩余：${diff_days}天
 🕒日期：${today}
 ${remain_emoji}剩余：${diff_days}天
 🔄周期：${start} 到 ${end}
-⌛已用：${usage} GB
-🌐套餐：${limit}
-💾空间：${disk_line}
+⌛已用：${usage_display}
+🌐套餐：${limit_display}
+${traffic_warning:+${traffic_warning}
+}💾空间：${disk_line}
 "
 
     # PushPlus HTML：使用<br>
@@ -363,9 +444,9 @@ ${remain_emoji}剩余：${diff_days}天
 🕒日期：${today}<br>
 ${remain_emoji}剩余：${diff_days}天<br>
 🔄周期：${start} 到 ${end}<br>
-⌛已用：${usage} GB<br>
-🌐套餐：${limit}<br>
-💾空间：${disk_line}
+⌛已用：${usage_display}<br>
+🌐套餐：${limit_display}<br>
+${traffic_warning:+${traffic_warning}<br>}💾空间：${disk_line}
 "
 
     # 用分隔符输出三段，避免 sed 取行断裂
