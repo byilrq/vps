@@ -1461,6 +1461,274 @@ acme_purge_keep_xui() {
 
 
 # -----------------------------
+#  SSH 防爆破：1小时内认证失败6次后永久封禁
+# -----------------------------
+ssh_fail2ban_guard() {
+  need_root
+
+  local jail_name="ssh-permanent-guard"
+  local jail_file="/etc/fail2ban/jail.d/ssh-permanent-guard.local"
+  local maxretry="6"
+  local findtime="3600"
+  local bantime="-1"
+
+  _ssh_guard_pause() {
+    echo ""
+    read -rp "回车返回 SSH 防爆破菜单..." _
+  }
+
+  _ssh_guard_install() {
+    if command -v fail2ban-client >/dev/null 2>&1; then
+      return 0
+    fi
+
+    yellow "未检测到 Fail2Ban，正在安装..."
+    pkg_update || true
+    pkg_install fail2ban || {
+      red "Fail2Ban 安装失败。"
+      return 1
+    }
+
+    # systemd 日志后端需要 python3-systemd；Debian/Ubuntu 尽量自动补齐。
+    if command -v apt-get >/dev/null 2>&1; then
+      if ! python3 -c 'import systemd.journal' >/dev/null 2>&1; then
+        pkg_install python3-systemd >/dev/null 2>&1 || true
+      fi
+    fi
+    return 0
+  }
+
+  _ssh_guard_action() {
+    if [[ -f /etc/fail2ban/action.d/nftables-allports.conf ]] && command -v nft >/dev/null 2>&1; then
+      echo "nftables-allports"
+      return 0
+    fi
+
+    if [[ -f /etc/fail2ban/action.d/iptables-allports.conf ]]; then
+      if ! command -v iptables >/dev/null 2>&1; then
+        pkg_install iptables >/dev/null 2>&1 || true
+      fi
+      if command -v iptables >/dev/null 2>&1; then
+        echo "iptables-allports"
+        return 0
+      fi
+    fi
+
+    return 1
+  }
+
+  _ssh_guard_write_config() {
+    local action_name backend_line logpath_line sshp
+    sshp="$(get_ssh_port)"
+    action_name="$(_ssh_guard_action)" || {
+      red "未找到可用的 Fail2Ban 全端口封禁动作（nftables/iptables）。"
+      return 1
+    }
+
+    backend_line="backend = systemd"
+    logpath_line=""
+
+    if ! command -v journalctl >/dev/null 2>&1 || ! python3 -c 'import systemd.journal' >/dev/null 2>&1; then
+      if [[ -f /var/log/auth.log ]]; then
+        backend_line="backend = auto"
+        logpath_line="logpath = /var/log/auth.log"
+      elif [[ -f /var/log/secure ]]; then
+        backend_line="backend = auto"
+        logpath_line="logpath = /var/log/secure"
+      else
+        red "无法确定 SSH 登录失败日志来源：systemd journal 不可用，且未找到 auth.log/secure。"
+        return 1
+      fi
+    fi
+
+    mkdir -p /etc/fail2ban/jail.d || return 1
+    if [[ -f "$jail_file" ]]; then
+      cp -a "$jail_file" "${jail_file}.bak.$(date +%Y%m%d_%H%M%S)" || true
+    fi
+
+    cat > "$jail_file" <<EOF
+# Managed by sys_conf.sh - SSH permanent guard
+# Rule: same IP fails SSH authentication 6 times within 1 hour => permanent ban.
+# bantime=-1 means no automatic unban; use the SSH menu to unban manually.
+[$jail_name]
+enabled = true
+filter = sshd
+port = $sshp
+$backend_line
+$logpath_line
+findtime = $findtime
+maxretry = $maxretry
+bantime = $bantime
+usedns = no
+# Block all TCP and UDP ports from the banned source IP, not only the SSH port.
+action = $action_name[name=${jail_name}-tcp, protocol=tcp]
+         $action_name[name=${jail_name}-udp, protocol=udp]
+EOF
+
+    if ! fail2ban-client -t >/dev/null 2>&1; then
+      red "Fail2Ban 配置校验失败，未启用。"
+      fail2ban-client -t 2>&1 | tail -n 20
+      return 1
+    fi
+
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl enable fail2ban >/dev/null 2>&1 || true
+      if ! systemctl restart fail2ban; then
+        red "Fail2Ban 服务启动/重启失败。"
+        return 1
+      fi
+    else
+      service fail2ban restart || {
+        red "Fail2Ban 服务启动/重启失败。"
+        return 1
+      }
+    fi
+
+    sleep 1
+    if fail2ban-client status "$jail_name" >/dev/null 2>&1; then
+      green "SSH 防爆破已启用。"
+      echo "规则：同一 IP 在 1 小时内 SSH 认证失败累计 6 次 -> 永久封禁"
+      echo "范围：封禁该 IP 对本机全部 TCP/UDP 端口的访问"
+      echo "SSH 端口：$sshp"
+      echo "封禁时长：永久（仅手动解封）"
+      echo "配置文件：$jail_file"
+      yellow "注意：如果你自己连续输错密码达到 6 次，也会被永久封禁。"
+      return 0
+    fi
+
+    red "Fail2Ban 已启动，但未发现 jail：$jail_name"
+    fail2ban-client status 2>/dev/null || true
+    return 1
+  }
+
+  _ssh_guard_status() {
+    if ! command -v fail2ban-client >/dev/null 2>&1; then
+      yellow "Fail2Ban 尚未安装，SSH 防爆破未启用。"
+      return 0
+    fi
+
+    echo "=============================="
+    echo " SSH 防爆破状态"
+    echo "=============================="
+    if [[ -f "$jail_file" ]]; then
+      echo "配置文件：$jail_file"
+      echo "规则：1小时内失败 6 次 -> 永久封禁"
+    else
+      echo "配置文件：未创建"
+    fi
+    echo ""
+
+    if fail2ban-client status "$jail_name" >/dev/null 2>&1; then
+      fail2ban-client status "$jail_name"
+    else
+      yellow "jail [$jail_name] 当前未运行。"
+      fail2ban-client status 2>/dev/null || true
+    fi
+  }
+
+  _ssh_guard_banned() {
+    if ! command -v fail2ban-client >/dev/null 2>&1 || ! fail2ban-client status "$jail_name" >/dev/null 2>&1; then
+      yellow "SSH 防爆破当前未运行。"
+      return 0
+    fi
+
+    local banned
+    banned="$(fail2ban-client get "$jail_name" banip 2>/dev/null || true)"
+    echo "当前永久封禁 IP："
+    if [[ -n "$banned" ]]; then
+      printf '%s\n' "$banned"
+    else
+      echo "（无）"
+    fi
+  }
+
+  _ssh_guard_unban() {
+    if ! command -v fail2ban-client >/dev/null 2>&1 || ! fail2ban-client status "$jail_name" >/dev/null 2>&1; then
+      yellow "SSH 防爆破当前未运行。"
+      return 0
+    fi
+
+    local ip
+    read -erp "请输入要解除封禁的 IPv4/IPv6 地址: " ip
+    [[ -n "$ip" ]] || { yellow "未输入 IP，已取消。"; return 0; }
+
+    if fail2ban-client set "$jail_name" unbanip "$ip" >/dev/null 2>&1; then
+      green "已解除封禁：$ip"
+    else
+      red "解除封禁失败：$ip（可能未被当前 jail 封禁，或 IP 格式不正确）"
+      return 1
+    fi
+  }
+
+  _ssh_guard_disable() {
+    if [[ ! -f "$jail_file" ]]; then
+      yellow "未发现本脚本创建的 SSH 防爆破配置，无需关闭。"
+      return 0
+    fi
+
+    yellow "关闭后，本 jail 当前施加的封禁规则会被移除。"
+    read -rp "确认关闭 SSH 防爆破？输入 YES 继续: " confirm
+    [[ "$confirm" == "YES" ]] || { yellow "已取消。"; return 0; }
+
+    mv "$jail_file" "${jail_file}.disabled.$(date +%Y%m%d_%H%M%S)"
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl restart fail2ban >/dev/null 2>&1 || true
+    else
+      service fail2ban restart >/dev/null 2>&1 || true
+    fi
+    green "SSH 防爆破已关闭。"
+  }
+
+  while true; do
+    clear
+    echo "=========================================="
+    echo " SSH 防爆破 / 自动永久封禁"
+    echo "=========================================="
+    echo " 规则：1小时内 SSH 认证失败 6 次 -> 永久封禁"
+    echo " 范围：封禁来源 IP 的全部 TCP/UDP 访问"
+    echo ""
+    echo " 1. 安装/启用（或更新配置）"
+    echo " 2. 查看运行状态"
+    echo " 3. 查看已封禁 IP"
+    echo " 4. 手动解除封禁 IP"
+    echo " 5. 关闭 SSH 防爆破"
+    echo " 0. 返回上一级"
+    echo "=========================================="
+    read -rp "请选择 [0-5]： " guard_choice
+
+    case "$guard_choice" in
+      1)
+        _ssh_guard_install && _ssh_guard_write_config
+        _ssh_guard_pause
+        ;;
+      2)
+        _ssh_guard_status
+        _ssh_guard_pause
+        ;;
+      3)
+        _ssh_guard_banned
+        _ssh_guard_pause
+        ;;
+      4)
+        _ssh_guard_unban
+        _ssh_guard_pause
+        ;;
+      5)
+        _ssh_guard_disable
+        _ssh_guard_pause
+        ;;
+      0)
+        return 0
+        ;;
+      *)
+        yellow "无效选项。"
+        sleep 1
+        ;;
+    esac
+  done
+}
+
+# -----------------------------
 #  SSH 设置
 # -----------------------------
 ssh_settings() {
@@ -1471,13 +1739,15 @@ ssh_settings() {
     echo " SSH 设置"
     echo " 1. 修改 SSH 端口2222"
     echo " 2. 设置 SSH 登录方式"
+    echo " 3. SSH 防爆破（1小时失败6次永久封禁）"
     echo " 0. 返回上一级"
     echo "=============================="
-    read -rp "请选择 [0-2]： " ssh_choice
+    read -rp "请选择 [0-3]： " ssh_choice
 
     case "$ssh_choice" in
       1) ssh_port 2222 ;;
       2) auth_key root ;;
+      3) ssh_fail2ban_guard ;;
       0) return 0 ;;
       *) return 0 ;;
     esac
