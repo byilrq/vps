@@ -1591,66 +1591,6 @@ install_sub2sing_box() {
 }
 
 # -----------------------------
-#  安装伪装站点
-# -----------------------------
-install_fake_site() {
-
-    echo "----------------------------------------------------------------"
-    echo "重置伪装站点"
-    echo "----------------------------------------------------------------"
-
-    ZIP_URL="https://raw.githubusercontent.com/byilrq/vps/main/html.zip"
-    ZIP_FILE="$HOME/html.zip"
-    WEB_ROOT="/var/www/html"
-
-    Green="\033[32m"
-    Red="\033[31m"
-    Blue="\033[36m"
-    Font="\033[0m"
-    OK="${Green}[OK]${Font}"
-    ERROR="${Red}[ERROR]${Font}"
-
-    msg_inf() { echo -e "${Blue} $1 ${Font}"; }
-    msg_ok()  { echo -e "${OK} ${Blue} $1 ${Font}"; }
-    msg_err() { echo -e "${ERROR} ${Blue} $1 ${Font}"; }
-
-	msg_inf "开始安装 unzip..."
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get update -y -q >/dev/null 2>&1 || true
-        apt-get install -y unzip >/dev/null 2>&1 || true
-    elif command -v yum >/dev/null 2>&1; then
-        yum install -y unzip >/dev/null 2>&1 || true
-    fi
-
-    cd "$HOME" || return 1
-
-    msg_inf "开始下载网站压缩包..."
-    rm -f "$ZIP_FILE"
-    wget -O "$ZIP_FILE" "$ZIP_URL" || {
-        msg_err "网站压缩包下载失败！"
-        return 1
-    }
-
-    [[ -d "$WEB_ROOT" ]] || mkdir -p "$WEB_ROOT"
-
-    msg_inf "清空当前网站目录..."
-    rm -rf "${WEB_ROOT:?}"/*
-
-    msg_inf "正在解压到 $WEB_ROOT ..."
-    unzip -o "$ZIP_FILE" -d "$WEB_ROOT" >/dev/null 2>&1 || {
-        msg_err "网站压缩包解压失败！"
-        return 1
-    }
-
-    # 防止压缩包内多套一层 html 目录，避免变成 /var/www/html/html
-    if [[ -d "$WEB_ROOT/html" ]]; then
-        msg_inf "检测到多余 html 目录，正在整理..."
-        cp -a "$WEB_ROOT/html/." "$WEB_ROOT/" && rm -rf "$WEB_ROOT/html"
-    fi
-
-    msg_ok "网站已成功重置并部署到 $WEB_ROOT"
-}
-# -----------------------------
 #  配置计划任务
 # -----------------------------
 setup_cronjob() {
@@ -1914,7 +1854,7 @@ show_final_details() {
         echo -e "用户名:  ${config_username} \n"
         echo -e "密码:    ${config_password} \n"
         msg_inf "- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -"
-        msg_inf "伪装站主页: https://${domain}/\n"
+        msg_inf "网站入口（内容需手动部署，Nginx 当前反代至 127.0.0.1:8080）: https://${domain}/\n"
         msg_inf "首个客户端 Web 订阅页: https://${domain}/${web_path}?name=first\n"
         msg_inf "本地 sub2sing-box 地址: https://${domain}/${sub2singbox_path}/\n"
 
@@ -2796,7 +2736,7 @@ install_xui_pro() {
     UPDATE_XUIDB
     configure_nginx
     install_sub2sing_box
-    install_fake_site
+    msg_inf "已跳过伪装站点安装；网站内容由用户手动部署。"
     setup_cronjob
     show_final_details
     pause
