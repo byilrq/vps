@@ -3,25 +3,33 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 RAW_WOL_URL="https://raw.githubusercontent.com/byilrq/vps/main/wol/wol.py"
-APP_DIR="/opt/wol-web"
-ETC_DIR="/etc/wol-web"
-CONFIG_FILE="${ETC_DIR}/config.json"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+APP_DIR="${SCRIPT_DIR}/wol"
+ETC_DIR="${APP_DIR}"
+CONFIG_FILE="${APP_DIR}/config.json"
 SERVICE_FILE="/etc/systemd/system/wol-web.service"
 SERVICE_NAME="wol-web"
-SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 VENV_PY="${APP_DIR}/venv/bin/python"
 VENV_PIP="${APP_DIR}/venv/bin/pip"
 GENERATED_PASSWORD=""
 NGINX_CONF_FILE=""
 NGINX_LINK_FILE=""
 
-RED=$'\033[0;31m'
-GREEN=$'\033[0;32m'
-YELLOW=$'\033[0;33m'
-CYAN=$'\033[0;36m'
-RESET=$'\033[0m'
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+    RED=$'\033[1;31m'
+    GREEN=$'\033[1;32m'
+    YELLOW=$'\033[1;33m'
+    CYAN=$'\033[1;36m'
+    BLUE=$'\033[1;34m'
+    PURPLE=$'\033[1;35m'
+    DIM=$'\033[2m'
+    BOLD=$'\033[1m'
+    RESET=$'\033[0m'
+else
+    RED='' GREEN='' YELLOW='' CYAN='' BLUE='' PURPLE='' DIM='' BOLD='' RESET=''
+fi
 
 info() { printf '%s\n' "${CYAN}[INFO]${RESET} $*"; }
 ok() { printf '%s\n' "${GREEN}[OK]${RESET} $*"; }
@@ -89,8 +97,8 @@ finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
 PY
-    chown root:wolweb "$CONFIG_FILE" 2>/dev/null || chown root:root "$CONFIG_FILE" 2>/dev/null || true
-    chmod 640 "$CONFIG_FILE" 2>/dev/null || true
+    chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
 record_firewall_port() {
@@ -117,8 +125,8 @@ finally:
     if os.path.exists(tmp):
         os.unlink(tmp)
 PY
-    chown root:wolweb "$CONFIG_FILE" 2>/dev/null || chown root:root "$CONFIG_FILE" 2>/dev/null || true
-    chmod 640 "$CONFIG_FILE" 2>/dev/null || true
+    chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
 read_default() {
@@ -194,34 +202,18 @@ prepare_managed_dir() {
     touch "$path/$marker"
 }
 
-ensure_service_user() {
-    if ! getent group wolweb >/dev/null 2>&1; then
-        groupadd --system wolweb || { err "Creating wolweb group failed."; return 1; }
-        touch "$ETC_DIR/.wol-web-group-created"
-    fi
-    if id -u wolweb >/dev/null 2>&1; then
-        return 0
-    fi
-    if useradd --system --gid wolweb --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin wolweb; then
-        touch "$ETC_DIR/.wol-web-user-created"
-        return 0
-    fi
-    err "Creating wolweb service account failed."
-    return 1
-}
-
 download_wol_program() {
     local tmp="${APP_DIR}/.wol.py.download.$$"
     local source_ok=0
     rm -f "$tmp"
     if command -v curl >/dev/null 2>&1; then
         if curl -fsSL --connect-timeout 10 --max-time 60 "$RAW_WOL_URL" -o "$tmp"; then
-            if grep -q "WOL_WEB_APP_VERSION" "$tmp" && "$VENV_PY" -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$tmp" >/dev/null 2>&1; then
+            if grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$tmp" && "$VENV_PY" -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$tmp" >/dev/null 2>&1; then
                 install -o root -g root -m 644 "$tmp" "$APP_DIR/wol.py"
                 source_ok=1
                 info "已从 GitHub Raw 地址下载 wol.py。"
             else
-                warn "GitHub 上的 wol.py 为空或尚未上传完整版本，将尝试使用本地 wol.py。"
+                warn "GitHub 上的 wol.py 为空、版本不匹配或语法不正确，将尝试使用本地 wol.py。"
             fi
         else
             warn "GitHub 下载失败，将尝试使用本地 wol.py。"
@@ -229,13 +221,13 @@ download_wol_program() {
     fi
     rm -f "$tmp"
     if (( source_ok == 0 )); then
-        if [[ -f "$SCRIPT_DIR/wol.py" ]] && grep -q "WOL_WEB_APP_VERSION" "$SCRIPT_DIR/wol.py"; then
+        if [[ -f "$SCRIPT_DIR/wol.py" ]] && grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$SCRIPT_DIR/wol.py"; then
             if [[ "$(readlink -f "$SCRIPT_DIR/wol.py" 2>/dev/null || printf '%s' "$SCRIPT_DIR/wol.py")" != "$(readlink -f "$APP_DIR/wol.py" 2>/dev/null || printf '%s' "$APP_DIR/wol.py")" ]]; then
                 install -o root -g root -m 644 "$SCRIPT_DIR/wol.py" "$APP_DIR/wol.py"
             fi
             source_ok=1
             info "已使用 wol.sh 同目录中的 wol.py。"
-        elif [[ -f "$APP_DIR/wol.py" ]] && grep -q "WOL_WEB_APP_VERSION" "$APP_DIR/wol.py"; then
+        elif [[ -f "$APP_DIR/wol.py" ]] && grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$APP_DIR/wol.py"; then
             source_ok=1
             info "继续使用已安装的 wol.py。"
         fi
@@ -303,8 +295,8 @@ PY
     local result=$?
     unset WOL_INIT_PASSWORD
     [[ $result -eq 0 ]] || return 1
-    chown root:wolweb "$CONFIG_FILE" 2>/dev/null || chown root:root "$CONFIG_FILE" 2>/dev/null || true
-    chmod 640 "$CONFIG_FILE"
+    chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CONFIG_FILE"
 }
 
 show_generated_password() {
@@ -366,8 +358,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=wolweb
-Group=wolweb
+# Run as root because the requested ${APP_DIR} path may be under /root (mode 0700).
+# Restrict privileges with systemd hardening; never chmod /root to world-readable.
+User=root
+Group=root
 WorkingDirectory=${APP_DIR}
 Environment=WOL_CONFIG_FILE=${CONFIG_FILE}
 Environment=WOL_COOKIE_SECURE=1
@@ -377,9 +371,18 @@ RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
-ReadOnlyPaths=${ETC_DIR}
-UMask=0027
+ProtectHome=read-only
+ReadOnlyPaths=${APP_DIR}
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+LockPersonality=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -488,7 +491,6 @@ install_deploy() {
         return 1
     fi
     prepare_managed_dir "$APP_DIR" ".wol-web-managed" || return 1
-    prepare_managed_dir "$ETC_DIR" ".wol-web-managed" || return 1
 
     info "安装 Python 运行环境及下载工具..."
     apt-get update || { err "apt-get update 失败。"; return 1; }
@@ -497,7 +499,6 @@ install_deploy() {
         return 1
     }
 
-    ensure_service_user || return 1
     mkdir -p "$APP_DIR"
     if [[ ! -x "$VENV_PY" ]]; then
         python3 -m venv "$APP_DIR/venv" || { err "创建 Python 虚拟环境失败。"; return 1; }
@@ -514,10 +515,10 @@ install_deploy() {
         ensure_password_hash || return 1
     fi
     show_generated_password
-    chown root:wolweb "$ETC_DIR" 2>/dev/null || true
-    chmod 750 "$ETC_DIR"
-    chown root:wolweb "$CONFIG_FILE" 2>/dev/null || true
-    chmod 640 "$CONFIG_FILE"
+    chown root:root "$APP_DIR" 2>/dev/null || true
+    chmod 700 "$APP_DIR"
+    chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CONFIG_FILE"
 
     local internal_port
     internal_port="$(config_get internal_port)"
@@ -542,9 +543,11 @@ install_deploy() {
     if [[ -n "$domain" ]]; then
         ok "访问地址：https://${domain}:${external_port}/"
     else
-        info "下一步请运行菜单 2 配置 NAS，再运行菜单 6 配置网页域名和端口。"
+        info "下一步请运行菜单 2 配置 NAS，再运行菜单 3 配置网页域名和端口。"
     fi
     ok "内部监听：127.0.0.1:${internal_port}；不会直接暴露内部端口到公网。"
+    info "程序目录：${APP_DIR}；配置文件：${CONFIG_FILE}"
+    show_status
 }
 
 configure_nas() {
@@ -585,16 +588,25 @@ configure_nas() {
 
 restart_service() {
     need_root || return 1
-    if ! systemctl list-unit-files "$SERVICE_NAME.service" --no-legend 2>/dev/null | grep -q "$SERVICE_NAME"; then
+    if ! systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
         err "服务尚未安装，请先运行菜单 1。"
+        show_status
         return 1
     fi
-    if systemctl restart "$SERVICE_NAME"; then
-        ok "WOL Web 服务已重启。"
-        systemctl --no-pager --full status "$SERVICE_NAME" 2>/dev/null | sed -n '1,12p'
+    info "正在重启 WOL Web 服务..."
+    if ! systemctl restart "$SERVICE_NAME"; then
+        err "systemctl restart 执行失败。"
+        show_status
+        journalctl -u "$SERVICE_NAME" -n 25 --no-pager 2>/dev/null || true
+        return 1
+    fi
+    sleep 1
+    show_status
+    if systemctl is-active --quiet "$SERVICE_NAME"; then
+        ok "重启完成，当前服务状态：运行中。"
     else
-        err "重启失败，最近日志如下："
-        journalctl -u "$SERVICE_NAME" -n 40 --no-pager 2>/dev/null || true
+        err "服务重启后未处于运行状态，最近日志如下："
+        journalctl -u "$SERVICE_NAME" -n 25 --no-pager 2>/dev/null || true
         return 1
     fi
 }
@@ -602,7 +614,14 @@ restart_service() {
 stop_service() {
     need_root || return 1
     if systemctl cat "$SERVICE_NAME" >/dev/null 2>&1; then
-        systemctl stop "$SERVICE_NAME" && ok "WOL Web 服务已停止。"
+        if systemctl stop "$SERVICE_NAME"; then
+            ok "WOL Web 服务已停止。"
+            show_status
+        else
+            err "停止服务失败。"
+            show_status
+            return 1
+        fi
     else
         warn "服务尚未安装。"
     fi
@@ -780,7 +799,7 @@ PY
         cp -a "$backup_dir/service" "$SERVICE_FILE"
         if (( conf_existed == 1 )); then cp -a "$backup_dir/nginx.conf" "$NGINX_CONF_FILE"; else rm -f "$NGINX_CONF_FILE"; fi
         if [[ -n "$NGINX_LINK_FILE" && $link_existed -eq 0 ]]; then rm -f "$NGINX_LINK_FILE"; fi
-        chown root:wolweb "$CONFIG_FILE" 2>/dev/null || true
+        chown root:root "$CONFIG_FILE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
         rm -rf "$backup_dir"
         return 1
@@ -792,7 +811,7 @@ PY
         cp -a "$backup_dir/service" "$SERVICE_FILE"
         if (( conf_existed == 1 )); then cp -a "$backup_dir/nginx.conf" "$NGINX_CONF_FILE"; else rm -f "$NGINX_CONF_FILE"; fi
         if [[ -n "$NGINX_LINK_FILE" && $link_existed -eq 0 ]]; then rm -f "$NGINX_LINK_FILE"; fi
-        chown root:wolweb "$CONFIG_FILE" 2>/dev/null || true
+        chown root:root "$CONFIG_FILE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
         rm -rf "$backup_dir"
         return 1
@@ -804,7 +823,7 @@ PY
         cp -a "$backup_dir/service" "$SERVICE_FILE"
         if (( conf_existed == 1 )); then cp -a "$backup_dir/nginx.conf" "$NGINX_CONF_FILE"; else rm -f "$NGINX_CONF_FILE"; fi
         if [[ -n "$NGINX_LINK_FILE" && $link_existed -eq 0 ]]; then rm -f "$NGINX_LINK_FILE"; fi
-        chown root:wolweb "$CONFIG_FILE" 2>/dev/null || true
+        chown root:root "$CONFIG_FILE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
         nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
@@ -818,7 +837,7 @@ PY
         cp -a "$backup_dir/service" "$SERVICE_FILE"
         if (( conf_existed == 1 )); then cp -a "$backup_dir/nginx.conf" "$NGINX_CONF_FILE"; else rm -f "$NGINX_CONF_FILE"; fi
         if [[ -n "$NGINX_LINK_FILE" && $link_existed -eq 0 ]]; then rm -f "$NGINX_LINK_FILE"; fi
-        chown root:wolweb "$CONFIG_FILE" 2>/dev/null || true
+        chown root:root "$CONFIG_FILE" 2>/dev/null || true
         systemctl daemon-reload >/dev/null 2>&1 || true
         systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
         nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
@@ -826,13 +845,14 @@ PY
         return 1
     fi
 
-    chown root:wolweb "$CONFIG_FILE" 2>/dev/null || true
-    chmod 640 "$CONFIG_FILE"
+    chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CONFIG_FILE"
     open_firewall_port "$external_port" || true
     rm -rf "$backup_dir"
     ok "WEB 设置已应用，WOL 服务已重启，Nginx 配置检查通过并已重载。"
     printf '\n访问地址：%s\n' "https://${domain}:${external_port}/"
     info "Nginx 仅新增独立的 wol-web 配置文件，没有修改 nginx.conf 或其他站点文件。"
+    show_status
 }
 
 remove_nginx_config() {
@@ -864,10 +884,6 @@ uninstall_service() {
     read -r -p "确认卸载 WOL Web，并删除本程序配置？输入 yes 继续: " answer || return 1
     [[ "$answer" == "yes" ]] || { info "已取消卸载。"; return 0; }
 
-    local user_created=0 group_created=0
-    [[ -f "$ETC_DIR/.wol-web-user-created" ]] && user_created=1
-    [[ -f "$ETC_DIR/.wol-web-group-created" ]] && group_created=1
-
     systemctl stop "$SERVICE_NAME" >/dev/null 2>&1 || true
     systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
     remove_nginx_config
@@ -887,62 +903,89 @@ uninstall_service() {
     else
         warn "应用目录没有管理标记，未删除：$APP_DIR"
     fi
-    if [[ -f "$ETC_DIR/.wol-web-managed" ]]; then
-        rm -rf "$ETC_DIR"
-    else
-        warn "配置目录没有管理标记，未删除：$ETC_DIR"
-    fi
-    if (( user_created == 1 )); then
-        userdel wolweb >/dev/null 2>&1 || true
-    fi
-    if (( group_created == 1 )) && getent group wolweb >/dev/null 2>&1; then
-        groupdel wolweb >/dev/null 2>&1 || true
-    fi
     ok "WOL Web 已卸载。未删除 /etc/letsencrypt 下的证书，也未删除或覆盖其他 Nginx 站点配置。"
     warn "若 VPS 云厂商还有独立安全组/网络 ACL，请自行移除其中为本服务添加的 TCP 端口规则。"
 }
 
 show_status() {
-    printf '\n%s\n' "---- WOL Web 状态 ----"
-    if systemctl is-active --quiet "$SERVICE_NAME"; then
-        printf '服务状态：%s运行中%s\n' "$GREEN" "$RESET"
-    else
-        printf '服务状态：%s未运行%s\n' "$YELLOW" "$RESET"
+    local state enabled pid internal_port domain external_port
+    printf '\n%s\n' "${BLUE}────────────────── WOL Web 运行状态 ──────────────────${RESET}"
+    state="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+    enabled="$(systemctl is-enabled "$SERVICE_NAME" 2>/dev/null || true)"
+    pid="$(systemctl show "$SERVICE_NAME" --property=MainPID --value 2>/dev/null || true)"
+    case "$state" in
+        active)   printf '  %s●%s 服务状态：%s运行中 (active)%s\n' "$GREEN" "$RESET" "$GREEN" "$RESET" ;;
+        inactive) printf '  %s●%s 服务状态：%s已停止 (inactive)%s\n' "$YELLOW" "$RESET" "$YELLOW" "$RESET" ;;
+        failed)   printf '  %s●%s 服务状态：%s启动失败 (failed)%s\n' "$RED" "$RESET" "$RED" "$RESET" ;;
+        *)        printf '  %s●%s 服务状态：%s\n' "$YELLOW" "$RESET" "${state:-未安装}" ;;
+    esac
+    printf '  开机自启：%s\n' "${enabled:-未配置}"
+    if [[ "$pid" =~ ^[0-9]+$ ]] && (( pid > 0 )); then
+        printf '  主进程 PID：%s\n' "$pid"
     fi
     if [[ -f "$CONFIG_FILE" ]]; then
-        printf 'NAS 地址：%s\n' "$(config_get host)"
-        printf 'WOL UDP 端口：%s\n' "$(config_get port)"
-        printf '网页域名：%s\n' "$(config_get web_domain)"
-        printf '网页外部端口：%s\n' "$(config_get external_port)"
-        printf '网页内部端口：%s\n' "$(config_get internal_port)"
+        internal_port="$(config_get internal_port)"
+        domain="$(config_get web_domain)"
+        external_port="$(config_get external_port)"
+        printf '  NAS 目标：%s\n' "$(config_get host)"
+        printf '  唤醒端口：UDP %s\n' "$(config_get port)"
+        printf '  本地监听：127.0.0.1:%s\n' "${internal_port:-8109}"
+        if [[ -n "$domain" ]]; then
+            printf '  网页入口：https://%s:%s/\n' "$domain" "${external_port:-8119}"
+        else
+            printf '  网页入口：%s尚未设置（菜单 3）%s\n' "$YELLOW" "$RESET"
+        fi
+        printf '  应用目录：%s\n' "$APP_DIR"
+        printf '  配置文件：%s\n' "$CONFIG_FILE"
     else
-        printf '配置状态：未安装\n'
+        printf '  配置状态：%s未安装%s\n' "$YELLOW" "$RESET"
     fi
+    printf '%s\n' "${BLUE}──────────────────────────────────────────────────────${RESET}"
+}
+
+menu_item() {
+    local number="$1" label="$2" note="${3:-}" color="${CYAN}"
+    [[ "$number" == "6" ]] && color="${RED}"
+    printf '  %s[%s]%s  %s  %s%s%s\n' "$color" "$number" "$RESET" "$label" "$DIM" "$note" "$RESET"
 }
 
 main_menu() {
     while true; do
+        local selection current_status status_text
+        printf '\n%s\n' "${BLUE}╔══════════════════════════════════════════════════════╗${RESET}"
+        printf '%s\n' "${BLUE}║${RESET}            ${CYAN}${BOLD}WOL NAS 远程唤醒管理中心${RESET}  ${DIM}v${VERSION}${RESET} ${BLUE}║${RESET}"
+        printf '%s\n' "${BLUE}╚══════════════════════════════════════════════════════╝${RESET}"
+        current_status="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
+        if [[ "$current_status" == "active" ]]; then
+            status_text="${GREEN}● 服务运行中${RESET}"
+        elif [[ "$current_status" == "failed" ]]; then
+            status_text="${RED}● 服务启动失败${RESET}"
+        else
+            status_text="${YELLOW}● 服务未运行${RESET}"
+        fi
+        printf '  %s\n' "$status_text"
+        printf '  %s安装目录：%s%s\n' "$DIM" "$APP_DIR" "$RESET"
+        printf '\n%s\n' "${PURPLE}  ── 基础管理 ──${RESET}"
+        menu_item 1 '安装部署' '安装 Python / Web / systemd'
+        menu_item 2 '配置 NAS' 'MAC / DDNS / UDP 9'
+        menu_item 3 'WEB 端设置' '域名 / 外部 8119 / 内部 8109'
+        printf '\n%s\n' "${PURPLE}  ── 服务管理 ──${RESET}"
+        menu_item 4 '重启服务' '重启后显示当前运行状态'
+        menu_item 5 '停止服务' '停止网页服务'
+        menu_item 6 '卸载' '仅删除 WOL 专属文件'
         printf '\n'
-        printf '%s\n' "=================================================="
-        printf '%s\n' "          WOL NAS 远程唤醒管理脚本 v${VERSION}"
-        printf '%s\n' "=================================================="
-        printf '%s\n' "  1. 安装部署"
-        printf '%s\n' "  2. 配置 NAS（MAC / 域名或 IP / UDP 端口）"
-        printf '%s\n' "  3. 重启服务"
-        printf '%s\n' "  4. 停止服务"
-        printf '%s\n' "  5. 卸载"
-        printf '%s\n' "  6. WEB 端设置（域名 / 外部端口 / 内部端口）"
-        printf '%s\n' "  0. 退出"
-        read -r -p "请选择 [0-6]: " choice || exit 0
-        case "$choice" in
+        menu_item 0 '退出' ''
+        printf '%s\n' "${BLUE}──────────────────────────────────────────────────────${RESET}"
+        read -r -p '请选择操作 [0-6]: ' selection || exit 0
+        case "$selection" in
             1) install_deploy; pause_menu ;;
             2) configure_nas; pause_menu ;;
-            3) restart_service; pause_menu ;;
-            4) stop_service; pause_menu ;;
-            5) uninstall_service; pause_menu ;;
-            6) web_settings; pause_menu ;;
+            3) web_settings; pause_menu ;;
+            4) restart_service; pause_menu ;;
+            5) stop_service; pause_menu ;;
+            6) uninstall_service; pause_menu ;;
             0) exit 0 ;;
-            *) warn "无效选项，请输入 0-6。" ;;
+            *) warn '无效选项，请输入 0-6。' ;;
         esac
     done
 }

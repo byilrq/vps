@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """Authenticated Wake-on-LAN web button."""
-WOL_WEB_APP_VERSION = "1.0.0"
+WOL_WEB_APP_VERSION = "1.1.0"
 
 import hmac
 import ipaddress
@@ -18,7 +18,7 @@ from flask import Flask, abort, flash, redirect, render_template_string, request
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-CONFIG_FILE = Path(os.environ.get("WOL_CONFIG_FILE", "/etc/wol-web/config.json"))
+CONFIG_FILE = Path(os.environ.get("WOL_CONFIG_FILE", str(Path(__file__).resolve().parent / "config.json")))
 WEB_BIND = os.environ.get("WOL_WEB_BIND", "127.0.0.1")
 WEB_PORT = int(os.environ.get("WOL_WEB_PORT", "8109"))
 COOKIE_SECURE = os.environ.get("WOL_COOKIE_SECURE", "1") == "1"
