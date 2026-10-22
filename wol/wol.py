@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.4.0"
+WOL_WEB_APP_VERSION = "1.5.1"
 
 import hmac
 import ipaddress
@@ -58,17 +58,26 @@ h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
 .entry-main{flex:1;min-width:0}.state{font-size:13px;font-weight:650}.state.ok{color:#8eebbf}.state.err{color:#ffacb9}.item-desc{font-size:12px;color:#829bb3;margin-top:3px;overflow-wrap:anywhere}
 .when{font-size:11px;color:#839ab4;white-space:nowrap;margin-top:2px;font-variant-numeric:tabular-nums}
 .foot{color:#557088;text-align:center;font-size:11px;margin:20px 0 8px}
-.login{background:#101e2fcf;border:1px solid var(--border);border-radius:16px;padding:22px;margin-top:28px}
-.login label{color:#b2c6d9;display:block;font-size:13px;margin:13px 0 7px}
-.login input{background:#0b1726;border:1px solid #39516a;color:#fff;padding:12px;border-radius:10px;font:inherit;width:100%}
-.login button{margin-top:16px;width:100%;padding:12px;border:0;border-radius:10px;background:#82e7ba;color:#0d3026;font:inherit;font-weight:bold;cursor:pointer}
+.login{background:#101e2fcf;border:1px solid var(--border);border-radius:20px;padding:30px 24px 28px;margin:clamp(40px,12vh,112px) auto 0;width:100%;max-width:390px}
+.login h1{font-size:23px;margin:0 0 26px;font-weight:730}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.login input{background:#0b1726;border:1px solid #39516a;color:#fff;padding:13px 14px;border-radius:11px;font:inherit;width:100%;height:50px;outline:none}.login input::placeholder{color:#7b90a7}.login input:focus{border-color:#82e7ba;box-shadow:0 0 0 3px #82e7ba20}
+.login button{margin-top:12px;width:100%;height:50px;padding:12px;border:0;border-radius:11px;background:#82e7ba;color:#0d3026;font:inherit;font-weight:750;cursor:pointer}.login button:active{opacity:.86}.login .login-error{min-height:0;margin:13px 0 0;text-align:center;color:#ffb0b9;font-size:13px}
 @media(max-height:720px){.bar{margin-bottom:12px}.lead{margin-bottom:11px}.wake{width:165px;height:165px}.btn-box{padding:8px 0}.feedback{margin:12px 0}}
 </style></head><body><main class="wrap">
 <header class="bar"><div class="logo"><span class="dot">●</span>NAS WAKE</div>
-{% if auth_enabled and logged_in %}<form action="{{ url_for('logout') }}" method="post"><input name="csrf" type="hidden" value="{{ csrf }}"><button class="logout" type="submit">退出</button></form>{% else %}<span style="font-size:11px;color:#6986a1">WOL WEB</span>{% endif %}
+{% if auth_enabled and logged_in %}<form action="{{ url_for('logout') }}" method="post"><input name="csrf" type="hidden" value="{{ csrf }}"><button class="logout" type="submit">退出</button></form>{% endif %}
 </header>
 {% if auth_enabled and not logged_in %}
-<div class="login"><h1>NAS 远程唤醒</h1><p class="lead">请输入 WEB 登录密码</p><form action="{{ url_for('login') }}" method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><label for="pw">访问密码</label><input id="pw" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">登录</button></form><p id="loginMessage" class="feedback err">{{ message }}</p></div>
+<section class="login" aria-label="登录">
+  <h1>NAS 唤醒</h1>
+  <form action="{{ url_for('login') }}" method="post">
+    <input type="hidden" name="csrf" value="{{ csrf }}">
+    <label class="sr-only" for="pw">密码</label>
+    <input id="pw" name="password" type="password" placeholder="密码" autocomplete="current-password" required>
+    <button type="submit">登录</button>
+  </form>
+  {% if message %}<p class="login-error" role="alert">{{ message }}</p>{% endif %}
+</section>
 {% else %}
 <h1>NAS 远程唤醒</h1><p class="lead">点击圆形按钮向家庭 NAS 发送网络唤醒数据包</p>
 <div class="btn-box"><button id="wakeButton" class="wake" type="button"><svg class="power-icon" viewBox="0 0 64 64" role="img" aria-label="电源" xmlns="http://www.w3.org/2000/svg"><path d="M32 7 V30"/><path d="M20 12 A24 24 0 1 0 44 12"/></svg><span class="wake-text">唤醒</span></button></div>
@@ -145,7 +154,7 @@ def auth_enabled():
 
 
 def logged_in():
-    return session.get("logged_in") is True
+    return session.get("logged_in") is True and session.get("login_method") == "password"
 
 
 def require_auth(fn):
@@ -368,6 +377,7 @@ def login():
         return redirect(url_for("index", error="密码错误"))
     session.clear()
     session["logged_in"] = True
+    session["login_method"] = "password"
     session["_csrf"] = secrets.token_urlsafe(28)
     with _login_lock:
         _failed_logins.pop(ip, None)

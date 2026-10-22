@@ -3,7 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.4.0"
+VERSION="1.5.1"
 RAW_WOL_URL="https://raw.githubusercontent.com/byilrq/vps/main/wol/wol.py"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
@@ -216,7 +216,14 @@ download_wol_program() {
     local tmp="${APP_DIR}/.wol.py.download.$$"
     local source_ok=0
     rm -f "$tmp"
-    if command -v curl >/dev/null 2>&1; then
+    # Prefer the colocated release (signed/copy-managed by the operator) to
+    # avoid accidentally installing a different cloud snapshot on upgrades.
+    if [[ -f "$SCRIPT_DIR/wol.py" ]] && grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$SCRIPT_DIR/wol.py"; then
+        install -o root -g root -m 644 "$SCRIPT_DIR/wol.py" "$APP_DIR/wol.py" || return 1
+        source_ok=1
+        info "已使用 wol.sh 同目录的 v${VERSION} wol.py。"
+    fi
+    if (( source_ok == 0 )) && command -v curl >/dev/null 2>&1; then
         if curl -fsSL --connect-timeout 10 --max-time 60 "$RAW_WOL_URL" -o "$tmp"; then
             if grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$tmp" && "$VENV_PY" -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$tmp" >/dev/null 2>&1; then
                 install -o root -g root -m 644 "$tmp" "$APP_DIR/wol.py"
@@ -873,7 +880,7 @@ web_settings() {
     ok "WEB 设置已应用，WOL 服务已重启，Nginx 配置检查通过并已重载。"
     printf '\n访问地址：%s\n' "https://${domain}:${external_port}/"
     info "Nginx 仅新增独立的 wol-web 配置文件，没有修改 nginx.conf 或其他站点文件。"
-    info "网页已启用密码登录，登录后显示圆形唤醒按钮及最近 5 条发送记录。"
+    info "网页使用单一密码登录，保留原有唤醒按钮和最近 5 条发送记录。"
     show_status
 }
 
