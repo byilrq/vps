@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Authenticated Wake-on-LAN web button."""
-WOL_WEB_APP_VERSION = "1.1.0"
+"""WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
+WOL_WEB_APP_VERSION = "1.3.0"
 
 import hmac
 import ipaddress
@@ -10,300 +10,369 @@ import os
 import re
 import secrets
 import socket
+import sqlite3
 import threading
 import time
+from datetime import datetime
+from functools import wraps
+from contextlib import contextmanager
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
-from flask import Flask, abort, flash, redirect, render_template_string, request, session, url_for
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, session, url_for
 from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-CONFIG_FILE = Path(os.environ.get("WOL_CONFIG_FILE", str(Path(__file__).resolve().parent / "config.json")))
-WEB_BIND = os.environ.get("WOL_WEB_BIND", "127.0.0.1")
-WEB_PORT = int(os.environ.get("WOL_WEB_PORT", "8109"))
-COOKIE_SECURE = os.environ.get("WOL_COOKIE_SECURE", "1") == "1"
-WAKE_COOLDOWN_SECONDS = 8
+APP_DIR = Path(__file__).resolve().parent
+CONFIG_FILE = Path(os.environ.get("WOL_CONFIG_FILE", str(APP_DIR / "config.json")))
+DB_FILE = Path(os.environ.get("WOL_HISTORY_FILE", str(APP_DIR / "wol_history.db")))
+TZ = ZoneInfo("Asia/Shanghai")
+os.umask(0o077)
 
-PAGE = r"""
-<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<meta name="theme-color" content="#09111f">
-<title>NAS 远程唤醒</title>
+PAGE = r'''<!doctype html>
+<html lang="zh-CN"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0b1320"><title>NAS 远程唤醒</title>
 <style>
-:root{color-scheme:dark;--bg:#09111f;--panel:#101c2d;--text:#edf4ff;--muted:#8fa4bf;--mint:#66e5ad}
-*{box-sizing:border-box}
-html,body{margin:0;min-height:100%;background:radial-gradient(ellipse at 50% 35%,#142844 0%,var(--bg) 62%);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
-body{min-height:100vh;min-height:100dvh;display:flex;align-items:center;justify-content:center;padding:22px}
-.shell{width:100%;max-width:460px;text-align:center}
-.top{display:flex;justify-content:space-between;align-items:center;margin:0 0 44px;color:var(--muted);font-size:12px;letter-spacing:.18em}
-.brand{display:flex;align-items:center;gap:9px;font-weight:800;letter-spacing:.14em;color:#c9d8ed}
-.brand-mark{display:inline-flex;align-items:center;justify-content:center;width:29px;height:29px;border-radius:9px;background:#18334a;color:var(--mint);font-size:18px;letter-spacing:0}
-.logout{color:#9db1cb;text-decoration:none;font-size:13px;letter-spacing:0;border:1px solid #263951;border-radius:20px;padding:7px 11px;background:#0c1726}
-h1{font-size:26px;line-height:1.2;margin:0 0 10px;font-weight:750;letter-spacing:.02em}
-.subtitle{font-size:14px;color:var(--muted);margin:0 0 44px}
-.wake-form{margin:0}
-.wake-button{appearance:none;border:1px solid rgba(137,255,205,.65);border-radius:50%;width:202px;height:202px;max-width:68vw;max-height:68vw;background:radial-gradient(circle at 34% 25%,#275c57 0%,#16433f 37%,#0e2c32 72%,#0b222d 100%);color:#eafff5;box-shadow:0 0 0 10px rgba(102,229,173,.055),0 0 0 22px rgba(102,229,173,.025),0 0 52px rgba(57,224,163,.18),inset 0 1px 0 rgba(255,255,255,.16);display:inline-flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;cursor:pointer;transition:transform .12s ease,box-shadow .18s ease;font:inherit;-webkit-tap-highlight-color:transparent}
-.wake-button:hover{box-shadow:0 0 0 10px rgba(102,229,173,.08),0 0 0 22px rgba(102,229,173,.035),0 0 68px rgba(57,224,163,.28),inset 0 1px 0 rgba(255,255,255,.2)}
-.wake-button:active{transform:scale(.97)}
-.wake-button:focus-visible{outline:3px solid #d4ffec;outline-offset:7px}
-.power{font-size:56px;line-height:1;font-weight:300;color:var(--mint)}
-.wake-label{font-size:23px;font-weight:750;letter-spacing:.16em;padding-left:.16em}
-.hint{margin:43px 0 0;color:#758ba7;font-size:12px;letter-spacing:.04em}
-.messages{margin:0 auto 22px;max-width:380px}
-.message{padding:11px 14px;border:1px solid #2d6a55;border-radius:12px;background:#102d28;color:#b9f9dc;font-size:14px;overflow-wrap:anywhere}
-.message.error{border-color:#75404a;background:#321b25;color:#ffc4cd}
-.login-card{margin:0 auto;padding:25px 22px;background:rgba(16,28,45,.9);border:1px solid #253851;border-radius:20px;text-align:left;box-shadow:0 24px 80px #0004}
-.login-card h1{text-align:center;margin-bottom:8px}
-.login-card .subtitle{text-align:center;margin-bottom:25px}
-label{display:block;color:#b8c9df;font-size:13px;margin:14px 0 7px}
-input{display:block;width:100%;padding:13px 14px;border:1px solid #334964;border-radius:11px;background:#091421;color:#fff;font:inherit;font-size:16px;outline:none}
-input:focus{border-color:#66e5ad;box-shadow:0 0 0 3px #66e5ad22}
-.login-button{display:block;width:100%;border:0;border-radius:11px;padding:13px 16px;margin-top:20px;background:var(--mint);color:#08271c;font:inherit;font-weight:800;cursor:pointer}
-.foot{color:#536982;font-size:11px;margin-top:28px}
-@media(max-height:650px){.top{margin-bottom:24px}.subtitle{margin-bottom:25px}.wake-button{width:170px;height:170px}.hint{margin-top:30px}}
-</style>
-</head>
-<body>
-<div class="shell">
-{% if not logged_in %}
-  <div class="top"><div class="brand"><span class="brand-mark">⏻</span><span>NAS WAKE</span></div><span>REMOTE ACCESS</span></div>
-  <div class="login-card">
-    <h1>NAS 远程唤醒</h1>
-    <p class="subtitle">请验证身份后继续</p>
-    {% with messages = get_flashed_messages(with_categories=true) %}
-      {% for category, message in messages %}
-        <div class="messages"><div class="message {{ 'error' if category == 'error' else '' }}">{{ message }}</div></div>
-      {% endfor %}
-    {% endwith %}
-    <form method="post" action="{{ url_for('login') }}">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <label for="password">网页访问密码</label>
-      <input id="password" name="password" type="password" autocomplete="current-password" required autofocus>
-      <button class="login-button" type="submit">登录</button>
-    </form>
-  </div>
+:root{color-scheme:dark;--bg:#0b1320;--text:#e9f3ff;--muted:#8296ad;--mint:#70e3b2;--border:#2d4059}
+*{box-sizing:border-box}html,body{min-height:100%;margin:0}
+body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320 77%);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:22px 16px}
+.wrap{width:100%;max-width:460px;margin:0 auto;min-height:calc(100dvh - 44px);display:flex;flex-direction:column}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:3px 0 29px}
+.logo{font-size:13px;letter-spacing:.17em;color:#b8d1e4;font-weight:800}.dot{color:var(--mint);font-size:18px;margin-right:9px}
+.logout{color:#9eb2c9;background:transparent;border:1px solid #344861;border-radius:10px;padding:7px 13px;cursor:pointer}
+h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
+.lead{text-align:center;color:var(--muted);font-size:13px;margin:0 0 26px}
+.btn-box{text-align:center;padding:17px 0 5px}
+.wake{width:196px;height:196px;max-width:65vw;max-height:65vw;cursor:pointer;border-radius:50%;border:1px solid #75e6b3;background:radial-gradient(circle at 36% 22%,#2e6b63 0%,#1a514b 43%,#0d3039 82%);box-shadow:0 0 0 11px #70e3b20c,0 0 0 24px #70e3b208,0 0 55px #33d9a331;color:#f1fff9;display:inline-flex;align-items:center;justify-content:center;flex-direction:column;gap:4px;transition:transform .12s,opacity .12s}
+.wake:active{transform:scale(.97)}.wake:disabled{cursor:not-allowed;opacity:.55}.wake:focus-visible,.refresh:focus-visible{outline:3px solid #f0fffc;outline-offset:5px}
+.power{font-size:61px;font-weight:300;line-height:1;color:#84f4c4}.wake-text{font-size:23px;font-weight:750;letter-spacing:.25em;padding-left:.25em}
+.feedback{margin:23px 0 22px;min-height:43px;text-align:center;color:#91aac2;font-size:13px;overflow-wrap:anywhere}
+.feedback.ok{color:#9cf6d0}.feedback.err{color:#ffb0b9}
+.history{margin-top:5px;background:#111f31dc;border:1px solid var(--border);border-radius:18px;padding:18px 17px 12px}
+.heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:10px}
+.heading strong{font-size:15px;font-weight:700}.heading small{font-size:11px;color:#7890aa;margin-left:5px;font-weight:400}
+.refresh{border:1px solid #37506a;background:#172d40;color:#bdebd9;padding:8px 12px;font:inherit;font-size:12px;border-radius:9px;cursor:pointer}
+.empty{color:#8196af;text-align:center;padding:26px 2px;font-size:13px}
+.entry{padding:11px 0;border-top:1px solid #23394d;display:flex;gap:9px;align-items:flex-start;justify-content:space-between}
+.entry-main{flex:1;min-width:0}.state{font-size:13px;font-weight:650}.state.ok{color:#8eebbf}.state.err{color:#ffacb9}.item-desc{font-size:12px;color:#829bb3;margin-top:3px;overflow-wrap:anywhere}
+.when{font-size:11px;color:#839ab4;white-space:nowrap;margin-top:2px;font-variant-numeric:tabular-nums}
+.foot{color:#557088;text-align:center;font-size:11px;margin:20px 0 8px}
+.login{background:#101e2fcf;border:1px solid var(--border);border-radius:16px;padding:22px;margin-top:28px}
+.login label{color:#b2c6d9;display:block;font-size:13px;margin:13px 0 7px}
+.login input{background:#0b1726;border:1px solid #39516a;color:#fff;padding:12px;border-radius:10px;font:inherit;width:100%}
+.login button{margin-top:16px;width:100%;padding:12px;border:0;border-radius:10px;background:#82e7ba;color:#0d3026;font:inherit;font-weight:bold;cursor:pointer}
+@media(max-height:720px){.bar{margin-bottom:12px}.lead{margin-bottom:11px}.wake{width:165px;height:165px}.btn-box{padding:8px 0}.feedback{margin:12px 0}}
+</style></head><body><main class="wrap">
+<header class="bar"><div class="logo"><span class="dot">●</span>NAS WAKE</div>
+{% if auth_enabled and logged_in %}<form action="{{ url_for('logout') }}" method="post"><input name="csrf" type="hidden" value="{{ csrf }}"><button class="logout" type="submit">退出</button></form>{% else %}<span style="font-size:11px;color:#6986a1">WOL WEB</span>{% endif %}
+</header>
+{% if auth_enabled and not logged_in %}
+<div class="login"><h1>NAS 远程唤醒</h1><p class="lead">此设备启用了访问验证</p><form action="{{ url_for('login') }}" method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><label for="pw">访问密码</label><input id="pw" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">登录</button></form><p id="loginMessage" class="feedback err">{{ message }}</p></div>
 {% else %}
-  <div class="top">
-    <div class="brand"><span class="brand-mark">⏻</span><span>NAS WAKE</span></div>
-    <form method="post" action="{{ url_for('logout') }}">
-      <input type="hidden" name="csrf" value="{{ csrf }}">
-      <button class="logout" type="submit">退出</button>
-    </form>
-  </div>
-  <h1>NAS 远程唤醒</h1>
-  <p class="subtitle">轻触按钮，发送网络唤醒指令</p>
-  {% with messages = get_flashed_messages(with_categories=true) %}
-    {% for category, message in messages %}
-      <div class="messages"><div class="message {{ 'error' if category == 'error' else '' }}">{{ message }}</div></div>
-    {% endfor %}
-  {% endwith %}
-  <form class="wake-form" method="post" action="{{ url_for('wake') }}">
-    <input type="hidden" name="csrf" value="{{ csrf }}">
-    <button class="wake-button" type="submit" aria-label="唤醒 NAS">
-      <span class="power">⏻</span>
-      <span class="wake-label">唤醒</span>
-    </button>
-  </form>
-  <p class="hint">WAKE ON LAN · MAGIC PACKET</p>
+<h1>NAS 远程唤醒</h1><p class="lead">点击圆形按钮向家庭 NAS 发送网络唤醒数据包</p>
+<div class="btn-box"><button id="wakeButton" class="wake" type="button"><span class="power">⏻</span><span class="wake-text">唤醒</span></button></div>
+<div id="feedback" class="feedback" aria-live="polite">准备就绪</div>
+<section class="history" aria-label="最近五条发送记录"><div class="heading"><strong>发送记录 <small>最近 5 条 · 北京时间</small></strong><button id="refreshButton" class="refresh" type="button">↻ 刷新</button></div><div id="historyList" class="empty">加载中...</div></section>
+<div class="foot">发送成功仅表示数据包已交给 VPS 网络协议栈，不代表 NAS 已开机</div>
+<script>
+const csrf = {{ csrf|tojson }};
+const historyList = document.getElementById('historyList');
+const wakeButton = document.getElementById('wakeButton');
+const refreshButton = document.getElementById('refreshButton');
+const feedback = document.getElementById('feedback');
+function makeEl(tag, cls, text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
+async function refreshHistory(){
+  refreshButton.disabled=true;
+  try{
+    const resp=await fetch('/api/history',{credentials:'same-origin',cache:'no-store'});
+    if(resp.status===401){location.reload();return;}
+    if(!resp.ok)throw new Error('HTTP '+resp.status);
+    const data=await resp.json();historyList.replaceChildren();historyList.className='';
+    if(!data.records || !data.records.length){historyList.className='empty';historyList.textContent='暂无发送记录';return;}
+    for(const item of data.records){
+      const div=makeEl('div','entry');const left=makeEl('div','entry-main');
+      const ok=item.status==='sent';const pending=item.status==='sending';left.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),ok?'✓ 唤醒数据包已发送':pending?'… 正在发送':'× 发送失败'));
+      left.append(makeEl('div','item-desc',item.detail));
+      div.append(left,makeEl('time','when',item.time));historyList.append(div);
+    }
+  }catch(ex){historyList.className='empty';historyList.textContent='记录加载失败，请点击刷新';}
+  finally{refreshButton.disabled=false;}
+}
+wakeButton.addEventListener('click',async()=>{
+  wakeButton.disabled=true;feedback.className='feedback';feedback.textContent='正在发送 WOL 唤醒包...';
+  try{
+    const resp=await fetch('/api/wake',{method:'POST',headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store'});
+    if(resp.status===401){location.reload();return;}
+    const data=await resp.json();feedback.className='feedback '+(resp.ok?'ok':'err');
+    feedback.textContent=data.message || '请求失败';await refreshHistory();
+  }catch(ex){feedback.className='feedback err';feedback.textContent='连接失败，请检查 WEB 服务或网络连接';}
+  finally{wakeButton.disabled=false;}
+});
+refreshButton.addEventListener('click',refreshHistory);
+refreshHistory();
+</script>
 {% endif %}
-<div class="foot">SECURE CONNECTION · WOL WEB</div>
-</div>
-</body>
-</html>
-"""
+</main></body></html>'''
+
 
 def load_config():
     try:
         with CONFIG_FILE.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        return data if isinstance(data, dict) else {}
+            obj = json.load(handle)
+            return obj if isinstance(obj, dict) else {}
     except (OSError, ValueError):
         return {}
 
-_BOOT_CONFIG = load_config()
-if not _BOOT_CONFIG.get("secret_key"):
-    raise SystemExit(
-        f"WOL config missing or invalid: {CONFIG_FILE}. Run wol.sh and choose menu 1 first."
-    )
+
+_boot = load_config()
+if not _boot.get("secret_key"):
+    raise SystemExit(f"WOL 配置文件不可用或缺少 secret_key: {CONFIG_FILE}")
 
 app = Flask(__name__)
-app.secret_key = _BOOT_CONFIG["secret_key"]
+app.secret_key = _boot["secret_key"]
+# Only trust the locally configured Nginx proxy; do not bind the app to public interfaces.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
-app.config.update(
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=COOKIE_SECURE,
-    SESSION_COOKIE_SAMESITE="Lax",
-    PERMANENT_SESSION_LIFETIME=60 * 60 * 12,
-)
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=True)
 
 _failed_logins = {}
-_failed_lock = threading.Lock()
+_login_lock = threading.Lock()
 
-def get_csrf_token():
+
+def auth_enabled():
+    """Login is always required, including for upgraded auth_enabled=false configs."""
+    return True
+
+
+def logged_in():
+    return session.get("logged_in") is True
+
+
+def require_auth(fn):
+    @wraps(fn)
+    def wrapped(*args, **kwargs):
+        if not logged_in():
+            return jsonify({"ok": False, "message": "请先登录"}), 401
+        return fn(*args, **kwargs)
+    return wrapped
+
+
+def csrf_token():
     token = session.get("_csrf")
     if not token:
-        token = secrets.token_urlsafe(32)
+        token = secrets.token_urlsafe(28)
         session["_csrf"] = token
     return token
 
+
 def check_csrf():
-    supplied = request.form.get("csrf", "")
+    submitted = request.headers.get("X-CSRF-Token", "") or request.form.get("csrf", "")
     expected = session.get("_csrf", "")
-    if not supplied or not expected or not hmac.compare_digest(supplied, expected):
-        abort(400, description="Invalid CSRF token")
+    if not submitted or not expected or not hmac.compare_digest(submitted, expected):
+        return False
+    # Same-site token is required for all state-changing actions.
+    return True
 
-def logged_in_required(view):
-    from functools import wraps
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not session.get("logged_in"):
-            return redirect(url_for("index"))
-        return view(*args, **kwargs)
-    return wrapped
 
-def normalize_mac(value):
-    compact = re.sub(r"[^0-9a-fA-F]", "", str(value or ""))
-    if not re.fullmatch(r"[0-9a-fA-F]{12}", compact):
-        raise ValueError("MAC 地址格式不正确，请在管理脚本菜单 2 中配置。")
-    return ":".join(compact[i:i + 2] for i in range(0, 12, 2)).upper()
+def normalize_mac(mac):
+    mac = str(mac or "").strip()
+    if re.fullmatch(r"[0-9A-Fa-f]{12}", mac):
+        compact = mac
+    elif re.fullmatch(r"(?:[0-9A-Fa-f]{2}[:-]){5}[0-9A-Fa-f]{2}", mac):
+        compact = mac.replace(":", "").replace("-", "")
+    else:
+        raise ValueError("MAC 地址不合法，请检查菜单 2 配置")
+    return bytes.fromhex(compact)
+
 
 def validate_host(value):
     host = str(value or "").strip()
-    if not host or len(host) > 253 or any(ch.isspace() for ch in host):
-        raise ValueError("NAS 域名或 IP 未配置，请先运行管理脚本菜单 2。")
-    if "/" in host or "\\" in host or "://" in host:
-        raise ValueError("NAS 地址只填写域名或 IP，不要填写 http:// 或 https://。")
+    if not host or len(host) > 253 or any(ch.isspace() for ch in host) or "://" in host or "/" in host or "\\" in host:
+        raise ValueError("未设置合法的 DDNS 域名/IP，请先运行管理脚本菜单 2")
     try:
-        parsed = ipaddress.ip_address(host)
-        if parsed.version != 4:
-            raise ValueError("当前公网 WOL 发送方式需要可解析到 IPv4 的域名或 IPv4 地址。")
+        if ipaddress.ip_address(host).version != 4:
+            raise ValueError("目前仅支持 IPv4 WOL 转发目标")
         return host
     except ValueError as exc:
-        if "当前公网" in str(exc):
+        if "IPv4 WOL" in str(exc):
             raise
-    candidate = host[:-1] if host.endswith(".") else host
-    labels = candidate.split(".")
-    label_re = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
-    if not candidate or any(not label_re.fullmatch(label) for label in labels):
-        raise ValueError("NAS 域名格式不正确。")
+    domain = host.rstrip(".")
+    pattern = re.compile(r"^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$")
+    if not domain or not all(pattern.fullmatch(label) for label in domain.split(".")):
+        raise ValueError("NAS 域名格式不合法")
     return host
 
-def make_magic_packet(mac):
-    raw = bytes.fromhex(normalize_mac(mac).replace(":", ""))
-    return b"\xff" * 6 + raw * 16
+
+def build_packet(mac):
+    return b"\xff" * 6 + normalize_mac(mac) * 16
+
 
 def send_wol(config):
-    host = validate_host(config.get("host"))
+    host = validate_host(config.get("host", ""))
     try:
         port = int(config.get("port", 9))
     except (TypeError, ValueError):
-        raise ValueError("UDP 端口配置无效，请运行管理脚本菜单 2 检查。")
+        raise ValueError("WOL 端口不合法")
     if not 1 <= port <= 65535:
-        raise ValueError("UDP 端口必须在 1-65535 之间。")
-    packet = make_magic_packet(config.get("mac"))
+        raise ValueError("WOL UDP 端口必须在 1-65535 之间")
+    packet = build_packet(config.get("mac", ""))
+    count = int(config.get("send_count", 5))
+    count = max(1, min(10, count))
     try:
-        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        resolved = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
     except socket.gaierror as exc:
-        raise ValueError(f"域名无法解析到 IPv4 地址：{exc}") from exc
-    targets = []
-    for info in infos:
-        ip = info[4][0]
-        if ip not in targets:
-            targets.append(ip)
-    if not targets:
-        raise ValueError("没有找到可用的 IPv4 目标地址。")
+        raise ValueError("DDNS 解析 IPv4 失败，请核实域名 A 记录") from exc
+    ips = list(dict.fromkeys(result[4][0] for result in resolved))
+    if not ips:
+        raise ValueError("没有解析到 IPv4 地址")
     sent = 0
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        for ip in targets:
-            for index in range(3):
-                sock.sendto(packet, (ip, port))
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        for address in ips:
+            for index in range(count):
+                sock.sendto(packet, (address, port))
                 sent += 1
-                if index < 2:
-                    time.sleep(0.06)
-    return targets, port, sent
+                if index < count - 1:
+                    time.sleep(0.13)
+    return ips, port, sent
+
+
+@contextmanager
+def database():
+    con = sqlite3.connect(str(DB_FILE), timeout=10, isolation_level=None)
+    try:
+        con.execute("PRAGMA busy_timeout=10000")
+        con.execute("CREATE TABLE IF NOT EXISTS sends ("
+                    "id INTEGER PRIMARY KEY AUTOINCREMENT, at INTEGER NOT NULL, "
+                    "status TEXT NOT NULL, detail TEXT NOT NULL)")
+        yield con
+    finally:
+        con.close()
+
+
+def history_items():
+    with database() as con:
+        rows = con.execute("SELECT at,status,detail FROM sends ORDER BY id DESC LIMIT 5").fetchall()
+    return [
+        {"time": datetime.fromtimestamp(ts, TZ).strftime("%m/%d %H:%M:%S"),
+         "status": status, "detail": detail}
+        for ts, status, detail in rows
+    ]
+
+
+def reserve_send(cooldown):
+    """Atomic, persistent rate limit shared across all gunicorn workers."""
+    now = int(time.time())
+    with database() as con:
+        con.execute("BEGIN IMMEDIATE")
+        last = con.execute("SELECT at FROM sends ORDER BY id DESC LIMIT 1").fetchone()
+        if last and now - last[0] < cooldown:
+            con.rollback()
+            return None, max(1, cooldown - (now - last[0]))
+        cursor = con.execute("INSERT INTO sends(at,status,detail) VALUES(?,?,?)",
+                             (now, "sending", "正在准备发送"))
+        row_id = cursor.lastrowid
+        con.execute("DELETE FROM sends WHERE id NOT IN (SELECT id FROM sends ORDER BY id DESC LIMIT 5)")
+        con.commit()
+        return row_id, 0
+
+
+def finish_send(row_id, status, detail):
+    with database() as con:
+        con.execute("UPDATE sends SET status=?,detail=? WHERE id=?", (status, detail[:220], row_id))
+
 
 @app.after_request
-def set_security_headers(response):
+def headers(response):
+    response.headers["Cache-Control"] = "no-store, max-age=0"
     response.headers["X-Content-Type-Options"] = "nosniff"
     response.headers["X-Frame-Options"] = "DENY"
     response.headers["Referrer-Policy"] = "no-referrer"
-    response.headers["Cache-Control"] = "no-store"
-    response.headers["Content-Security-Policy"] = (
-        "default-src 'self'; style-src 'self' 'unsafe-inline'; "
-        "form-action 'self'; frame-ancestors 'none'; base-uri 'none'"
-    )
+    response.headers["Content-Security-Policy"] = ("default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                                                   "style-src 'self' 'unsafe-inline'; "
+                                                   "connect-src 'self'; form-action 'self'; frame-ancestors 'none'")
     return response
 
-@app.route("/", methods=["GET"])
-def index():
-    return render_template_string(
-        PAGE, logged_in=bool(session.get("logged_in")), csrf=get_csrf_token()
-    )
 
-@app.route("/login", methods=["POST"])
+@app.get("/healthz")
+def healthz():
+    return jsonify({"ok": True, "version": WOL_WEB_APP_VERSION})
+
+
+@app.get("/")
+def index():
+    return render_template_string(PAGE, csrf=csrf_token(),
+                                  auth_enabled=auth_enabled(), logged_in=logged_in(),
+                                  message=request.args.get("error", ""))
+
+
+@app.post("/login")
 def login():
-    check_csrf()
-    remote = request.remote_addr or "unknown"
-    now = time.time()
-    with _failed_lock:
-        recent = [stamp for stamp in _failed_logins.get(remote, []) if now - stamp < 300]
-        _failed_logins[remote] = recent
-        if len(recent) >= 8:
-            abort(429, description="Too many login attempts")
-    config = load_config()
-    stored_hash = config.get("password_hash", "")
-    password = request.form.get("password", "")
-    ok = False
-    if stored_hash and password:
-        try:
-            ok = check_password_hash(stored_hash, password)
-        except (ValueError, TypeError):
-            ok = False
-    if ok:
-        with _failed_lock:
-            _failed_logins.pop(remote, None)
-        session.clear()
-        session["logged_in"] = True
-        session["_csrf"] = secrets.token_urlsafe(32)
-        session.permanent = True
-        return redirect(url_for("index"))
-    with _failed_lock:
-        _failed_logins[remote] = _failed_logins.get(remote, []) + [now]
-    flash("密码不正确，请重试。", "error")
+    if not check_csrf():
+        abort(400)
+    ip = request.remote_addr or "unknown"
+    with _login_lock:
+        now = time.time()
+        _failed_logins[ip] = [t for t in _failed_logins.get(ip, []) if now - t < 300]
+        if len(_failed_logins[ip]) >= 8:
+            abort(429)
+    stored_hash = load_config().get("password_hash", "")
+    pw = request.form.get("password", "")
+    try:
+        valid = bool(pw) and bool(stored_hash) and check_password_hash(stored_hash, pw)
+    except (ValueError, TypeError):
+        valid = False
+    if not valid:
+        with _login_lock:
+            _failed_logins.setdefault(ip, []).append(time.time())
+        return redirect(url_for("index", error="密码错误"))
+    session.clear()
+    session["logged_in"] = True
+    session["_csrf"] = secrets.token_urlsafe(28)
+    with _login_lock:
+        _failed_logins.pop(ip, None)
     return redirect(url_for("index"))
 
-@app.route("/logout", methods=["POST"])
-@logged_in_required
+
+@app.post("/logout")
 def logout():
-    check_csrf()
+    if not check_csrf():
+        abort(400)
     session.clear()
     return redirect(url_for("index"))
 
-@app.route("/wake", methods=["POST"])
-@logged_in_required
+
+@app.get("/api/history")
+@require_auth
+def history():
+    return jsonify({"records": history_items()})
+
+
+@app.post("/api/wake")
+@require_auth
 def wake():
-    check_csrf()
-    now = time.time()
-    last = float(session.get("last_wake", 0) or 0)
-    if now - last < WAKE_COOLDOWN_SECONDS:
-        flash("操作太频繁，请稍等几秒再试。", "error")
-        return redirect(url_for("index"))
+    if not check_csrf():
+        return jsonify({"ok": False, "message": "页面验证失效，请刷新后重试"}), 400
+    config = load_config()
+    cooldown = max(5, min(600, int(config.get("cooldown_seconds", 20))))
     try:
-        targets, port, sent = send_wol(load_config())
-        session["last_wake"] = now
-        app.logger.info("WOL packet sent to %s:%s; packets=%s", ",".join(targets), port, sent)
-        flash(
-            f"唤醒包已发送至 {', '.join(targets)} 的 UDP {port} 端口。"
-            "数据包发出不代表 NAS 已完成启动。",
-            "success",
-        )
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        app.logger.warning("WOL send failed: %s", exc)
-        flash(f"发送失败：{exc}", "error")
-    return redirect(url_for("index"))
+        row_id, seconds_left = reserve_send(cooldown)
+    except sqlite3.Error:
+        app.logger.exception("Unable to store WOL history")
+        return jsonify({"ok": False, "message": "发送记录数据库暂时不可写，请检查服务权限"}), 503
+    if row_id is None:
+        return jsonify({"ok": False, "message": f"操作过于频繁，请 {seconds_left} 秒后再试"}), 429
+    try:
+        ips, port, count = send_wol(config)
+        detail = f"目标 {', '.join(ips)}:{port} · UDP {count} 包 · 仅确认已发出"
+        finish_send(row_id, "sent", detail)
+        app.logger.info("WOL sent: resolved=%s port=%s packets=%s", ips, port, count)
+        return jsonify({"ok": True, "message": f"已发送 {count} 个唤醒包至 {', '.join(ips)}:{port}；请确认 NAS 是否启动"})
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        app.logger.warning("WOL failed: %s", exc)
+        finish_send(row_id, "failed", str(exc))
+        return jsonify({"ok": False, "message": f"WOL 发送失败：{exc}"}), 502
+
 
 if __name__ == "__main__":
-    app.run(host=WEB_BIND, port=WEB_PORT, debug=False)
+    app.run(host="127.0.0.1", port=int(os.environ.get("WOL_WEB_PORT", "8109")), debug=False)

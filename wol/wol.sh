@@ -3,7 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.1.0"
+VERSION="1.3.0"
 RAW_WOL_URL="https://raw.githubusercontent.com/byilrq/vps/main/wol/wol.py"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
@@ -81,8 +81,10 @@ for item in sys.argv[2:]:
     key, sep, value = item.partition("=")
     if not sep:
         continue
-    if key in ("port", "external_port", "internal_port"):
+    if key in ("port", "external_port", "internal_port", "send_count", "cooldown_seconds"):
         data[key] = int(value)
+    elif key == "auth_enabled":
+        data[key] = value.lower() in ("true", "yes", "1")
     else:
         data[key] = value
 directory = os.path.dirname(path)
@@ -130,15 +132,23 @@ PY
 }
 
 read_default() {
+    # Interactive SSH: readline enables Backspace / arrow keys, -i prefills the old value.
+    # Enter keeps the current parameter unchanged. Non-TTY also supports Enter defaults.
     local prompt="$1" default_value="${2:-}" entered=""
-    if [[ -n "$default_value" ]]; then
+    if [[ -t 0 ]]; then
+        if [[ -n "$default_value" ]]; then
+            read -e -r -i "$default_value" -p "${prompt}: " entered || return 1
+        else
+            read -e -r -p "${prompt}: " entered || return 1
+        fi
+    elif [[ -n "$default_value" ]]; then
         read -r -p "${prompt} [${default_value}]: " entered || return 1
-        REPLY="${entered:-$default_value}"
     else
         read -r -p "${prompt}: " entered || return 1
-        REPLY="$entered"
     fi
+    REPLY="${entered:-$default_value}"
 }
+
 
 validate_port() {
     [[ "$1" =~ ^[0-9]{1,5}$ ]] && (( 10#$1 >= 1 && 10#$1 <= 65535 ))
@@ -247,15 +257,15 @@ prompt_initial_password() {
     local pw="" confirm=""
     GENERATED_PASSWORD=""
     while true; do
-        read -r -s -p "设置网页登录密码（至少 12 位，直接回车自动生成）: " pw || return 1
+        read -r -s -p "设置网页登录密码（至少 6 位，直接回车自动生成）: " pw || return 1
         printf '\n'
         if [[ -z "$pw" ]]; then
             pw="$("$VENV_PY" -c 'import secrets; print(secrets.token_urlsafe(18))')"
             GENERATED_PASSWORD="$pw"
             break
         fi
-        if (( ${#pw} < 12 )); then
-            warn "密码至少需要 12 位，请重新输入。"
+        if (( ${#pw} < 6 )); then
+            warn "密码至少需要 6 位，请重新输入。"
             continue
         fi
         read -r -s -p "请再次输入密码: " confirm || return 1
@@ -274,6 +284,9 @@ data = {
     "host": "",
     "mac": "",
     "port": 9,
+    "send_count": 5,
+    "cooldown_seconds": 20,
+    "auth_enabled": True,
     "web_domain": "",
     "external_port": 8119,
     "internal_port": 8109,
@@ -301,7 +314,7 @@ PY
 
 show_generated_password() {
     if [[ -n "$GENERATED_PASSWORD" ]]; then
-        printf '\n%s\n' "${YELLOW}Auto-generated web login password (save it now; it will not be shown again):${RESET}"
+        printf '\n%s\n' "${YELLOW}自动生成的网页登录密码（仅显示一次，请妥善保存）：${RESET}"
         printf '%s\n\n' "$GENERATED_PASSWORD"
         GENERATED_PASSWORD=""
     fi
@@ -313,25 +326,25 @@ ensure_password_hash() {
     if [[ -n "$existing" ]]; then
         return 0
     fi
-    warn "Current config has no web password hash; initializing it without changing NAS settings."
+    warn "配置缺少密码哈希，正在初始化；不会更改 NAS 唤醒配置。"
     while true; do
-        read -r -s -p "Set web password (at least 12 characters; Enter generates one): " password || return 1
+        read -r -s -p "设置网页登录密码（至少 6 位，回车自动生成）: " password || return 1
         printf '\n'
         if [[ -z "$password" ]]; then
             password="$("$VENV_PY" -c 'import secrets; print(secrets.token_urlsafe(18))')"
             GENERATED_PASSWORD="$password"
             break
         fi
-        if (( ${#password} < 12 )); then
-            warn "Password must be at least 12 characters."
+        if (( ${#password} < 6 )); then
+            warn "密码至少需要 6 位。"
             continue
         fi
-        read -r -s -p "Confirm password: " confirm || return 1
+        read -r -s -p "请再次输入密码: " confirm || return 1
         printf '\n'
         if [[ "$password" == "$confirm" ]]; then
             break
         fi
-        warn "Passwords do not match. Try again."
+        warn "密码不一致，请重新输入。"
     done
     password_hash="$(WOL_PASSWORD_TO_HASH="$password" "$VENV_PY" - <<'PY'
 import os
@@ -371,8 +384,9 @@ RestartSec=3
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=read-only
-ReadOnlyPaths=${APP_DIR}
+# /root/wol is user-requested. ReadWritePaths lets SQLite persist the last 5 sends.
+ProtectHome=false
+ReadWritePaths=${APP_DIR}
 CapabilityBoundingSet=
 AmbientCapabilities=
 PrivateDevices=true
@@ -513,6 +527,9 @@ install_deploy() {
         prompt_initial_password || { err "初始化配置失败。"; return 1; }
     else
         ensure_password_hash || return 1
+        # Preserve the password hash and NAS/WEB settings, but require login
+        # on upgrades even if v1.2 previously stored auth_enabled=false.
+        config_set_fields "auth_enabled=true" || return 1
     fi
     show_generated_password
     chown root:root "$APP_DIR" 2>/dev/null || true
@@ -525,8 +542,8 @@ install_deploy() {
     internal_port="${internal_port:-8109}"
     write_service_unit "$internal_port" || return 1
     systemctl daemon-reload || { err "systemd 重新加载失败。"; return 1; }
-    if systemctl enable --now "$SERVICE_NAME"; then
-        ok "WOL Web 服务已安装并启动。"
+    if systemctl enable "$SERVICE_NAME" >/dev/null && systemctl restart "$SERVICE_NAME"; then
+        ok "WOL Web 服务已安装或更新，并重新启动。"
     else
         err "服务启动失败，最近日志如下："
         journalctl -u "$SERVICE_NAME" -n 40 --no-pager 2>/dev/null || true
@@ -537,6 +554,10 @@ install_deploy() {
     external_port="$(config_get external_port)"
     external_port="${external_port:-8119}"
     open_firewall_port "$external_port" || true
+
+    # During upgrades, refresh ONLY our managed Nginx snippet so HTTP->HTTPS
+    # redirect works immediately after menu 1 without reentering menu 3.
+    sync_existing_nginx || warn "WOL 专属 Nginx 配置尚未同步；请运行菜单 3 检查设置。"
 
     local domain
     domain="$(config_get web_domain)"
@@ -584,6 +605,16 @@ configure_nas() {
     ok "NAS 参数已保存。"
     printf 'MAC：%s\n目标：%s\nUDP 端口：%s\n' "$mac" "$host_input" "$port_input"
     info "这里的 UDP 端口是家庭路由器转发的 WOL 端口，默认 9；与网页外部 TCP 端口不同。"
+    info "程序每次唤醒会向域名解析的 IPv4 地址发送 5 个标准 102 字节的 Magic Packet。"
+    if command -v getent >/dev/null 2>&1; then
+        local resolved
+        resolved="$(getent ahostsv4 "$host_input" 2>/dev/null | awk 'NR==1 { print $1 }')"
+        if [[ -n "$resolved" ]]; then
+            info "当前 DDNS IPv4 解析结果：$resolved（请与手机小程序的目标地址核对）。"
+        else
+            warn "DDNS 未解析到 IPv4；请检查 DNS A 记录。"
+        fi
+    fi
 }
 
 restart_service() {
@@ -684,6 +715,9 @@ ${listen_v6}
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
     ssl_protocols TLSv1.2 TLSv1.3;
+    # Only for HTTP sent to this HTTPS port (Nginx internal status 497).
+    # The port must be preserved, e.g. http://domain:8119 -> https://domain:8119.
+    error_page 497 =301 https://\$host:\$server_port\$request_uri;
     ssl_session_cache shared:WOLWEB:2m;
     ssl_session_timeout 10m;
 
@@ -707,6 +741,36 @@ EOF
     if [[ -n "$NGINX_LINK_FILE" && ! -L "$NGINX_LINK_FILE" ]]; then
         ln -s "$NGINX_CONF_FILE" "$NGINX_LINK_FILE" || return 1
     fi
+}
+
+sync_existing_nginx() {
+    local domain external internal old_file backup
+    domain="$(config_get web_domain)"
+    [[ -n "$domain" ]] || return 0
+    if ! select_nginx_paths; then
+        return 1
+    fi
+    old_file="$NGINX_CONF_FILE"
+    # On first installation, a domain may exist in the config without a site yet.
+    [[ -f "$old_file" ]] || return 0
+    if ! grep -q "WOL-WEB MANAGED CONFIG" "$old_file"; then
+        warn "发现与本程序同名的非托管 Nginx 文件，不做任何覆盖。"
+        return 1
+    fi
+    backup="$(mktemp /tmp/wol-nginx-update.XXXXXX)" || return 1
+    cp -a "$old_file" "$backup" || { rm -f "$backup"; return 1; }
+    external="$(config_get external_port)"
+    internal="$(config_get internal_port)"
+    if write_nginx_config "$domain" "${external:-8119}" "${internal:-8109}" && nginx -t && systemctl reload nginx; then
+        rm -f "$backup"
+        ok "已更新 WOL 专属 Nginx 配置，HTTP 497 自动跳转至 HTTPS。"
+        return 0
+    fi
+    err "同步 Nginx 失败，恢复原文件（不会更改其他站点）。"
+    cp -a "$backup" "$old_file"
+    rm -f "$backup"
+    nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    return 1
 }
 
 web_settings() {
@@ -749,11 +813,12 @@ web_settings() {
         return 1
     fi
 
-    read -r -s -p "修改网页登录密码（至少 12 位，留空表示不修改）: " password || return 1
+    info "网页登录验证始终启用。首次安装密码至少 6 位；修改密码时回车保留原密码。"
+    read -r -s -p "网页登录密码（至少 6 位；回车保持现有密码）: " password || return 1
     printf '\n'
     if [[ -n "$password" ]]; then
-        if (( ${#password} < 12 )); then
-            err "密码至少需要 12 位。"
+        if (( ${#password} < 6 )); then
+            err "密码至少需要 6 位。"
             return 1
         fi
         read -r -s -p "请再次输入新密码: " password_confirm || return 1
@@ -787,6 +852,7 @@ PY
 
     local -a fields
     fields=("web_domain=$domain" "external_port=$external_port" "internal_port=$internal_port" "nginx_config_path=$NGINX_CONF_FILE" "nginx_link_path=$NGINX_LINK_FILE")
+    fields+=("auth_enabled=true")
     [[ -n "$password_hash" ]] && fields+=("password_hash=$password_hash")
     if ! config_set_fields "${fields[@]}"; then
         err "写入 WEB 设置失败。"
@@ -852,6 +918,7 @@ PY
     ok "WEB 设置已应用，WOL 服务已重启，Nginx 配置检查通过并已重载。"
     printf '\n访问地址：%s\n' "https://${domain}:${external_port}/"
     info "Nginx 仅新增独立的 wol-web 配置文件，没有修改 nginx.conf 或其他站点文件。"
+    info "网页已启用密码登录，登录后显示圆形唤醒按钮及最近 5 条发送记录。"
     show_status
 }
 
@@ -937,6 +1004,11 @@ show_status() {
         fi
         printf '  应用目录：%s\n' "$APP_DIR"
         printf '  配置文件：%s\n' "$CONFIG_FILE"
+        if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 3 "http://127.0.0.1:${internal_port:-8109}/healthz" 2>/dev/null | grep -q '"ok":true'; then
+            printf '  页面健康检测：%s正常%s\n' "$GREEN" "$RESET"
+        else
+            printf '  页面健康检测：%s尚未响应%s\n' "$YELLOW" "$RESET"
+        fi
     else
         printf '  配置状态：%s未安装%s\n' "$YELLOW" "$RESET"
     fi
@@ -968,7 +1040,7 @@ main_menu() {
         printf '\n%s\n' "${PURPLE}  ── 基础管理 ──${RESET}"
         menu_item 1 '安装部署' '安装 Python / Web / systemd'
         menu_item 2 '配置 NAS' 'MAC / DDNS / UDP 9'
-        menu_item 3 'WEB 端设置' '域名 / 外部 8119 / 内部 8109'
+        menu_item 3 'WEB 端设置' '域名 / 端口 / 登录密码'
         printf '\n%s\n' "${PURPLE}  ── 服务管理 ──${RESET}"
         menu_item 4 '重启服务' '重启后显示当前运行状态'
         menu_item 5 '停止服务' '停止网页服务'
