@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.5.1"
+WOL_WEB_APP_VERSION = "1.5.2"
 
 import hmac
 import ipaddress
@@ -54,9 +54,9 @@ h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
 .heading strong{font-size:15px;font-weight:700}.heading small{font-size:11px;color:#7890aa;margin-left:5px;font-weight:400}
 .refresh{border:1px solid #37506a;background:#172d40;color:#bdebd9;padding:8px 12px;font:inherit;font-size:12px;border-radius:9px;cursor:pointer}
 .empty{color:#8196af;text-align:center;padding:26px 2px;font-size:13px}
-.entry{padding:11px 0;border-top:1px solid #23394d;display:flex;gap:9px;align-items:flex-start;justify-content:space-between}
-.entry-main{flex:1;min-width:0}.state{font-size:13px;font-weight:650}.state.ok{color:#8eebbf}.state.err{color:#ffacb9}.item-desc{font-size:12px;color:#829bb3;margin-top:3px;overflow-wrap:anywhere}
-.when{font-size:11px;color:#839ab4;white-space:nowrap;margin-top:2px;font-variant-numeric:tabular-nums}
+.entry{padding:11px 0;border-top:1px solid #23394d;display:flex;gap:7px 12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+.state{font-size:13px;font-weight:650}.state.ok{color:#8eebbf}.state.err{color:#ffacb9}
+.when{font-size:11px;color:#839ab4;white-space:nowrap;margin-left:auto;font-variant-numeric:tabular-nums}
 .foot{color:#557088;text-align:center;font-size:11px;margin:20px 0 8px}
 .login{background:#101e2fcf;border:1px solid var(--border);border-radius:20px;padding:30px 24px 28px;margin:clamp(40px,12vh,112px) auto 0;width:100%;max-width:390px}
 .login h1{font-size:23px;margin:0 0 26px;font-weight:730}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -100,10 +100,10 @@ async function refreshHistory(){
     const data=await resp.json();historyList.replaceChildren();historyList.className='';
     if(!data.records || !data.records.length){historyList.className='empty';historyList.textContent='暂无发送记录';return;}
     for(const item of data.records){
-      const div=makeEl('div','entry');const left=makeEl('div','entry-main');
-      const ok=item.status==='sent';const pending=item.status==='sending';left.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),ok?'✓ 唤醒数据包已发送':pending?'… 正在发送':'发送失败'));
-      left.append(makeEl('div','item-desc',item.detail));
-      div.append(left,makeEl('time','when',item.time));historyList.append(div);
+      const div=makeEl('div','entry');
+      const ok=item.status==='sent';const pending=item.status==='sending';
+      div.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),ok?'✓ 唤醒数据包已发送':pending?'… 正在发送':'发送失败'));
+      div.append(makeEl('time','when',item.time));historyList.append(div);
     }
   }catch(ex){historyList.className='empty';historyList.textContent='记录加载失败，请点击刷新';}
   finally{refreshButton.disabled=false;}
@@ -298,12 +298,13 @@ def database():
 
 
 def history_items():
+    """Expose only status and Beijing time; never return saved network details."""
     with database() as con:
-        rows = con.execute("SELECT at,status,detail FROM sends ORDER BY id DESC LIMIT 5").fetchall()
+        rows = con.execute("SELECT at,status FROM sends ORDER BY id DESC LIMIT 5").fetchall()
     return [
         {"time": datetime.fromtimestamp(ts, TZ).strftime("%m/%d %H:%M:%S"),
-         "status": status, "detail": detail}
-        for ts, status, detail in rows
+         "status": status}
+        for ts, status in rows
     ]
 
 
@@ -414,13 +415,13 @@ def wake():
         return jsonify({"ok": False, "message": f"操作过于频繁，请 {seconds_left} 秒后再试"}), 429
     try:
         ips, port, count, sources = send_wol(config)
-        detail = f"目标 {', '.join(ips)}:{port} · UDP {count} 包 · 出站 {', '.join(sources)}"
-        finish_send(row_id, "sent", detail)
+        finish_send(row_id, "sent", "唤醒数据包已发送")
+        # Keep low-level diagnostics in the VPS service log, not in web history.
         app.logger.info("WOL sent: resolved=%s port=%s packets=%s sources=%s", ips, port, count, sources)
-        return jsonify({"ok": True, "message": f"已发送 {count} 个唤醒包至 {', '.join(ips)}:{port}；仅确认 VPS 已发出，请检查 NAS 是否启动"})
+        return jsonify({"ok": True, "message": "✓ 唤醒数据包已发送"})
     except (OSError, ValueError, TypeError, KeyError) as exc:
         app.logger.warning("WOL failed: %s", exc)
-        finish_send(row_id, "failed", str(exc))
+        finish_send(row_id, "failed", "发送失败")
         return jsonify({"ok": False, "message": f"WOL 发送失败：{exc}"}), 502
 
 

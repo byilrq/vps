@@ -3,7 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.5.1"
+VERSION="1.5.2"
 RAW_WOL_URL="https://raw.githubusercontent.com/byilrq/vps/main/wol/wol.py"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
