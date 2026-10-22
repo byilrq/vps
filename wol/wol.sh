@@ -3,7 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.3.0"
+VERSION="1.4.0"
 RAW_WOL_URL="https://raw.githubusercontent.com/byilrq/vps/main/wol/wol.py"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
@@ -253,107 +253,49 @@ download_wol_program() {
     chmod 644 "$APP_DIR/wol.py"
 }
 
-prompt_initial_password() {
-    local pw="" confirm=""
-    GENERATED_PASSWORD=""
-    while true; do
-        read -r -s -p "设置网页登录密码（至少 6 位，直接回车自动生成）: " pw || return 1
-        printf '\n'
-        if [[ -z "$pw" ]]; then
-            pw="$("$VENV_PY" -c 'import secrets; print(secrets.token_urlsafe(18))')"
-            GENERATED_PASSWORD="$pw"
-            break
-        fi
-        if (( ${#pw} < 6 )); then
-            warn "密码至少需要 6 位，请重新输入。"
-            continue
-        fi
-        read -r -s -p "请再次输入密码: " confirm || return 1
-        printf '\n'
-        if [[ "$pw" == "$confirm" ]]; then
-            break
-        fi
-        warn "两次输入不一致，请重试。"
-    done
-    WOL_INIT_PASSWORD="$pw" WOL_CONFIG_FILE="$CONFIG_FILE" "$VENV_PY" - <<'PY'
+initialize_config() {
+    # Menu 1 deliberately has no interactive settings: no WEB password, no
+    # external/internal port prompts, and no firewall manipulation.
+    # Menu 3 configures password/ports and opens its own firewall port.
+    WOL_CONFIG_FILE="$CONFIG_FILE" python3 - <<'PY_CONFIG'
 import json, os, secrets
 from pathlib import Path
-from werkzeug.security import generate_password_hash
 path = Path(os.environ["WOL_CONFIG_FILE"])
-data = {
-    "host": "",
-    "mac": "",
-    "port": 9,
-    "send_count": 5,
-    "cooldown_seconds": 20,
+obj = {
+    "host": "", "mac": "", "port": 9,
+    "send_count": 5, "cooldown_seconds": 20,
     "auth_enabled": True,
-    "web_domain": "",
-    "external_port": 8119,
-    "internal_port": 8109,
-    "password_hash": generate_password_hash(os.environ["WOL_INIT_PASSWORD"]),
-    "secret_key": secrets.token_hex(32),
-    "firewall": {
-        "ufw_added_ports": [],
-        "firewalld_added_ports": [],
-        "iptables_added_ports": []
-    },
-    "nginx_config_path": "",
-    "nginx_link_path": ""
+    "web_domain": "", "external_port": 8119, "internal_port": 8109,
+    "password_hash": "", "secret_key": secrets.token_hex(32),
+    "firewall": {"ufw_added_ports": [], "firewalld_added_ports": [], "iptables_added_ports": []},
+    "nginx_config_path": "", "nginx_link_path": ""
 }
-with path.open("w", encoding="utf-8") as f:
-    json.dump(data, f, ensure_ascii=False, indent=2)
+with path.open("x", encoding="utf-8") as f:
+    json.dump(obj, f, ensure_ascii=False, indent=2)
     f.write("\n")
-os.chmod(path, 0o640)
-PY
-    local result=$?
-    unset WOL_INIT_PASSWORD
-    [[ $result -eq 0 ]] || return 1
-    chown root:root "$CONFIG_FILE" 2>/dev/null || true
-    chmod 600 "$CONFIG_FILE"
+os.chmod(path, 0o600)
+PY_CONFIG
 }
 
-show_generated_password() {
-    if [[ -n "$GENERATED_PASSWORD" ]]; then
-        printf '\n%s\n' "${YELLOW}自动生成的网页登录密码（仅显示一次，请妥善保存）：${RESET}"
-        printf '%s\n\n' "$GENERATED_PASSWORD"
-        GENERATED_PASSWORD=""
-    fi
-}
-
-ensure_password_hash() {
-    local existing password confirm password_hash
-    existing="$(config_get password_hash)"
-    if [[ -n "$existing" ]]; then
-        return 0
-    fi
-    warn "配置缺少密码哈希，正在初始化；不会更改 NAS 唤醒配置。"
-    while true; do
-        read -r -s -p "设置网页登录密码（至少 6 位，回车自动生成）: " password || return 1
-        printf '\n'
-        if [[ -z "$password" ]]; then
-            password="$("$VENV_PY" -c 'import secrets; print(secrets.token_urlsafe(18))')"
-            GENERATED_PASSWORD="$password"
-            break
-        fi
-        if (( ${#password} < 6 )); then
-            warn "密码至少需要 6 位。"
-            continue
-        fi
-        read -r -s -p "请再次输入密码: " confirm || return 1
-        printf '\n'
-        if [[ "$password" == "$confirm" ]]; then
-            break
-        fi
-        warn "密码不一致，请重新输入。"
-    done
-    password_hash="$(WOL_PASSWORD_TO_HASH="$password" "$VENV_PY" - <<'PY'
+make_password_hash() {
+    local passwd="$1"
+    WOL_PASSWORD_TO_HASH="$passwd" "$VENV_PY" - <<'PY_HASH'
 import os
 from werkzeug.security import generate_password_hash
 print(generate_password_hash(os.environ["WOL_PASSWORD_TO_HASH"]))
-PY
-)" || return 1
-    unset password confirm
-    config_set_fields "password_hash=$password_hash"
+PY_HASH
+}
+
+read_secret() {
+    local prompt="$1" entered=""
+    # readline editing works with Backspace even for hidden terminal input.
+    if [[ -t 0 ]]; then
+        read -e -r -s -p "$prompt" entered || return 1
+    else
+        read -r -s -p "$prompt" entered || return 1
+    fi
+    printf '\n'
+    REPLY="$entered"
 }
 
 write_service_unit() {
@@ -387,8 +329,10 @@ ProtectSystem=strict
 # /root/wol is user-requested. ReadWritePaths lets SQLite persist the last 5 sends.
 ProtectHome=false
 ReadWritePaths=${APP_DIR}
-CapabilityBoundingSet=
-AmbientCapabilities=
+# Allow the optional diagnostic/source UDP port 9 bind without granting
+# unrelated Linux capabilities to the application process.
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 PrivateDevices=true
 ProtectKernelTunables=true
 ProtectKernelModules=true
@@ -524,14 +468,12 @@ install_deploy() {
 
     download_wol_program || return 1
     if [[ ! -f "$CONFIG_FILE" ]]; then
-        prompt_initial_password || { err "初始化配置失败。"; return 1; }
+        initialize_config || { err "创建默认配置失败。"; return 1; }
+        info "已创建配置文件，未设置 WEB 密码和对外端口；请在菜单 3 完成。"
     else
-        ensure_password_hash || return 1
-        # Preserve the password hash and NAS/WEB settings, but require login
-        # on upgrades even if v1.2 previously stored auth_enabled=false.
+        # Preserve existing password/ports on upgrade; never prompt during menu 1.
         config_set_fields "auth_enabled=true" || return 1
     fi
-    show_generated_password
     chown root:root "$APP_DIR" 2>/dev/null || true
     chmod 700 "$APP_DIR"
     chown root:root "$CONFIG_FILE" 2>/dev/null || true
@@ -550,10 +492,10 @@ install_deploy() {
         return 1
     fi
 
+    # The WEB external port is opened ONLY after successful menu 3 settings.
     local external_port
     external_port="$(config_get external_port)"
     external_port="${external_port:-8119}"
-    open_firewall_port "$external_port" || true
 
     # During upgrades, refresh ONLY our managed Nginx snippet so HTTP->HTTPS
     # redirect works immediately after menu 1 without reentering menu 3.
@@ -564,7 +506,7 @@ install_deploy() {
     if [[ -n "$domain" ]]; then
         ok "访问地址：https://${domain}:${external_port}/"
     else
-        info "下一步请运行菜单 2 配置 NAS，再运行菜单 3 配置网页域名和端口。"
+        info "下一步请运行菜单 2 配置 NAS，再运行菜单 3 配置网页域名、端口和密码。"
     fi
     ok "内部监听：127.0.0.1:${internal_port}；不会直接暴露内部端口到公网。"
     info "程序目录：${APP_DIR}；配置文件：${CONFIG_FILE}"
@@ -605,7 +547,8 @@ configure_nas() {
     ok "NAS 参数已保存。"
     printf 'MAC：%s\n目标：%s\nUDP 端口：%s\n' "$mac" "$host_input" "$port_input"
     info "这里的 UDP 端口是家庭路由器转发的 WOL 端口，默认 9；与网页外部 TCP 端口不同。"
-    info "程序每次唤醒会向域名解析的 IPv4 地址发送 5 个标准 102 字节的 Magic Packet。"
+    info "每次尝试发送 5 个标准 Magic Packet，并尝试使用源 UDP 9 端口补发 2 个。"
+    warn "如果实际唤醒仍失败，请检查家庭路由器 UDP9 转发到关机 NAS 时的 ARP/广播能力。"
     if command -v getent >/dev/null 2>&1; then
         local resolved
         resolved="$(getent ahostsv4 "$host_input" 2>/dev/null | awk 'NR==1 { print $1 }')"
@@ -813,26 +756,34 @@ web_settings() {
         return 1
     fi
 
-    info "网页登录验证始终启用。首次安装密码至少 6 位；修改密码时回车保留原密码。"
-    read -r -s -p "网页登录密码（至少 6 位；回车保持现有密码）: " password || return 1
-    printf '\n'
+    local current_hash generated_password=""
+    current_hash="$(config_get password_hash)"
+    if [[ -n "$current_hash" ]]; then
+        info "已有 WEB 登录密码；此处直接回车保持原密码不变。"
+        read_secret "修改网页登录密码（至少 6 位，回车保持原密码）: " || return 1
+    else
+        warn "尚未设置 WEB 登录密码；直接回车将自动生成随机密码。"
+        read_secret "首次设置网页登录密码（至少 6 位，回车自动生成）: " || return 1
+    fi
+    password="$REPLY"
+    if [[ -z "$password" && -z "$current_hash" ]]; then
+        generated_password="$("$VENV_PY" -c 'import secrets; print(secrets.token_urlsafe(18))')" || return 1
+        password="$generated_password"
+    fi
     if [[ -n "$password" ]]; then
         if (( ${#password} < 6 )); then
             err "密码至少需要 6 位。"
             return 1
         fi
-        read -r -s -p "请再次输入新密码: " password_confirm || return 1
-        printf '\n'
-        if [[ "$password" != "$password_confirm" ]]; then
-            err "两次输入不一致，未修改密码。"
-            return 1
+        if [[ -z "$generated_password" ]]; then
+            read_secret "确认网页登录密码: " || return 1
+            password_confirm="$REPLY"
+            if [[ "$password" != "$password_confirm" ]]; then
+                err "两次输入不一致，未修改密码。"
+                return 1
+            fi
         fi
-        password_hash="$(WOL_PASSWORD_TO_HASH="$password" "$VENV_PY" - <<'PY'
-import os
-from werkzeug.security import generate_password_hash
-print(generate_password_hash(os.environ["WOL_PASSWORD_TO_HASH"]))
-PY
-)"
+        password_hash="$(make_password_hash "$password")" || return 1
         unset password password_confirm
     fi
 
@@ -915,6 +866,10 @@ PY
     chmod 600 "$CONFIG_FILE"
     open_firewall_port "$external_port" || true
     rm -rf "$backup_dir"
+    if [[ -n "$generated_password" ]]; then
+        printf '\n%s\n' "${YELLOW}首次自动生成的网页登录密码（仅显示一次，请立即保存）：${RESET}"
+        printf '%s\n\n' "$generated_password"
+    fi
     ok "WEB 设置已应用，WOL 服务已重启，Nginx 配置检查通过并已重载。"
     printf '\n访问地址：%s\n' "https://${domain}:${external_port}/"
     info "Nginx 仅新增独立的 wol-web 配置文件，没有修改 nginx.conf 或其他站点文件。"
@@ -1038,9 +993,9 @@ main_menu() {
         printf '  %s\n' "$status_text"
         printf '  %s安装目录：%s%s\n' "$DIM" "$APP_DIR" "$RESET"
         printf '\n%s\n' "${PURPLE}  ── 基础管理 ──${RESET}"
-        menu_item 1 '安装部署' '安装 Python / Web / systemd'
+        menu_item 1 '安装部署' '仅安装程序，不询问密码/端口'
         menu_item 2 '配置 NAS' 'MAC / DDNS / UDP 9'
-        menu_item 3 'WEB 端设置' '域名 / 端口 / 登录密码'
+        menu_item 3 'WEB 端设置' '域名 / 端口 / 密码 / 放行防火墙'
         printf '\n%s\n' "${PURPLE}  ── 服务管理 ──${RESET}"
         menu_item 4 '重启服务' '重启后显示当前运行状态'
         menu_item 5 '停止服务' '停止网页服务'

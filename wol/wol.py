@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.3.0"
+WOL_WEB_APP_VERSION = "1.4.0"
 
 import hmac
 import ipaddress
@@ -46,7 +46,7 @@ h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
 .btn-box{text-align:center;padding:17px 0 5px}
 .wake{width:196px;height:196px;max-width:65vw;max-height:65vw;cursor:pointer;border-radius:50%;border:1px solid #75e6b3;background:radial-gradient(circle at 36% 22%,#2e6b63 0%,#1a514b 43%,#0d3039 82%);box-shadow:0 0 0 11px #70e3b20c,0 0 0 24px #70e3b208,0 0 55px #33d9a331;color:#f1fff9;display:inline-flex;align-items:center;justify-content:center;flex-direction:column;gap:4px;transition:transform .12s,opacity .12s}
 .wake:active{transform:scale(.97)}.wake:disabled{cursor:not-allowed;opacity:.55}.wake:focus-visible,.refresh:focus-visible{outline:3px solid #f0fffc;outline-offset:5px}
-.power{font-size:61px;font-weight:300;line-height:1;color:#84f4c4}.wake-text{font-size:23px;font-weight:750;letter-spacing:.25em;padding-left:.25em}
+.power-icon{display:block;width:62px;height:62px;fill:none;stroke:#84f4c4;stroke-width:6;stroke-linecap:round;stroke-linejoin:round;flex:none}.wake-text{font-size:23px;font-weight:750;letter-spacing:.25em;padding-left:.25em}
 .feedback{margin:23px 0 22px;min-height:43px;text-align:center;color:#91aac2;font-size:13px;overflow-wrap:anywhere}
 .feedback.ok{color:#9cf6d0}.feedback.err{color:#ffb0b9}
 .history{margin-top:5px;background:#111f31dc;border:1px solid var(--border);border-radius:18px;padding:18px 17px 12px}
@@ -68,10 +68,10 @@ h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
 {% if auth_enabled and logged_in %}<form action="{{ url_for('logout') }}" method="post"><input name="csrf" type="hidden" value="{{ csrf }}"><button class="logout" type="submit">退出</button></form>{% else %}<span style="font-size:11px;color:#6986a1">WOL WEB</span>{% endif %}
 </header>
 {% if auth_enabled and not logged_in %}
-<div class="login"><h1>NAS 远程唤醒</h1><p class="lead">此设备启用了访问验证</p><form action="{{ url_for('login') }}" method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><label for="pw">访问密码</label><input id="pw" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">登录</button></form><p id="loginMessage" class="feedback err">{{ message }}</p></div>
+<div class="login"><h1>NAS 远程唤醒</h1><p class="lead">请输入 WEB 登录密码</p><form action="{{ url_for('login') }}" method="post"><input type="hidden" name="csrf" value="{{ csrf }}"><label for="pw">访问密码</label><input id="pw" name="password" type="password" autocomplete="current-password" required autofocus><button type="submit">登录</button></form><p id="loginMessage" class="feedback err">{{ message }}</p></div>
 {% else %}
 <h1>NAS 远程唤醒</h1><p class="lead">点击圆形按钮向家庭 NAS 发送网络唤醒数据包</p>
-<div class="btn-box"><button id="wakeButton" class="wake" type="button"><span class="power">⏻</span><span class="wake-text">唤醒</span></button></div>
+<div class="btn-box"><button id="wakeButton" class="wake" type="button"><svg class="power-icon" viewBox="0 0 64 64" role="img" aria-label="电源" xmlns="http://www.w3.org/2000/svg"><path d="M32 7 V30"/><path d="M20 12 A24 24 0 1 0 44 12"/></svg><span class="wake-text">唤醒</span></button></div>
 <div id="feedback" class="feedback" aria-live="polite">准备就绪</div>
 <section class="history" aria-label="最近五条发送记录"><div class="heading"><strong>发送记录 <small>最近 5 条 · 北京时间</small></strong><button id="refreshButton" class="refresh" type="button">↻ 刷新</button></div><div id="historyList" class="empty">加载中...</div></section>
 <div class="foot">发送成功仅表示数据包已交给 VPS 网络协议栈，不代表 NAS 已开机</div>
@@ -92,7 +92,7 @@ async function refreshHistory(){
     if(!data.records || !data.records.length){historyList.className='empty';historyList.textContent='暂无发送记录';return;}
     for(const item of data.records){
       const div=makeEl('div','entry');const left=makeEl('div','entry-main');
-      const ok=item.status==='sent';const pending=item.status==='sending';left.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),ok?'✓ 唤醒数据包已发送':pending?'… 正在发送':'× 发送失败'));
+      const ok=item.status==='sent';const pending=item.status==='sending';left.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),ok?'✓ 唤醒数据包已发送':pending?'… 正在发送':'发送失败'));
       left.append(makeEl('div','item-desc',item.detail));
       div.append(left,makeEl('time','when',item.time));historyList.append(div);
     }
@@ -208,6 +208,17 @@ def build_packet(mac):
 
 
 def send_wol(config):
+    """Send conventional 102-byte Magic Packets over public IPv4/UDP.
+
+    Strategy differs from the previous release:
+      - five datagrams using an OS-selected ephemeral UDP source port;
+      - a second, best-effort two-datagram pass with source UDP port 9.
+    Both use the *configured destination port*, normally UDP/9. The alternate
+    source port can help only with unusual router/firewall rules; it does not
+    solve a home router's missing ARP or broken port forwarding.
+
+    Returns resolved targets, target port, packets sent, source-port summary.
+    """
     host = validate_host(config.get("host", ""))
     try:
         port = int(config.get("port", 9))
@@ -216,8 +227,8 @@ def send_wol(config):
     if not 1 <= port <= 65535:
         raise ValueError("WOL UDP 端口必须在 1-65535 之间")
     packet = build_packet(config.get("mac", ""))
-    count = int(config.get("send_count", 5))
-    count = max(1, min(10, count))
+    if len(packet) != 102:
+        raise ValueError("Magic Packet 长度不正确")
     try:
         resolved = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
     except socket.gaierror as exc:
@@ -225,16 +236,43 @@ def send_wol(config):
     ips = list(dict.fromkeys(result[4][0] for result in resolved))
     if not ips:
         raise ValueError("没有解析到 IPv4 地址")
+    if len(ips) > 4:
+        raise ValueError("域名解析出过多 IPv4 地址；请检查是否误开 CDN 代理")
+
+    # Repeating with a different source port is not a substitute for
+    # LAN-level broadcast; keep logging sufficiently detailed to diagnose.
     sent = 0
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        for address in ips:
-            for index in range(count):
-                sock.sendto(packet, (address, port))
+    source_descriptions = []
+    for address in ips:
+        dest = (address, port)
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(3)
+            sock.connect(dest)
+            source_ip, source_port = sock.getsockname()
+            source_descriptions.append(f"{source_ip}:{source_port}")
+            for index in range(5):
+                sock.send(packet)
                 sent += 1
-                if index < count - 1:
-                    time.sleep(0.13)
-    return ips, port, sent
+                if index != 4:
+                    time.sleep(0.10)
+        # Optional second attempt, bound to local UDP source port 9.
+        # Binding is not always allowed (port already in use / upstream rules).
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(3)
+                sock.bind(("0.0.0.0", 9))
+                sock.connect(dest)
+                local_ip, source_port = sock.getsockname()
+                source_descriptions.append(f"{local_ip}:{source_port}")
+                for index in range(2):
+                    sock.send(packet)
+                    sent += 1
+                    if index == 0:
+                        time.sleep(0.10)
+        except OSError as exc:
+            source_descriptions.append(f"源端口9不可用({exc.__class__.__name__})")
+
+    return ips, port, sent, source_descriptions
 
 
 @contextmanager
@@ -301,6 +339,8 @@ def healthz():
 
 @app.get("/")
 def index():
+    if not load_config().get("password_hash"):
+        return "WEB 未完成初始化：请运行 wol.sh，选择菜单 3 设置访问密码。", 503
     return render_template_string(PAGE, csrf=csrf_token(),
                                   auth_enabled=auth_enabled(), logged_in=logged_in(),
                                   message=request.args.get("error", ""))
@@ -363,11 +403,11 @@ def wake():
     if row_id is None:
         return jsonify({"ok": False, "message": f"操作过于频繁，请 {seconds_left} 秒后再试"}), 429
     try:
-        ips, port, count = send_wol(config)
-        detail = f"目标 {', '.join(ips)}:{port} · UDP {count} 包 · 仅确认已发出"
+        ips, port, count, sources = send_wol(config)
+        detail = f"目标 {', '.join(ips)}:{port} · UDP {count} 包 · 出站 {', '.join(sources)}"
         finish_send(row_id, "sent", detail)
-        app.logger.info("WOL sent: resolved=%s port=%s packets=%s", ips, port, count)
-        return jsonify({"ok": True, "message": f"已发送 {count} 个唤醒包至 {', '.join(ips)}:{port}；请确认 NAS 是否启动"})
+        app.logger.info("WOL sent: resolved=%s port=%s packets=%s sources=%s", ips, port, count, sources)
+        return jsonify({"ok": True, "message": f"已发送 {count} 个唤醒包至 {', '.join(ips)}:{port}；仅确认 VPS 已发出，请检查 NAS 是否启动"})
     except (OSError, ValueError, TypeError, KeyError) as exc:
         app.logger.warning("WOL failed: %s", exc)
         finish_send(row_id, "failed", str(exc))
@@ -375,4 +415,20 @@ def wake():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=int(os.environ.get("WOL_WEB_PORT", "8109")), debug=False)
+    import sys
+    if len(sys.argv) == 2 and sys.argv[1] == "--test-wol":
+        # Operator-only SSH diagnostic: use the installed config, bypassing
+        # browser/HTTPS. This makes it possible to isolate VPS UDP vs WEB.
+        try:
+            ips, port, count, sources = send_wol(load_config())
+            print(f"WOL 测试：已向 {', '.join(ips)}:{port} 发送 {count} 个 Magic Packet")
+            print("VPS 本机 UDP 出站地址/端口：" + ", ".join(sources))
+            print("注意：发送成功不代表家庭路由器已转发或 NAS 已启动。")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            print(f"WOL 测试发送失败：{exc}", file=sys.stderr)
+            sys.exit(1)
+    elif len(sys.argv) > 1:
+        print("用法：python wol.py [--test-wol]", file=sys.stderr)
+        sys.exit(2)
+    else:
+        app.run(host="127.0.0.1", port=int(os.environ.get("WOL_WEB_PORT", "8109")), debug=False)
