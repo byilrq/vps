@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.5.2"
+WOL_WEB_APP_VERSION = "1.5.6"
 
 import hmac
 import ipaddress
@@ -32,22 +32,20 @@ os.umask(0o077)
 PAGE = r'''<!doctype html>
 <html lang="zh-CN"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="theme-color" content="#0b1320"><title>NAS 远程唤醒</title>
+<meta name="theme-color" content="#0b1320"><title>WOL</title>
 <style>
 :root{color-scheme:dark;--bg:#0b1320;--text:#e9f3ff;--muted:#8296ad;--mint:#70e3b2;--border:#2d4059}
 *{box-sizing:border-box}html,body{min-height:100%;margin:0}
 body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320 77%);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:22px 16px}
 .wrap{width:100%;max-width:460px;margin:0 auto;min-height:calc(100dvh - 44px);display:flex;flex-direction:column}
-.bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:3px 0 29px}
-.logo{font-size:13px;letter-spacing:.17em;color:#b8d1e4;font-weight:800}.dot{color:var(--mint);font-size:18px;margin-right:9px}
+.bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:3px 0 12px}
+.logo{font-size:14px;letter-spacing:.22em;color:#d8e8f5;font-weight:850}.dot{color:var(--mint);font-size:18px;margin-right:9px}
 .logout{color:#9eb2c9;background:transparent;border:1px solid #344861;border-radius:10px;padding:7px 13px;cursor:pointer}
-h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
-.lead{text-align:center;color:var(--muted);font-size:13px;margin:0 0 26px}
 .btn-box{text-align:center;padding:17px 0 5px}
 .wake{width:196px;height:196px;max-width:65vw;max-height:65vw;cursor:pointer;border-radius:50%;border:1px solid #75e6b3;background:radial-gradient(circle at 36% 22%,#2e6b63 0%,#1a514b 43%,#0d3039 82%);box-shadow:0 0 0 11px #70e3b20c,0 0 0 24px #70e3b208,0 0 55px #33d9a331;color:#f1fff9;display:inline-flex;align-items:center;justify-content:center;flex-direction:column;gap:4px;transition:transform .12s,opacity .12s}
 .wake:active{transform:scale(.97)}.wake:disabled{cursor:not-allowed;opacity:.55}.wake:focus-visible,.refresh:focus-visible{outline:3px solid #f0fffc;outline-offset:5px}
-.power-icon{display:block;width:62px;height:62px;fill:none;stroke:#84f4c4;stroke-width:6;stroke-linecap:round;stroke-linejoin:round;flex:none}.wake-text{font-size:23px;font-weight:750;letter-spacing:.25em;padding-left:.25em}
-.feedback{margin:23px 0 22px;min-height:43px;text-align:center;color:#91aac2;font-size:13px;overflow-wrap:anywhere}
+.power-icon{display:block;width:72px;height:72px;fill:none;stroke:#84f4c4;stroke-width:5.5;stroke-linecap:round;stroke-linejoin:round;flex:none}
+.feedback{margin:13px 0 14px;min-height:24px;text-align:center;color:#91aac2;font-size:13px;overflow-wrap:anywhere}
 .feedback.ok{color:#9cf6d0}.feedback.err{color:#ffb0b9}
 .history{margin-top:5px;background:#111f31dc;border:1px solid var(--border);border-radius:18px;padding:18px 17px 12px}
 .heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:10px}
@@ -57,19 +55,19 @@ h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
 .entry{padding:11px 0;border-top:1px solid #23394d;display:flex;gap:7px 12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
 .state{font-size:13px;font-weight:650}.state.ok{color:#8eebbf}.state.err{color:#ffacb9}
 .when{font-size:11px;color:#839ab4;white-space:nowrap;margin-left:auto;font-variant-numeric:tabular-nums}
-.foot{color:#557088;text-align:center;font-size:11px;margin:20px 0 8px}
 .login{background:#101e2fcf;border:1px solid var(--border);border-radius:20px;padding:30px 24px 28px;margin:clamp(40px,12vh,112px) auto 0;width:100%;max-width:390px}
-.login h1{font-size:23px;margin:0 0 26px;font-weight:730}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
+.login-mark{display:flex;align-items:center;justify-content:center;margin:0 auto 20px;width:40px;height:40px;border-radius:50%;background:#132b3a;border:1px solid #477c78;box-shadow:0 0 14px #33d9a31a}.login-mark svg{width:22px;height:22px;fill:none;stroke:#84f4c4;stroke-width:4;stroke-linecap:round;stroke-linejoin:round}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
 .login input{background:#0b1726;border:1px solid #39516a;color:#fff;padding:13px 14px;border-radius:11px;font:inherit;width:100%;height:50px;outline:none}.login input::placeholder{color:#7b90a7}.login input:focus{border-color:#82e7ba;box-shadow:0 0 0 3px #82e7ba20}
 .login button{margin-top:12px;width:100%;height:50px;padding:12px;border:0;border-radius:11px;background:#82e7ba;color:#0d3026;font:inherit;font-weight:750;cursor:pointer}.login button:active{opacity:.86}.login .login-error{min-height:0;margin:13px 0 0;text-align:center;color:#ffb0b9;font-size:13px}
 @media(max-height:720px){.bar{margin-bottom:12px}.lead{margin-bottom:11px}.wake{width:165px;height:165px}.btn-box{padding:8px 0}.feedback{margin:12px 0}}
 </style></head><body><main class="wrap">
-<header class="bar"><div class="logo"><span class="dot">●</span>NAS WAKE</div>
+<header class="bar">
+<div class="logo">WOL</div>
 {% if auth_enabled and logged_in %}<form action="{{ url_for('logout') }}" method="post"><input name="csrf" type="hidden" value="{{ csrf }}"><button class="logout" type="submit">退出</button></form>{% endif %}
 </header>
 {% if auth_enabled and not logged_in %}
 <section class="login" aria-label="登录">
-  <h1>NAS 唤醒</h1>
+  <div class="login-mark" role="img" aria-label="电源图标"><svg viewBox="0 0 64 64" xmlns="http://www.w3.org/2000/svg"><path d="M32 7 V30"/><path d="M20 12 A24 24 0 1 0 44 12"/></svg></div>
   <form action="{{ url_for('login') }}" method="post">
     <input type="hidden" name="csrf" value="{{ csrf }}">
     <label class="sr-only" for="pw">密码</label>
@@ -79,11 +77,9 @@ h1{font-size:26px;letter-spacing:.04em;text-align:center;margin:1px 0 7px}
   {% if message %}<p class="login-error" role="alert">{{ message }}</p>{% endif %}
 </section>
 {% else %}
-<h1>NAS 远程唤醒</h1><p class="lead">点击圆形按钮向家庭 NAS 发送网络唤醒数据包</p>
-<div class="btn-box"><button id="wakeButton" class="wake" type="button"><svg class="power-icon" viewBox="0 0 64 64" role="img" aria-label="电源" xmlns="http://www.w3.org/2000/svg"><path d="M32 7 V30"/><path d="M20 12 A24 24 0 1 0 44 12"/></svg><span class="wake-text">唤醒</span></button></div>
-<div id="feedback" class="feedback" aria-live="polite">准备就绪</div>
+<div class="btn-box"><button id="wakeButton" class="wake" type="button" aria-label="唤醒 NAS"><svg class="power-icon" viewBox="0 0 64 64" role="img" aria-label="电源" xmlns="http://www.w3.org/2000/svg"><path d="M32 7 V30"/><path d="M20 12 A24 24 0 1 0 44 12"/></svg></button></div>
+<div id="feedback" class="feedback" aria-live="polite"></div>
 <section class="history" aria-label="最近五条发送记录"><div class="heading"><strong>发送记录 <small>最近 5 条 · 北京时间</small></strong><button id="refreshButton" class="refresh" type="button">↻ 刷新</button></div><div id="historyList" class="empty">加载中...</div></section>
-<div class="foot">发送成功仅表示数据包已交给 VPS 网络协议栈，不代表 NAS 已开机</div>
 <script>
 const csrf = {{ csrf|tojson }};
 const historyList = document.getElementById('historyList');
