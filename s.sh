@@ -1,1551 +1,1008 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# s.sh - Standalone S-UI + sing-box manager, independent of xpro.sh / 3X-UI.
+# User owned /etc/nginx/sites-enabled/wow and /www/wow/public are never edited.
+# Embedded Python helpers are extracted locally on demand; only s.sh is required.
+set -Eeuo pipefail
+umask 077
 
-# -----------------------
-# 彩色输出函数
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
+SUI_MANAGER_VERSION='2026.10.25-isolated-1'
+SUI_VERSION='v1.6.5'
+SUI_DOMAIN_DEFAULT='wow.xyrq.de'
+SUI_HOME='/root/sui-pro'
+SUI_LIB="$SUI_HOME/internal"
+SUI_API_MANAGER="$SUI_LIB/sui_manage.py"
+SUI_NGINX_INSPECTOR="$SUI_LIB/nginx_legacy_cleanup.py"
+SUI_NGINX_BRIDGE='/etc/nginx/conf.d/sui-managed-reality-bridge.conf'
+SUI_LOG="$SUI_HOME/install.log"
+SUI_HTTP_BACKEND_PORT=8080
+SUI_BRIDGE_PORT=''
+SUI_DOMAIN=''
+SUI_USER_SITE=''
+SUI_CERT=''
+SUI_KEY=''
+SUI_NEW_INSTALL=0
+SUI_NEW_BRIDGE=0
+SUI_TRANSACTION=0
+SUI_COMMITTED=0
+SUI_LEGACY_BACKUP=''
 
-# -----------------------
-# 检测系统类型
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        OS_ID="${ID:-}"
-        OS_ID_LIKE="${ID_LIKE:-}"
+info() { printf '[INFO] %s\n' "$*"; }
+warn() { printf '[WARN] %s\n' "$*" >&2; }
+ok() { printf '[OK] %s\n' "$*"; }
+fail() { printf '[ERROR] %s\n' "$*" >&2; return 1; }
+need_root() { (( EUID == 0 )) || fail '请以 root 身份运行'; }
+read_console() {
+    local name="$1" prompt="$2" value=''
+    if [[ -t 0 ]]; then IFS= read -e -r -p "$prompt" value; else IFS= read -r -p "$prompt" value; fi
+    printf -v "$name" '%s' "$value"
+}
+valid_domain() {
+    [[ "$1" =~ ^([a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}$ ]] && [[ "$1" != *..* ]]
+}
+require_cmds() {
+    local exe
+    for exe in bash python3 curl nginx openssl ss systemctl tar sha256sum; do
+        command -v "$exe" >/dev/null 2>&1 || fail "缺少命令: $exe；Debian/Ubuntu 可安装：apt-get install -y python3 curl nginx openssl iproute2 ca-certificates"
+    done
+}
+port_listening() {
+    local port="$1"
+    ss -lntH 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${port}$"
+}
+port_owner() { ss -lntp 2>/dev/null | grep -E "(^|:)${1}[[:space:]]" || true; }
+site_http_code() {
+    curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' --connect-timeout 3 --max-time 8 "http://127.0.0.1:${SUI_HTTP_BACKEND_PORT}/" 2>/dev/null || true
+}
+http_ok() { [[ "$1" =~ ^[1-4][0-9][0-9]$ ]]; }
+bridge_http_code() {
+    local port="$1"
+    curl --noproxy '*' --silent --show-error --max-time 8 --connect-timeout 3 \
+        --resolve "${SUI_DOMAIN}:${port}:127.0.0.1" \
+        --output /dev/null --write-out '%{http_code}' \
+        "https://${SUI_DOMAIN}:${port}/" 2>/dev/null || true
+}
+set_domain() {
+    SUI_DOMAIN="${1:-$SUI_DOMAIN_DEFAULT}"
+    valid_domain "$SUI_DOMAIN" || fail "非法域名: $SUI_DOMAIN"
+    SUI_USER_SITE="/etc/nginx/sites-enabled/${SUI_DOMAIN%%.*}"
+    SUI_CERT="${SUI_CERT_FULLCHAIN:-/etc/letsencrypt/live/${SUI_DOMAIN}/fullchain.pem}"
+    SUI_KEY="${SUI_CERT_PRIVKEY:-/etc/letsencrypt/live/${SUI_DOMAIN}/privkey.pem}"
+}
+
+# Inlined helpers are written only to S-UI's private application data directory.
+# They have no dependency on xpro.sh, /root/x.sh or another downloaded package.
+extract_helpers() {
+    need_root
+    mkdir -p "$SUI_LIB"
+    chmod 700 "$SUI_HOME" "$SUI_LIB"
+    cat > "$SUI_API_MANAGER" <<'SUI_EMBED_MANAGER_PY'
+#!/usr/bin/env python3
+"""Provision S-UI v1.6.5 through its first-party, session-authenticated local API.
+No direct modification of S-UI's SQLite database.
+"""
+import argparse
+import getpass
+import http.cookiejar
+import json
+import os
+from pathlib import Path
+import re
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+API_ROOT = os.environ.get('SUI_LOCAL_API', 'http://127.0.0.1:2095/app/api').rstrip('/')
+SB_BIN = os.environ.get('SUI_SINGBOX_BIN', '/usr/local/s-ui/bin/sing-box')
+STATE = Path(os.environ.get('SUI_STATE_FILE', '/root/sui-pro/node-state.json'))
+
+class SetupError(RuntimeError):
+    pass
+
+class SuiAPI:
+    def __init__(self, root=API_ROOT):
+        self.root = root.rstrip('/')
+        self.opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(http.cookiejar.CookieJar()), urllib.request.ProxyHandler({}))
+
+    def call(self, path, fields=None, timeout=12):
+        url = self.root + '/' + path.lstrip('/')
+        payload = None if fields is None else urllib.parse.urlencode(fields).encode('utf-8')
+        req = urllib.request.Request(url, data=payload, headers={'User-Agent': 'SUI-Migration-Manager/1.0', 'Origin': 'http://127.0.0.1:2095', 'Referer': 'http://127.0.0.1:2095/app/'})
+        try:
+            with self.opener.open(req, timeout=timeout) as response:
+                obj = json.loads(response.read().decode('utf-8'))
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            raise SetupError(f'S-UI API 请求失败: {path}: {exc}') from exc
+        if not isinstance(obj, dict) or obj.get('success') is not True:
+            raise SetupError(f'S-UI API 返回错误: {path}: {obj.get("msg", obj) if isinstance(obj, dict) else obj}')
+        return obj.get('obj')
+
+    def login(self, user, password):
+        self.call('login', {'user':user, 'pass':password})
+        self.get('tls')  # Check that the session cookie really works
+
+    def get(self, object_type):
+        result = self.call(object_type)
+        if not isinstance(result, dict):
+            raise SetupError(f'{object_type} 返回结构异常: {result!r}')
+        value = result.get(object_type)
+        return value if isinstance(value, list) else []
+
+    def save(self, object_type, data, action='new'):
+        return self.call('save', {'object': object_type, 'action': action, 'data': json.dumps(data, ensure_ascii=False, separators=(',',':'))})
+
+    def get_generated_config(self):
+        url = self.root + '/singbox-config'
+        req = urllib.request.Request(url, headers={
+            'Origin': 'http://127.0.0.1:2095',
+            'Referer': 'http://127.0.0.1:2095/app/',
+            'User-Agent': 'SUI-Migration-Manager/1.0'})
+        try:
+            with self.opener.open(req, timeout=12) as response:
+                return json.loads(response.read().decode('utf-8'))
+        except (urllib.error.URLError, TimeoutError, ValueError) as exc:
+            raise SetupError(f'无法读取 sing-box 生成配置: {exc}') from exc
+
+    def get_first_id(self, object_type, match_field, match_value):
+        for obj in self.get(object_type):
+            if obj.get(match_field) == match_value:
+                return obj.get('id')
+        return None
+
+
+def reality_keys(sing_box=SB_BIN):
+    if not os.path.isfile(sing_box) or not os.access(sing_box, os.X_OK):
+        raise SetupError(f'找不到 sing-box 可执行文件: {sing_box}')
+    p = subprocess.run([sing_box, 'generate', 'reality-keypair'], text=True, capture_output=True, timeout=12)
+    if p.returncode:
+        raise SetupError(f'sing-box 生成密钥失败: {p.stderr.strip()}')
+    priv = re.search(r'(?im)^\s*PrivateKey:\s*(\S+)', p.stdout)
+    pub = re.search(r'(?im)^\s*PublicKey:\s*(\S+)', p.stdout)
+    if not priv or not pub or len(priv.group(1)) != 43 or len(pub.group(1)) != 43:
+        raise SetupError('sing-box 密钥输出格式不符合预期')
+    return priv.group(1), pub.group(1)
+
+
+def pick_id(before, after, match_field, match_val):
+    matches = [x['id'] for x in after if x.get(match_field)==match_val and x.get('id') is not None]
+    if len(matches)!=1:
+        raise SetupError(f'创建 {match_val} 后未找到唯一记录: {matches}')
+    return matches[0]
+
+
+def save_new(api, object_type, data, match_field):
+    key=data[match_field]
+    if api.get_first_id(object_type,match_field,key) is not None:
+        raise SetupError(f'已有同名 {object_type}: {key}；为了保护已有配置，不覆盖')
+    api.save(object_type,data)
+    return pick_id(None,api.get(object_type),match_field,key)
+
+
+def fresh_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1',0))
+        return s.getsockname()[1]
+
+
+class Health(BaseHTTPRequestHandler):
+    def do_GET(self):
+        raw=b'sui-reality-authenticated-ok\n'
+        self.send_response(200)
+        self.send_header('Content-Type','text/plain')
+        self.send_header('Content-Length',str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+    def log_message(self,*args):
+        pass
+
+
+def test_reality(node, sing_box=SB_BIN, mode='reality'):
+    """Authenticate through REALITY or WS+TLS and relay an HTTP request."""
+    if mode not in ('reality','ws'):
+        raise SetupError('未知代理验收类型')
+    echo = HTTPServer(('127.0.0.1',0),Health)
+    echoport=echo.server_port
+    worker=threading.Thread(target=echo.serve_forever, daemon=True)
+    worker.start()
+    socksport=fresh_port()
+    if mode=='reality':
+        outbound={'type':'vless','tag':'proxy','server':'127.0.0.1','server_port':443,
+                  'uuid':node['uuid'],'flow':'xtls-rprx-vision',
+                  'tls':{'enabled':True,'server_name':node['domain'],
+                         'utls':{'enabled':True,'fingerprint':'chrome'},
+                         'reality':{'enabled':True,'public_key':node['public_key'],
+                                    'short_id':node['short_id']}}}
+    else:
+        outbound={'type':'vless','tag':'proxy','server':'127.0.0.1','server_port':2053,
+                  'uuid':node['uuid'],
+                  'tls':{'enabled':True,'server_name':node['domain']},
+                  'transport':{'type':'ws','path':'/xian','headers':{'Host':node['domain']}}}
+    cfg={
+      'log':{'level':'info'},
+      'inbounds':[{'type':'socks','tag':'probe','listen':'127.0.0.1','listen_port':socksport}],
+      'outbounds':[outbound],
+      'route':{'final':'proxy','auto_detect_interface':True}
+    }
+    with tempfile.TemporaryDirectory(prefix='sui-reality-probe-') as td:
+        path=os.path.join(td,'probe.json')
+        with open(path,'w',encoding='utf8') as out:
+            json.dump(cfg,out)
+        check=subprocess.run([sing_box,'check','-c',path],capture_output=True,text=True,timeout=15)
+        if check.returncode:
+            raise SetupError('本地认证测试配置错误: '+(check.stderr.strip() or check.stdout.strip())[-700:])
+        logpath=os.path.join(td,'probe.log')
+        try:
+            with open(logpath,'w',encoding='utf8') as logfile:
+                proc=subprocess.Popen([sing_box,'run','-c',path],stdout=logfile,stderr=subprocess.STDOUT)
+                try:
+                    started=False
+                    for _ in range(30):
+                        if proc.poll() is not None:
+                            break
+                        try:
+                            with socket.create_connection(('127.0.0.1',socksport),timeout=.15):
+                                started=True;break
+                        except OSError:
+                            time.sleep(.2)
+                    if not started:
+                        raise SetupError('临时 sing-box 客户端没有启动')
+                    command=['curl','--noproxy','','-sS','-f','--max-time','9',
+                             '--socks5-hostname',f'127.0.0.1:{socksport}',
+                             f'http://127.0.0.1:{echoport}/health']
+                    answer=subprocess.run(command,capture_output=True,text=True,timeout=14)
+                    if answer.returncode != 0 or answer.stdout != 'sui-reality-authenticated-ok\n':
+                        raise SetupError(f'{mode} 真实代理测试失败: '+(answer.stderr.strip() or answer.stdout.strip())[:300])
+                    return True
+                finally:
+                    proc.terminate()
+                    try: proc.wait(timeout=3)
+                    except subprocess.TimeoutExpired: proc.kill();proc.wait(timeout=3)
+        except SetupError as ex:
+            with open(logpath,encoding='utf8') as handle:
+                last=''.join(handle.readlines()[-12:])
+            raise SetupError(f'{ex}\n临时客户端日志:\n{last[-2200:]}') from ex
+        finally:
+            echo.shutdown()
+            echo.server_close()
+
+
+def build_objects(domain, bridgeport, cert, key, private_key, pub, short_id, client_uuid):
+    tr={
+      'name':'sui-managed-reality-'+domain,
+      'server':{'enabled':True,'server_name':domain,
+                'reality':{'enabled':True,'handshake':{'server':'127.0.0.1','server_port':int(bridgeport)},
+                           'private_key':private_key,'short_id':[short_id]}},
+      'client':{'enabled':True,'server_name':domain,
+                'utls':{'enabled':True,'fingerprint':'chrome'},
+                'reality':{'enabled':True,'public_key':pub,'short_id':short_id}}
+    }
+    tw={
+      'name':'sui-managed-ws-'+domain,
+      'server':{'enabled':True,'server_name':domain,'certificate_path':cert,'key_path':key},
+      'client':{'enabled':True,'server_name':domain,'insecure':False}
+    }
+    reality={
+      'type':'vless','tag':'sui-managed-reality-443','listen':'0.0.0.0','listen_port':443,
+      'addrs':[{'server':domain,'server_port':443}],
+      'out_json':{'type':'vless','server':domain,'server_port':443,'flow':'xtls-rprx-vision'}
+    }
+    ws={
+      'type':'vless','tag':'sui-managed-ws-2053','listen':'0.0.0.0','listen_port':2053,
+      'transport':{'type':'ws','path':'/xian'},
+      'addrs':[{'server':domain,'server_port':2053}],
+      'out_json':{'type':'vless','server':domain,'server_port':2053,'transport':{'type':'ws','path':'/xian'}}
+    }
+    client_name='node-'+client_uuid.replace('-','')
+    client={
+      'enable':True,'name':client_name,'remark':'SUI','volume':0,'expiry':0,
+      'config':{'vless':{'name':client_name,'uuid':client_uuid,'flow':'xtls-rprx-vision'}},
+      'links':[]
+    }
+    return tr,tw,reality,ws,client
+
+
+def write_state(node):
+    STATE.parent.mkdir(parents=True,exist_ok=True)
+    os.chmod(STATE.parent,0o700)
+    temp=STATE.with_suffix('.json.tmp')
+    with open(temp,'w',encoding='utf8') as f:
+        json.dump(node,f,ensure_ascii=False,indent=2)
+        f.write('\n')
+    os.chmod(temp,0o600)
+    os.replace(temp,STATE)
+    # No private key stored by this tool; it lives in S-UI's TLS object.
+    import urllib.parse as up
+    domain=node['domain'];uid=node['uuid'];pub=node['public_key'];sid=node['short_id']
+    params=up.urlencode({'encryption':'none','security':'reality','sni':domain,'fp':'chrome','pbk':pub,'sid':sid,'spx':'/','type':'tcp','flow':'xtls-rprx-vision'})
+    r=f'vless://{uid}@{domain}:443?{params}#SUI-REALITY'
+    wsparams=up.urlencode({'encryption':'none','security':'tls','sni':domain,'host':domain,'type':'ws','path':'/xian'})
+    w=f'vless://{uid}@{domain}:2053?{wsparams}#SUI-WS-TLS'
+    links=STATE.parent/'nodes.txt'
+    links.write_text(r+'\n'+w+'\n',encoding='utf8')
+    links.chmod(0o600)
+    print('REALITY 链接：\n'+r)
+    print('WS+TLS 链接：\n'+w)
+    print(f'保存位置：{links}（权限 600）')
+
+
+def verify_https_panel(domain):
+    """Require a live HTTPS management page after the panel has restarted."""
+    import ssl
+    ctx=ssl._create_unverified_context()
+    opener=urllib.request.build_opener(urllib.request.ProxyHandler({}),
+                                        urllib.request.HTTPSHandler(context=ctx))
+    url='https://127.0.0.1:8443/app/'
+    for _ in range(35):
+        try:
+            req=urllib.request.Request(url,headers={'Host':domain})
+            with opener.open(req,timeout=3) as res:
+                if 200 <= res.status < 400:
+                    return True
+        except urllib.error.HTTPError as ex:
+            if 300 <= ex.code < 400:
+                return True
+        except (urllib.error.URLError, TimeoutError):
+            pass
+        time.sleep(1)
+    raise SetupError('S-UI HTTPS 管理面板 8443 未能在配置后正常启动')
+
+
+def provision(args):
+    username=args.user or input('请输入 S-UI 管理员用户名: ').strip()
+    password=os.environ.get('SUI_ADMIN_PASS') or getpass.getpass('请输入 S-UI 管理员密码（不会回显）: ')
+    if not username or not password:
+        raise SetupError('用户名或密码不能为空')
+    api=SuiAPI()
+    api.login(username,password)
+    print('[OK] 已登录 S-UI 官方本地 API')
+    if STATE.exists():
+        raise SetupError(f'已有 SUI 托管节点记录: {STATE}。请先检查，避免重复创建')
+    tls_entries=api.get('tls')
+    inb_entries=api.get('inbounds')
+    for tag in ('sui-managed-reality-443','sui-managed-ws-2053'):
+        if any(x.get('tag')==tag for x in inb_entries):
+            raise SetupError(f'存在已有节点 {tag}；为了避免覆盖，拒绝重复部署')
+    for name in (f'sui-managed-reality-{args.domain}',f'sui-managed-ws-{args.domain}'):
+        if any(x.get('name')==name for x in tls_entries):
+            raise SetupError(f'存在已有 TLS 记录 {name}；拒绝重复部署')
+    private, pub=reality_keys()
+    uid=str(uuid.uuid4()); sid=os.urandom(4).hex()
+    tr,tw,ir,iw,cl=build_objects(args.domain,args.bridgeport,args.cert,args.key,private,pub,sid,uid)
+    print('[INFO] 创建两个 TLS 配置...')
+    tr_id=save_new(api,'tls',tr,'name')
+    tw_id=save_new(api,'tls',tw,'name')
+    ir['tls_id']=tr_id; iw['tls_id']=tw_id
+    print('[INFO] 创建 VLESS+REALITY 443 和 WS+TLS 2053 入站...')
+    ir_id=save_new(api,'inbounds',ir,'tag')
+    iw_id=save_new(api,'inbounds',iw,'tag')
+    cl['inbounds']=[ir_id,iw_id]
+    print('[INFO] 创建并关联 VLESS 客户端...')
+    cl_id=save_new(api,'clients',cl,'name')
+    # Read-back validation: catches omissions in client/inbound associations.
+    stored_client=[c for c in api.get('clients') if c.get('id')==cl_id]
+    if len(stored_client)!=1 or not set(map(str,[ir_id,iw_id])).issubset(set(map(str,stored_client[0].get('inbounds',[])))):
+        raise SetupError('S-UI 客户端入站关联校验失败')
+    print('[OK] TLS、入站、客户端记录已写入官方 S-UI API')
+    # The generated core configuration must contain this UUID on BOTH inbounds.
+    # This specifically guards against a panel saving the client but omitting it
+    # when constructing the sing-box runtime configuration.
+    generated = api.get_generated_config()
+    if not isinstance(generated, dict):
+        raise SetupError('S-UI 返回的 sing-box 配置不是 JSON 对象')
+    inbound_map={x.get('listen_port'):x for x in generated.get('inbounds',[]) if isinstance(x,dict)}
+    for port in (443,2053):
+        ib=inbound_map.get(port)
+        if not ib:
+            raise SetupError(f'实际 sing-box 配置缺少 {port} 入站')
+        users=ib.get('users',[])
+        if not any(u.get('uuid')==uid for u in users if isinstance(u,dict)):
+            raise SetupError(f'实际 sing-box {port} 入站缺少 UUID；停止切换，不能仅看面板用户列表')
+    print('[OK] sing-box 实际生成配置含 443 和 2053 的有效 UUID')
+    # Keep panel at HTTP localhost only until node test; HTTPS cutover is done afterward.
+    node={'domain':args.domain,'uuid':uid,'public_key':pub,'short_id':sid,
+          'bridgeport':args.bridgeport,'reality_inbound_id':ir_id,
+          'ws_inbound_id':iw_id,'client_id':cl_id}
+    print('[INFO] 检测真实 REALITY 认证和代理链路...')
+    last_err=None
+    for attempt in range(5):
+        try:
+            if test_reality(node):
+                last_err=None
+                break
+        except SetupError as exc:
+            last_err=exc
+            time.sleep(1)
+    if last_err:
+        raise SetupError(str(last_err))
+    print('[PASS] REALITY 已完成认证并成功转发测试 HTTP 请求')
+    print('[INFO] 检测 WS+TLS 2053 的真实认证和代理链路...')
+    last_err=None
+    for attempt in range(5):
+        try:
+            if test_reality(node,mode='ws'):
+                last_err=None
+                break
+        except SetupError as exc:
+            last_err=exc
+            time.sleep(1)
+    if last_err:
+        raise SetupError(str(last_err))
+    print('[PASS] WS+TLS 已完成认证并成功转发测试 HTTP 请求')
+    # Switch web panel to HTTPS 8443 and subscription to HTTPS 2096, preserving other settings.
+    # Saving settings may restart S-UI; no subsequent API writes occur.
+    print('[INFO] 设置 HTTPS 面板 8443、HTTPS 订阅 2096 ...')
+    api.save('settings',{'webPort':'8443','webCertFile':args.cert,'webKeyFile':args.key,
+                         'subPort':'2096','subCertFile':args.cert,'subKeyFile':args.key},'set')
+    # The panel may restart asynchronously after the settings change.
+    verify_https_panel(args.domain)
+    write_state(node)
+    print(f'[PASS] S-UI + sing-box 双协议部署完成。管理页面：https://{args.domain}:8443/app/')
+    print('提示：REALITY 主机名必须使用 DNS only；WS+TLS 此处为直连节点，不能自动等同 CDN。')
+
+
+def show_links(args):
+    if not STATE.exists():
+        raise SetupError('未找到已验收节点记录。请先部署。')
+    data=json.loads(STATE.read_text(encoding='utf8'))
+    write_state(data)
+
+
+def inspect(args):
+    print('S-UI API：',API_ROOT)
+    if STATE.exists():
+        data=json.loads(STATE.read_text(encoding='utf8'))
+        print('节点信息（不显示私钥）：',json.dumps(data,ensure_ascii=False,indent=2))
+    else:
+        print('当前没有 SUI 托管节点验收记录')
+
+
+def health(args):
+    if not STATE.exists():
+        raise SetupError('没有已完成验收的节点记录')
+    node=json.loads(STATE.read_text(encoding='utf-8'))
+    for mode in ('reality', 'ws'):
+        if test_reality(node,mode=mode):
+            print('[PASS] %s 实际代理连接通过' % ('REALITY' if mode=='reality' else 'WS+TLS'))
+
+
+def main():
+    p=argparse.ArgumentParser(description='SUI API 配置与验收')
+    sub=p.add_subparsers(dest='action',required=True)
+    a=sub.add_parser('provision')
+    a.add_argument('--domain',required=True)
+    a.add_argument('--bridgeport',required=True,type=int)
+    a.add_argument('--cert',required=True)
+    a.add_argument('--key',required=True)
+    a.add_argument('--user')
+    sub.add_parser('show-links')
+    sub.add_parser('inspect')
+    sub.add_parser('health')
+    args=p.parse_args()
+    try:
+        if args.action=='provision': provision(args)
+        elif args.action=='show-links':show_links(args)
+        elif args.action=='health': health(args)
+        else:inspect(args)
+    except (SetupError, OSError, subprocess.SubprocessError) as e:
+        print(f'[FAIL] {e}',file=sys.stderr)
+        sys.exit(1)
+
+if __name__=='__main__': main()
+SUI_EMBED_MANAGER_PY
+    cat > "$SUI_NGINX_INSPECTOR" <<'SUI_EMBED_NGINX_PY'
+#!/usr/bin/env python3
+"""Safely quarantine ONLY recognizable old X.sh SSL:8080 configs.
+
+Never edits original HTTP site, certificates, /www, PHP-FPM, or unrelated vhosts.
+The cleanup is optional, and invoked only during explicitly confirmed S-UI migration.
+"""
+from __future__ import annotations
+
+import argparse
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+def nginx_test() -> subprocess.CompletedProcess:
+    return subprocess.run(['nginx', '-t'], text=True, capture_output=True, timeout=20)
+
+
+def site_is_user_http(site: Path, domain: str) -> bool:
+    if not site.is_file():
+        return False
+    src = site.read_text(errors='replace')
+    names = re.findall(r'(?m)^\s*server_name\s+([^;]+);', src)
+    if not any(domain in n.split() for n in names):
+        return False
+    return bool(re.search(r'(?m)^\s*listen\s+127\.0\.0\.1:8080\s*;', src)) and not bool(
+        re.search(r'(?m)^\s*listen\s+[^;]*8080\s+ssl\b', src))
+
+
+def has_tls_8080(src: str) -> bool:
+    return bool(re.search(
+        r'(?m)^\s*listen\s+(?:(?:127\.0\.0\.1|\[::1\]):)?8080\b[^;]*\bssl\b[^;]*;', src))
+
+
+def owned_legacy_candidates(domain: str, root: Path) -> list[Path]:
+    """Only old X.sh generated files with distinctive path/content fingerprints."""
+    result = []
+    # This file is generated by original X.sh and enabled as a symlink.
+    symlink = root / 'sites-enabled' / domain
+    expected = root / 'sites-available' / domain
+    if symlink.is_symlink() and symlink.resolve() == expected.resolve() and expected.is_file():
+        src = expected.read_text(errors='replace')
+        if (has_tls_8080(src)
+                and re.search(r'\bserver_tokens\s+off\s*;', src)
+                and re.search(r'\broot\s+/var/www/html/?\s*;', src)
+                and re.search(r'\binclude\s+/etc/nginx/snippets/includes\.conf\s*;', src)
+                and domain in src):
+            result.append(symlink)
+    # V9+ X.sh-created configs are identified by the exact management marker.
+    managed = root / 'conf.d' / f'xui-pro-fallback-{domain}.conf'
+    if managed.is_file() and not managed.is_symlink():
+        src = managed.read_text(errors='replace')
+        if (src.startswith('# XUI_PRO_MANAGED_FALLBACK_V9\n') or
+                src.startswith('# XUI_PRO_MANAGED_FALLBACK_V12\n')) and has_tls_8080(src):
+            result.append(managed)
+    return result
+
+
+def inspect(domain: str, root: Path, user_site: Path) -> tuple[str, list[Path], str]:
+    if not site_is_user_http(user_site, domain):
+        raise RuntimeError(f'未确认原网站是属于用户的 HTTP 127.0.0.1:8080，保持原样：{user_site}')
+    t = nginx_test()
+    if t.returncode == 0:
+        print('[OK] Nginx 现有配置有效，不进行旧配置迁移')
+        return 'valid', [], ''
+    error = (t.stdout or '') + (t.stderr or '')
+    items = owned_legacy_candidates(domain, root)
+    if ('no "ssl_certificate" is defined' not in error or
+            f'/sites-enabled/{user_site.name}:' not in error or not items):
+        print('[ERROR] Nginx 配置检查失败，且未能确认可安全清理的旧 X.sh 配置。', file=sys.stderr)
+        print(error[-1400:], file=sys.stderr)
+        if items:
+            print('[INFO] 已识别旧文件但错误原因不匹配，出于安全考虑不自动移动。', file=sys.stderr)
+        else:
+            print('[HINT] 请检查 8080 端口上是否还有其他 SSL 配置；原网站不应加证书。', file=sys.stderr)
+        return 'blocked', [], error
+    print(f'[INFO] 原用户网站保持不变：{user_site}')
+    print('[INFO] 已识别以下由旧 X.sh 生成、与 HTTP 8080 冲突的 SSL 配置：')
+    for path in items:
+        print(f'  {path}')
+    print('[INFO] 可在迁移确认后备份并暂时移出 Nginx 加载目录；其他站点完全不动')
+    return 'fixable', items, error
+
+
+def reconcile(domain: str, root: Path, site: Path, backup_root: Path) -> int:
+    state, items, _ = inspect(domain, root, site)
+    if state == 'valid':
+        return 0
+    if state != 'fixable':
+        return 2
+    backup = backup_root / ('nginx-legacy-' + datetime.now().strftime('%Y%m%d-%H%M%S-%f'))
+    backup.mkdir(mode=0o700, parents=True, exist_ok=False)
+    moved = []
+    try:
+        for i, src in enumerate(items):
+            dst = backup / f'{i}-{src.name}'
+            os.replace(src, dst)
+            moved.append((src, dst))
+            print(f'[BACKUP] 仅旧 X.sh SSL 配置：{src} -> {dst}')
+        t = nginx_test()
+        if t.returncode != 0:
+            raise RuntimeError('清理后 nginx -t 仍然失败：\n' + ((t.stdout or '') + (t.stderr or ''))[-1200:])
+        action = 'reload' if subprocess.run(['systemctl', 'is-active', '--quiet', 'nginx'], timeout=10).returncode == 0 else 'start'
+        p = subprocess.run(['systemctl', action, 'nginx'], text=True, capture_output=True, timeout=25)
+        if p.returncode:
+            raise RuntimeError(f'执行 systemctl {action} nginx 失败：{p.stderr[-450:]}')
+        (backup / 'moved.json').write_text(json.dumps([
+            {'original':str(a),'backup':str(b)} for a,b in moved], indent=2), encoding='utf-8')
+        os.chmod(backup / 'moved.json', 0o600)
+        print('[OK] 已解决由旧 X.sh SSL:8080 引起的 Nginx 冲突；原 wow 网站文件未修改')
+        print(f'[INFO] 冲突文件备份：{backup}')
+        return 0
+    except Exception:
+        # Put files back exactly as before: this is a failure, not a forced edit.
+        for src, dst in reversed(moved):
+            if dst.exists() or dst.is_symlink():
+                os.replace(dst, src)
+        print('[ROLLBACK] 已恢复移动过的旧 X.sh 配置；用户网站始终未被修改', file=sys.stderr)
+        raise
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--domain', default='wow.xyrq.de')
+    parser.add_argument('--site', default='/etc/nginx/sites-enabled/wow')
+    parser.add_argument('--nginx-root', default='/etc/nginx')
+    parser.add_argument('--backup-root', default='/root/sui-pro/backups')
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--inspect', action='store_true')
+    mode.add_argument('--apply', action='store_true')
+    args = parser.parse_args()
+    if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9.-]*\.[a-zA-Z]{2,}', args.domain):
+        raise RuntimeError('域名格式不合法')
+    root = Path(args.nginx_root)
+    site = Path(args.site)
+    if args.inspect:
+        state, _, _ = inspect(args.domain, root, site)
+        return 0 if state != 'blocked' else 2
+    if os.geteuid() != 0:
+        raise RuntimeError('执行 --apply 需要 root')
+    return reconcile(args.domain, root, site, Path(args.backup_root))
+
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (RuntimeError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
+        print('[ERROR] ' + str(exc), file=sys.stderr)
+        sys.exit(1)
+SUI_EMBED_NGINX_PY
+    chmod 600 "$SUI_API_MANAGER" "$SUI_NGINX_INSPECTOR"
+    python3 -m py_compile "$SUI_API_MANAGER" "$SUI_NGINX_INSPECTOR" || fail '内嵌 Python 模块语法检查失败'
+}
+
+inspect_nginx() {
+    extract_helpers
+    [[ -f "$SUI_CERT" && -f "$SUI_KEY" ]] || fail "缺少现有证书，请检查 $SUI_CERT 和 $SUI_KEY"
+    openssl x509 -in "$SUI_CERT" -noout -checkend 86400 >/dev/null || fail '证书过期或有效期不足 24 小时'
+    openssl x509 -in "$SUI_CERT" -noout -checkhost "$SUI_DOMAIN" >/dev/null || fail "证书不匹配域名: $SUI_DOMAIN"
+    openssl pkey -in "$SUI_KEY" -noout >/dev/null 2>&1 || fail '证书私钥无法解析'
+    python3 "$SUI_NGINX_INSPECTOR" --inspect --domain "$SUI_DOMAIN" --site "$SUI_USER_SITE" ||
+      fail '原站检查失败：不更改原 wow 网站；请先检查 Nginx 旧冲突配置'
+}
+ports_free() {
+    local p
+    # Never disable X-UI from this program. A stopped-but-enabled old
+    # x-ui service or its daily restart cron can reclaim 443 after reboot.
+    if systemctl is-enabled --quiet x-ui 2>/dev/null; then
+        fail '旧 x-ui.service 仍设置为开机启动。s.sh 不修改旧面板；请先用 xpro.sh 独立卸载，或自行停用 x-ui 服务。'
+    fi
+    if command -v crontab >/dev/null 2>&1 &&
+        crontab -l 2>/dev/null | grep -Eq '(# XUI_PRO_MANAGED_CRON_V9|--xui-guard|--xui-monthly)'; then
+        fail '发现旧 X-UI 的自动重启或健康检查任务，可能占用 443。请先通过 xpro.sh 独立卸载或手动停用旧任务。'
+    fi
+    for p in 443 2053 8443 2095 2096; do
+        if port_listening "$p"; then
+            warn "端口 $p 被占用：$(port_owner "$p" | head -n 1)"
+            fail 'S-UI 不会停止/卸载 3X-UI 或其他服务。请先通过 xpro.sh 菜单 2 独立卸载 3X-UI，或自行停用占用端口的服务，然后重试。'
+        fi
+    done
+    # The official S-UI installer may own the standard sing-box service name.
+    if systemctl cat sing-box >/dev/null 2>&1; then
+        fail '检测到 sing-box.service，为避免覆盖已有独立内核，已终止安装'
+    fi
+}
+site_live() {
+    nginx -t >/dev/null 2>&1 || fail 'Nginx 配置检查失败，不能继续部署'
+    local code
+    code="$(site_http_code)"
+    http_ok "$code" || fail "原 HTTP 网站 127.0.0.1:${SUI_HTTP_BACKEND_PORT} 不可访问（HTTP ${code:-unknown}）"
+    ok "原网站 HTTP ${SUI_HTTP_BACKEND_PORT} 正常 (HTTP $code)，未修改原配置"
+}
+choose_bridge() {
+    local p conf
+    [[ ! -e "$SUI_NGINX_BRIDGE" && ! -L "$SUI_NGINX_BRIDGE" ]] || fail "S-UI 自建回落配置已存在，请先查看 --status：$SUI_NGINX_BRIDGE"
+    conf="$(nginx -T 2>/dev/null || true)"
+    for p in $(seq 8081 8099); do
+        port_listening "$p" && continue
+        if grep -Eq "(^|[;{])[[:space:]]*listen[[:space:]]+([0-9A-Za-z_.:\[\]-]+:)?${p}([[:space:];]|$)" <<< "$conf"; then
+            continue
+        fi
+        SUI_BRIDGE_PORT="$p"; return 0
+    done
+    fail '无法找到空闲的独立 HTTPS 回落端口 (8081..8099)'
+}
+create_bridge() {
+    choose_bridge
+    local tmp code
+    info "创建 S-UI 独立 HTTPS 127.0.0.1:${SUI_BRIDGE_PORT} -> 原网站 HTTP 127.0.0.1:${SUI_HTTP_BACKEND_PORT}"
+    tmp="$(mktemp /etc/nginx/conf.d/.sui-private-XXXXXXXX)" || return 1
+    cat > "$tmp" <<EOF_NGINX
+# SUI-MANAGED-BRIDGE; may be removed ONLY by s.sh.
+# Original site file and PHP files are never touched.
+server {
+    listen 127.0.0.1:${SUI_BRIDGE_PORT} ssl;
+    server_name ${SUI_DOMAIN};
+    ssl_certificate ${SUI_CERT};
+    ssl_certificate_key ${SUI_KEY};
+    ssl_protocols TLSv1.2 TLSv1.3;
+    location / {
+        proxy_pass http://127.0.0.1:${SUI_HTTP_BACKEND_PORT};
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+    }
+}
+EOF_NGINX
+    chmod 600 "$tmp"
+    if ! mv -- "$tmp" "$SUI_NGINX_BRIDGE"; then rm -f -- "$tmp"; return 1; fi
+    SUI_NEW_BRIDGE=1
+    if ! nginx -t; then
+        rm -f -- "$SUI_NGINX_BRIDGE"; SUI_NEW_BRIDGE=0
+        fail 'S-UI 独立 HTTPS 桥接 Nginx 语法失败；已撤销新增文件'
+    fi
+    if systemctl is-active --quiet nginx; then
+        systemctl reload nginx || fail 'Nginx reload 失败'
     else
-        OS_ID=""
-        OS_ID_LIKE=""
+        systemctl start nginx || fail 'Nginx start 失败'
     fi
+    code="$(bridge_http_code "$SUI_BRIDGE_PORT")"
+    http_ok "$code" || fail "HTTPS 回落 ${SUI_BRIDGE_PORT} 不可用（HTTP ${code:-none}）"
+    ok "HTTPS 回落 ${SUI_BRIDGE_PORT} -> HTTP ${SUI_HTTP_BACKEND_PORT} 测试通过"
+}
+install_sui_official() {
+    [[ ! -e /usr/local/s-ui && ! -e /etc/systemd/system/s-ui.service ]] || fail '发现已有 S-UI 安装，拒绝覆盖'
+    local installer
+    installer="$(mktemp /tmp/sui-official-XXXXXXXX.sh)" || return 1
+    info "安装官方 S-UI ${SUI_VERSION}（不自动跟随 latest）..."
+    if ! curl -fLsS --retry 3 --connect-timeout 15 --max-time 60 \
+        -o "$installer" "https://raw.githubusercontent.com/alireza0/s-ui/${SUI_VERSION}/install.sh"; then
+        rm -f "$installer"; fail '官方安装脚本下载失败'; return 1
+    fi
+    if ! bash -n "$installer"; then rm -f "$installer"; fail '官方安装脚本语法有误'; return 1; fi
+    # The upstream installer's default path asks whether to modify settings;
+    # decline, then configure API and HTTPS after sing-box is healthy.
+    # The target was absent before this call, so even partial installation
+    # belongs to the current transaction and may be removed on failure.
+    SUI_NEW_INSTALL=1
+    if ! printf 'n\n' | SUI_LANG=zhcn bash "$installer" "$SUI_VERSION"; then
+        rm -f "$installer"; fail 'S-UI 官方安装失败'; return 1
+    fi
+    rm -f -- "$installer"
+    [[ -x /usr/local/s-ui/sui ]] || fail '未安装 S-UI 可执行文件'
+    systemctl is-active --quiet s-ui || fail 'S-UI 服务未运行'
+    [[ -x /usr/local/s-ui/bin/sing-box ]] || fail '官方包中未找到 sing-box 内核'
+    ok 'S-UI 安装成功，sing-box 内核存在'
+}
+set_sui_admin() {
+    local admin='admin' password code attempt
+    password="$(openssl rand -hex 18)"
+    /usr/local/s-ui/sui admin -username "$admin" -password "$password" >/dev/null || fail 'S-UI 管理员账号更新失败'
+    systemctl restart s-ui
+    code=''
+    for attempt in $(seq 1 25); do
+        code="$(curl --noproxy '*' -s -o /dev/null -w '%{http_code}' --max-time 3 'http://127.0.0.1:2095/app/' || true)"
+        if http_ok "$code"; then break; fi
+        sleep 1
+    done
+    http_ok "$code" || fail 'S-UI 默认本地管理端口 2095 不可用'
+    printf '管理地址: https://%s:8443/app/\n账号: %s\n密码: %s\n' "$SUI_DOMAIN" "$admin" "$password" > "$SUI_HOME/admin.txt"
+    chmod 600 "$SUI_HOME/admin.txt"
+    export SUI_ADMIN_PASS="$password"
+    SUI_ADMIN_USER="$admin"
+}
+rollback_self_owned() {
+    warn 'S-UI 安装没有通过最终验收，撤销本次创建的 S-UI 文件；不操作 3X-UI 或原 wow 站。'
+    systemctl stop s-ui >/dev/null 2>&1 || true
+    if systemctl cat sing-box 2>/dev/null | grep -Fq /usr/local/s-ui/; then
+        systemctl stop sing-box >/dev/null 2>&1 || true
+    fi
+    if (( SUI_NEW_INSTALL == 1 )); then
+        systemctl disable s-ui >/dev/null 2>&1 || true
+        rm -f -- /etc/systemd/system/s-ui.service /usr/bin/s-ui
+        if systemctl cat sing-box 2>/dev/null | grep -Fq /usr/local/s-ui/; then
+            rm -f -- /etc/systemd/system/sing-box.service
+        fi
+        rm -rf -- /usr/local/s-ui
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    if (( SUI_NEW_BRIDGE == 1 )) && [[ -f "$SUI_NGINX_BRIDGE" ]] &&
+            grep -Fq '# SUI-MANAGED-BRIDGE;' "$SUI_NGINX_BRIDGE"; then
+        rm -f -- "$SUI_NGINX_BRIDGE"
+        nginx -t >/dev/null 2>&1 && systemctl reload nginx >/dev/null 2>&1 || true
+    fi
+    warn '未停止/重启/卸载旧 3X-UI；独立 Nginx 老配置备份如有生成，保留在 /root/sui-pro/backups/'
+}
+on_exit() {
+    local rc="$?"
+    trap - EXIT
+    if (( rc != 0 && SUI_TRANSACTION == 1 && SUI_COMMITTED == 0 )); then rollback_self_owned; fi
+    exit "$rc"
+}
+trap on_exit EXIT
 
-    if echo "$OS_ID $OS_ID_LIKE" | grep -qi "alpine"; then
-        OS="alpine"
-    elif echo "$OS_ID $OS_ID_LIKE" | grep -Ei "debian|ubuntu" >/dev/null; then
-        OS="debian"
-    elif echo "$OS_ID $OS_ID_LIKE" | grep -Ei "centos|rhel|fedora" >/dev/null; then
-        OS="redhat"
+precheck_action() {
+    need_root
+    set_domain "${1:-$SUI_DOMAIN_DEFAULT}"
+    require_cmds
+    inspect_nginx
+    ports_free
+    ok '部署前检查通过；不改变任何系统服务'
+}
+install_action() {
+    need_root
+    local domain="${1:-$SUI_DOMAIN_DEFAULT}" flag="${2:-}" choice code
+    set_domain "$domain"
+    require_cmds
+    [[ -f /etc/debian_version ]] || fail '目前只支持 Debian/Ubuntu + systemd'
+    [[ ! -e /usr/local/s-ui && ! -e /etc/systemd/system/s-ui.service ]] || fail '已有 S-UI，拒绝覆盖；请使用 --status'
+    [[ ! -f "$SUI_HOME/node-state.json" ]] || fail '已有 S-UI 节点记录，拒绝覆盖'
+    [[ ! -e "$SUI_NGINX_BRIDGE" && ! -L "$SUI_NGINX_BRIDGE" ]] || fail '已有本工具的 HTTPS 回落配置，拒绝覆盖'
+    ports_free
+    inspect_nginx
+    echo
+    info "待安装：S-UI ${SUI_VERSION} + sing-box，REALITY 443，WS+TLS 2053，面板 HTTPS 8443"
+    info '只管理 S-UI；不会停用/卸载 3X-UI，不修改 wow 原网站或证书。'
+    if [[ "$flag" == --yes ]]; then choice=INSTALL; else
+        read_console choice '输入 INSTALL 确认开始（其他输入取消）: '
+    fi
+    [[ "$choice" == INSTALL ]] || { info '已取消，系统未更改'; return 0; }
+    mkdir -p "$SUI_HOME/backups"; chmod 700 "$SUI_HOME" "$SUI_HOME/backups"
+    touch "$SUI_LOG"; chmod 600 "$SUI_LOG"
+    exec > >(tee -a "$SUI_LOG") 2>&1
+    SUI_TRANSACTION=1
+    # Keep logs without exposing private REALITY keys.
+    info "安装日志：$SUI_LOG"
+    # Only known old X.sh SSL:8080 generated config can be moved, after explicit INSTALL.
+    python3 "$SUI_NGINX_INSPECTOR" --apply --domain "$SUI_DOMAIN" --site "$SUI_USER_SITE" ||
+      fail 'Nginx 老配置无法安全处理；原 wow 文件不受影响'
+    if ! systemctl is-active --quiet nginx; then systemctl start nginx || fail 'Nginx 未能启动'; fi
+    site_live
+    create_bridge
+    install_sui_official
+    set_sui_admin
+    info '通过官方 S-UI API 创建 REALITY、WS+TLS 入站，并执行实际代理验收...'
+    python3 "$SUI_API_MANAGER" provision --domain "$SUI_DOMAIN" --bridgeport "$SUI_BRIDGE_PORT" \
+        --cert "$SUI_CERT" --key "$SUI_KEY" --user "$SUI_ADMIN_USER" ||
+        fail 'S-UI 官方 API 写入或真实代理验收失败'
+    port_listening 443 || fail 'sing-box REALITY 443 没有监听'
+    port_listening 2053 || fail 'sing-box WS+TLS 2053 没有监听'
+    printf 'SUI_DOMAIN=%q\nSUI_BRIDGE_PORT=%q\n' "$SUI_DOMAIN" "$SUI_BRIDGE_PORT" > "$SUI_HOME/installed.env"
+    chmod 600 "$SUI_HOME/installed.env"
+    SUI_COMMITTED=1
+    SUI_TRANSACTION=0
+    ok "安装验收完成；面板 https://${SUI_DOMAIN}:8443/app/"
+    info "管理账号：$SUI_HOME/admin.txt；节点：$SUI_HOME/nodes.txt"
+    info '只需使用 s.sh 管理 S-UI，原 xpro.sh 与本工具没有调用关系。'
+}
+status_action() {
+    printf 'S-UI 独立管理脚本：%s；S-UI 固定版本：%s\n' "$SUI_MANAGER_VERSION" "$SUI_VERSION"
+    printf 'S-UI 服务：'; systemctl is-active s-ui 2>/dev/null || true
+    printf 'Nginx 服务：'; systemctl is-active nginx 2>/dev/null || true
+    if command -v ss >/dev/null 2>&1; then
+        printf '相关端口：\n'; ss -lntp 2>/dev/null | grep -E ':(443|2053|8443|8080|8081|8082|2095|2096)([[:space:]]|$)' || true
+    fi
+    [[ ! -f "$SUI_HOME/node-state.json" ]] || {
+        extract_helpers
+        python3 "$SUI_API_MANAGER" inspect
+    }
+    if [[ -f "$SUI_NGINX_BRIDGE" ]]; then
+        grep -Fq '# SUI-MANAGED-BRIDGE;' "$SUI_NGINX_BRIDGE" &&
+          ok "本脚本独立回落配置：$SUI_NGINX_BRIDGE"
+    fi
+    if command -v nginx >/dev/null 2>&1; then nginx -t 2>&1 || true; fi
+}
+links_action() {
+    [[ -f "$SUI_HOME/nodes.txt" ]] || fail '尚未有 S-UI 生成并通过验收的节点'
+    cat "$SUI_HOME/nodes.txt"
+}
+probe_action() {
+    [[ -f "$SUI_HOME/node-state.json" ]] || fail '没有 S-UI 节点状态，先安装并验收'
+    extract_helpers
+    python3 "$SUI_API_MANAGER" health
+}
+control_action() {
+    need_root
+    local action="$1"
+    if [[ "$action" == stop ]]; then
+        systemctl stop s-ui || fail 'S-UI 停止失败'
+        if systemctl cat sing-box 2>/dev/null | grep -Fq /usr/local/s-ui/; then
+            systemctl stop sing-box >/dev/null 2>&1 || true
+        fi
     else
-        OS="unknown"
+        systemctl "$action" s-ui || fail "S-UI ${action} 失败；请检查端口与日志"
     fi
+    ok "S-UI 已执行 $action；没有操作 3X-UI"
 }
-
-detect_os
-info "检测到系统: $OS (${OS_ID:-unknown})"
-
-# -----------------------
-# 检查 root 权限
-check_root() {
-    if [ "$(id -u)" != "0" ]; then
-        err "此脚本需要 root 权限"
-        err "请使用: sudo bash -c \"\$(curl -fsSL ...)\" 或切换到 root 用户"
-        exit 1
+uninstall_action() {
+    need_root
+    local answer='' backup conf_saved='' db=''
+    if [[ ! -e /usr/local/s-ui && ! -f /etc/systemd/system/s-ui.service ]]; then
+        info '没有检测到 S-UI 面板，无需卸载；其他服务和网站未改变'
+        return 0
     fi
-}
-
-check_root
-
-# -----------------------
-# 安装依赖
-install_deps() {
-    info "安装系统依赖..."
-    
-    case "$OS" in
-        alpine)
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --no-cache bash curl ca-certificates openssl openrc jq || {
-                err "依赖安装失败"
-                exit 1
-            }
-            ;;
-        debian)
-            export DEBIAN_FRONTEND=noninteractive
-            apt-get update -y || { err "apt update 失败"; exit 1; }
-            apt-get install -y curl ca-certificates openssl jq || {
-                err "依赖安装失败"
-                exit 1
-            }
-            ;;
-        redhat)
-            yum install -y curl ca-certificates openssl jq || {
-                err "依赖安装失败"
-                exit 1
-            }
-            ;;
-        *)
-            warn "未识别的系统类型,尝试继续..."
-            ;;
-    esac
-    
-    info "依赖安装完成"
-}
-
-install_deps
-
-# -----------------------
-# 工具函数
-# 生成随机端口
-rand_port() {
-    local port
-    port=$(shuf -i 10000-60000 -n 1 2>/dev/null) || port=$((RANDOM % 50001 + 10000))
-    echo "$port"
-}
-
-# 生成随机密码
-rand_pass() {
-    local pass
-    pass=$(openssl rand -base64 16 2>/dev/null | tr -d '\n\r') || pass=$(head -c 16 /dev/urandom | base64 2>/dev/null | tr -d '\n\r')
-    echo "$pass"
-}
-
-# 生成UUID
-rand_uuid() {
-    local uuid
-    if [ -f /proc/sys/kernel/random/uuid ]; then
-        uuid=$(cat /proc/sys/kernel/random/uuid)
-    else
-        uuid=$(openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/')
+    printf '仅卸载 S-UI 及其自带 sing-box。不会卸载 3X-UI，也不会删除原网站、证书、PHP 或 Nginx 原站配置。\n'
+    read_console answer '确认卸载 S-UI？(y/N): '
+    [[ "$answer" =~ ^[Yy]$ ]] || { info '已取消卸载'; return 0; }
+    backup="$SUI_HOME/backups/sui-before-uninstall-$(date +%Y%m%d_%H%M%S)-$$"
+    mkdir -p "$backup"; chmod 700 "$backup"
+    db='/usr/local/s-ui/db/s-ui.db'
+    if [[ -f "$db" ]]; then
+        python3 - "$db" "$backup/s-ui.db" <<'SUI_SQLITE_BACKUP'
+import sqlite3,sys
+src=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True,timeout=10)
+dst=sqlite3.connect(sys.argv[2],timeout=10)
+src.backup(dst)
+dst.close();src.close()
+SUI_SQLITE_BACKUP
+        [[ -s "$backup/s-ui.db" ]] || fail 'S-UI 数据库备份失败，已中止卸载'
+        chmod 600 "$backup/s-ui.db"
     fi
-    echo "$uuid"
+    [[ ! -f "$SUI_HOME/node-state.json" ]] || cp -a "$SUI_HOME/node-state.json" "$backup/"
+    [[ ! -f "$SUI_HOME/nodes.txt" ]] || cp -a "$SUI_HOME/nodes.txt" "$backup/"
+    [[ ! -f "$SUI_HOME/admin.txt" ]] || cp -a "$SUI_HOME/admin.txt" "$backup/"
+    systemctl stop s-ui >/dev/null 2>&1 || true
+    systemctl disable s-ui >/dev/null 2>&1 || true
+    if systemctl cat sing-box 2>/dev/null | grep -Fq /usr/local/s-ui/; then
+        systemctl stop sing-box >/dev/null 2>&1 || true
+        systemctl disable sing-box >/dev/null 2>&1 || true
+        rm -f -- /etc/systemd/system/sing-box.service
+    fi
+    rm -f -- /etc/systemd/system/s-ui.service /usr/bin/s-ui
+    rm -rf -- /usr/local/s-ui
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -f "$SUI_NGINX_BRIDGE" ]] && grep -Fq '# SUI-MANAGED-BRIDGE;' "$SUI_NGINX_BRIDGE"; then
+        conf_saved="$backup/bridge.conf"
+        cp -a "$SUI_NGINX_BRIDGE" "$conf_saved"
+        rm -f -- "$SUI_NGINX_BRIDGE"
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx >/dev/null 2>&1 || warn 'Nginx reload 未成功，网站配置没有被改动'
+        else
+            cp -a "$conf_saved" "$SUI_NGINX_BRIDGE"
+            warn '移除 S-UI 私有回落后 Nginx 检查失败，已还原私有回落配置'
+        fi
+    fi
+    rm -f -- "$SUI_HOME/node-state.json" "$SUI_HOME/nodes.txt" "$SUI_HOME/admin.txt" "$SUI_HOME/installed.env"
+    ok 'S-UI + 其自带 sing-box 已独立卸载。未操作 3X-UI 或原 wow 网站。'
+    info "备份目录：$backup"
 }
-
-# -----------------------
-# 配置节点名称后缀
-echo "请输入节点名称(留空则默认议名):"
-read -r user_name
-if [[ -n "$user_name" ]]; then
-    suffix="-${user_name}"
-    echo "$suffix" > /root/node_names.txt
-else
-    suffix=""
-fi
-
-# -----------------------
-# 选择要部署的协议
-select_protocols() {
-    info "=== 选择要部署的协议 ==="
-    echo "1) Shadowsocks (SS)"
-    echo "2) Hysteria2 (HY2)"
-    echo "3) TUIC"
-    echo "4) VLESS Reality"
-    echo ""
-    echo "请输入要部署的协议编号(多个用空格分隔,如: 1 2 4):"
-    read -r protocol_input
-    
-    # 使用全局变量
-    ENABLE_SS=false
-    ENABLE_HY2=false
-    ENABLE_TUIC=false
-    ENABLE_REALITY=false
-    
-    for num in $protocol_input; do
-        case "$num" in
-            1) ENABLE_SS=true ;;
-            2) ENABLE_HY2=true ;;
-            3) ENABLE_TUIC=true ;;
-            4) ENABLE_REALITY=true ;;
-            *) warn "无效选项: $num" ;;
+menu() {
+    while :; do
+        printf '\n============ S-UI + sing-box ============\n'
+        printf '1) 安装 S-UI / 创建 REALITY + WS+TLS\n'
+        printf '2) 卸载 S-UI（独立）\n'
+        printf '3) 查看状态\n4) 显示节点链接\n5) 代理真实连接测试\n'
+        printf '6) 启动 S-UI\n7) 停止 S-UI\n8) 重启 S-UI\n9) 安装前检查\n0) 退出\n'
+        local choice='' rc=0
+        read_console choice '请选择 [0-9]: ' || return 0
+        case "$choice" in
+            1) bash "$0" --install "$SUI_DOMAIN_DEFAULT" || rc=$? ;;
+            2) bash "$0" --uninstall || rc=$? ;;
+            3) bash "$0" --status || rc=$? ;;
+            4) bash "$0" --links || rc=$? ;;
+            5) bash "$0" --test || rc=$? ;;
+            6) bash "$0" --start || rc=$? ;;
+            7) bash "$0" --stop || rc=$? ;;
+            8) bash "$0" --restart || rc=$? ;;
+            9) bash "$0" --precheck "$SUI_DOMAIN_DEFAULT" || rc=$? ;;
+            0) return 0 ;;
+            *) warn '无效输入' ;;
         esac
+        if (( rc != 0 )); then warn "本次操作未完成 (exit=${rc})，未自动执行其他菜单操作"; fi
     done
-    
-    if ! $ENABLE_SS && ! $ENABLE_HY2 && ! $ENABLE_TUIC && ! $ENABLE_REALITY; then
-        err "未选择任何协议,退出安装"
-        exit 1
-    fi
-    
-    # 保存协议选择到文件（确保持久化）
-    mkdir -p /etc/sing-box
-    cat > /etc/sing-box/.protocols <<EOF
-ENABLE_SS=$ENABLE_SS
-ENABLE_HY2=$ENABLE_HY2
-ENABLE_TUIC=$ENABLE_TUIC
-ENABLE_REALITY=$ENABLE_REALITY
-EOF
-    
-    info "已选择协议:"
-    $ENABLE_SS && echo "  - Shadowsocks"
-    $ENABLE_HY2 && echo "  - Hysteria2"
-    $ENABLE_TUIC && echo "  - TUIC"
-    $ENABLE_REALITY && echo "  - VLESS Reality"
-    
-    # 导出为全局变量（确保后续脚本可以访问）
-    export ENABLE_SS
-    export ENABLE_HY2
-    export ENABLE_TUIC
-    export ENABLE_REALITY
 }
 
-# 创建配置目录
-mkdir -p /etc/sing-box
-select_protocols
-
-# -----------------------
-# 选择SS加密方式（新增）
-select_ss_method() {
-    if ! $ENABLE_SS; then
-        SS_METHOD="2022-blake3-aes-128-gcm"
-        return 0
-    fi
-    
-    info "=== 选择 Shadowsocks 加密方式 ==="
-    echo "1) 2022-blake3-aes-128-gcm (推荐)"
-    echo "2) aes-128-gcm"
-    echo ""
-    echo "请输入选择(默认为 1):"
-    read -r ss_method_choice
-    
-    case "${ss_method_choice:-1}" in
-        1) SS_METHOD="2022-blake3-aes-128-gcm" ;;
-        2) SS_METHOD="aes-128-gcm" ;;
-        *) 
-            warn "无效选择，使用默认方式: 2022-blake3-aes-128-gcm"
-            SS_METHOD="2022-blake3-aes-128-gcm"
+main() {
+    case "${1:-}" in
+        --install) shift; install_action "${1:-$SUI_DOMAIN_DEFAULT}" "${2:-}" ;;
+        --precheck) shift; precheck_action "${1:-$SUI_DOMAIN_DEFAULT}" ;;
+        --uninstall) uninstall_action ;;
+        --status) status_action ;;
+        --links) links_action ;;
+        --test) probe_action ;;
+        --start) control_action start ;;
+        --stop) control_action stop ;;
+        --restart) control_action restart ;;
+        --help|-h)
+            printf '用法: bash s.sh [--install [domain] [--yes]|--precheck [domain]|--uninstall|--status|--links|--test|--start|--stop|--restart]\n'
             ;;
-    esac
-    
-    info "已选择加密方式: $SS_METHOD"
-    export SS_METHOD
-}
-
-select_ss_method
-
-# -----------------------
-# 在获取公网 IP 之前，询问连接ip和sni配置
-echo ""
-echo "请输入节点连接 IP 或 DDNS域名(留空默认出口IP):"
-read -r CUSTOM_IP
-CUSTOM_IP="$(echo "$CUSTOM_IP" | tr -d '[:space:]')"
-
-# 如果用户选择了 Reality 协议，询问 server_name(SNI)
-REALITY_SNI=""
-if $ENABLE_REALITY; then
-    echo ""
-    echo "请输入 Reality 的 SNI(留空默认 addons.mozilla.org):"
-    read -r REALITY_SNI
-    REALITY_SNI="$(echo "${REALITY_SNI:-addons.mozilla.org}" | tr -d '[:space:]')"
-else
-    # 也设默认，方便后续统一处理（若未选 reality，也写入缓存以便 sb 读取）
-    REALITY_SNI="addons.mozilla.org"
-fi
-
-# 将用户选择写入缓存
-mkdir -p /etc/sing-box
-# preserve existing cache if any (append/overwrite relevant keys)
-# 最简单直接：在后面 create_config 也会写入 .config_cache，先写初始值以便中间步骤可读取
-echo "CUSTOM_IP=$CUSTOM_IP" > /etc/sing-box/.config_cache.tmp || true
-echo "REALITY_SNI=$REALITY_SNI" >> /etc/sing-box/.config_cache.tmp || true
-# 保留其他可能已有的缓存条目（若存在老的 .config_cache），把新临时与旧文件合并（保新值覆盖旧值）
-if [ -f /etc/sing-box/.config_cache ]; then
-    # 将旧文件中不在新文件内的行追加
-    awk 'FNR==NR{a[$1]=1;next} {split($0,k,"="); if(!(k[1] in a)) print $0}' /etc/sing-box/.config_cache.tmp /etc/sing-box/.config_cache >> /etc/sing-box/.config_cache.tmp2 || true
-    mv /etc/sing-box/.config_cache.tmp2 /etc/sing-box/.config_cache.tmp || true
-fi
-mv /etc/sing-box/.config_cache.tmp /etc/sing-box/.config_cache || true
-
-# -----------------------
-# 生成随机端口
-rand_port() {
-    shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000))
-}
-
-# 生成随机密码
-rand_pass() {
-    openssl rand -base64 16 | tr -d '\n\r' || head -c 16 /dev/urandom | base64 | tr -d '\n\r'
-}
-
-# 生成UUID
-rand_uuid() {
-    cat /proc/sys/kernel/random/uuid
-}
-
-# -----------------------
-# 配置端口和密码
-get_config() {
-    info "开始配置端口和密码..."
-    
-    if $ENABLE_SS; then
-        info "=== 配置 Shadowsocks (SS) ==="
-        if [ -n "${SINGBOX_PORT_SS:-}" ]; then
-            PORT_SS="$SINGBOX_PORT_SS"
-        else
-            read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_PORT_SS
-            PORT_SS="${USER_PORT_SS:-$(rand_port)}"
-        fi
-        PSK_SS=$(rand_pass)
-        info "SS 端口: $PORT_SS"
-        info "SS 加密方式: $SS_METHOD"
-        info "SS 密码已自动生成"
-    fi
-
-    if $ENABLE_HY2; then
-        info "=== 配置 Hysteria2 (HY2) ==="
-        if [ -n "${SINGBOX_PORT_HY2:-}" ]; then
-            PORT_HY2="$SINGBOX_PORT_HY2"
-        else
-            read -p "请输入 HY2 端口(留空则随机 10000-60000): " USER_PORT_HY2
-            PORT_HY2="${USER_PORT_HY2:-$(rand_port)}"
-        fi
-        PSK_HY2=$(rand_pass)
-        info "HY2 端口: $PORT_HY2"
-        info "HY2 密码已自动生成"
-    fi
-
-    if $ENABLE_TUIC; then
-        info "=== 配置 TUIC ==="
-        if [ -n "${SINGBOX_PORT_TUIC:-}" ]; then
-            PORT_TUIC="$SINGBOX_PORT_TUIC"
-        else
-            read -p "请输入 TUIC 端口(留空则随机 10000-60000): " USER_PORT_TUIC
-            PORT_TUIC="${USER_PORT_TUIC:-$(rand_port)}"
-        fi
-        PSK_TUIC=$(rand_pass)
-        UUID_TUIC=$(rand_uuid)
-        info "TUIC 端口: $PORT_TUIC"
-        info "TUIC UUID 和密码已自动生成"
-    fi
-
-    if $ENABLE_REALITY; then
-        info "=== 配置 VLESS Reality ==="
-        if [ -n "${SINGBOX_PORT_REALITY:-}" ]; then
-            PORT_REALITY="$SINGBOX_PORT_REALITY"
-        else
-            read -p "请输入 VLESS Reality 端口(留空则随机 10000-60000): " USER_PORT_REALITY
-            PORT_REALITY="${USER_PORT_REALITY:-$(rand_port)}"
-        fi
-        UUID=$(rand_uuid)
-        info "Reality 端口: $PORT_REALITY"
-        info "Reality UUID 已自动生成"
-    fi
-    
-    info "配置完成，继续安装..."
-}
-
-get_config
-
-# -----------------------
-# 安装 sing-box
-install_singbox() {
-    info "开始安装 sing-box..."
-
-    if command -v sing-box >/dev/null 2>&1; then
-        CURRENT_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
-        warn "检测到已安装 sing-box: $CURRENT_VERSION"
-        read -p "是否重新安装?(y/N): " REINSTALL
-        if [[ ! "$REINSTALL" =~ ^[Yy]$ ]]; then
-            info "跳过 sing-box 安装"
-            return 0
-        fi
-    fi
-
-    case "$OS" in
-        alpine)
-            info "使用 Edge 仓库安装 sing-box"
-            apk update || { err "apk update 失败"; exit 1; }
-            apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box || {
-                err "sing-box 安装失败"
-                exit 1
-            }
-            ;;
-        debian|redhat)
-            bash <(curl -fsSL https://sing-box.app/install.sh) || {
-                err "sing-box 安装失败"
-                exit 1
-            }
-            ;;
-        *)
-            err "未支持的系统,无法安装 sing-box"
-            exit 1
-            ;;
-    esac
-
-    if ! command -v sing-box >/dev/null 2>&1; then
-        err "sing-box 安装后未找到可执行文件"
-        exit 1
-    fi
-
-    INSTALLED_VERSION=$(sing-box version 2>/dev/null | head -1 || echo "unknown")
-    info "sing-box 安装成功: $INSTALLED_VERSION"
-}
-
-install_singbox
-
-# -----------------------
-# 生成 Reality 密钥对（必须在 sing-box 安装之后）
-generate_reality_keys() {
-    if ! $ENABLE_REALITY; then
-        info "跳过 Reality 密钥生成（未选择 Reality 协议）"
-        return 0
-    fi
-    
-    info "生成 Reality 密钥对..."
-    
-    if ! command -v sing-box >/dev/null 2>&1; then
-        err "sing-box 未安装，无法生成 Reality 密钥"
-        exit 1
-    fi
-    
-    REALITY_KEYS=$(sing-box generate reality-keypair 2>&1) || {
-        err "生成 Reality 密钥失败"
-        exit 1
-    }
-    
-    REALITY_PK=$(echo "$REALITY_KEYS" | grep "PrivateKey" | awk '{print $NF}' | tr -d '\r')
-    REALITY_PUB=$(echo "$REALITY_KEYS" | grep "PublicKey" | awk '{print $NF}' | tr -d '\r')
-    REALITY_SID=$(sing-box generate rand 8 --hex 2>&1) || {
-        err "生成 Reality ShortID 失败"
-        exit 1
-    }
-    
-    if [ -z "$REALITY_PK" ] || [ -z "$REALITY_PUB" ] || [ -z "$REALITY_SID" ]; then
-        err "Reality 密钥生成结果为空"
-        exit 1
-    fi
-    
-    mkdir -p /etc/sing-box
-    echo -n "$REALITY_PUB" > /etc/sing-box/.reality_pub
-    echo -n "$REALITY_SID" > /etc/sing-box/.reality_sid
-    
-    info "Reality 密钥已生成"
-}
-
-generate_reality_keys
-
-# -----------------------
-# 生成 HY2/TUIC 自签证书(仅在需要时)
-generate_cert() {
-    if ! $ENABLE_HY2 && ! $ENABLE_TUIC; then
-        info "跳过证书生成(未选择 HY2 或 TUIC)"
-        return 0
-    fi
-    
-    info "生成 HY2/TUIC 自签证书..."
-    mkdir -p /etc/sing-box/certs
-    
-    if [ ! -f /etc/sing-box/certs/fullchain.pem ] || [ ! -f /etc/sing-box/certs/privkey.pem ]; then
-        openssl req -x509 -newkey rsa:2048 -nodes \
-          -keyout /etc/sing-box/certs/privkey.pem \
-          -out /etc/sing-box/certs/fullchain.pem \
-          -days 3650 \
-          -subj "/CN=www.bing.com" || {
-            err "证书生成失败"
-            exit 1
-        }
-        info "证书已生成"
-    else
-        info "证书已存在"
-    fi
-}
-
-generate_cert
-
-# -----------------------
-# 生成配置文件
-CONFIG_PATH="/etc/sing-box/config.json"
-
-create_config() {
-    info "生成配置文件: $CONFIG_PATH"
-
-    mkdir -p "$(dirname "$CONFIG_PATH")"
-
-    # 构建 inbounds 内容（使用临时文件避免字符串处理问题）
-    local TEMP_INBOUNDS="/tmp/singbox_inbounds_$.json"
-    > "$TEMP_INBOUNDS"
-    
-    local need_comma=false
-    
-    if $ENABLE_SS; then
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_SS'
-    {
-      "type": "shadowsocks",
-      "listen": "::",
-      "listen_port": PORT_SS_PLACEHOLDER,
-      "method": "METHOD_SS_PLACEHOLDER",
-      "password": "PSK_SS_PLACEHOLDER",
-      "tag": "ss-in"
-    }
-INBOUND_SS
-        sed -i "s|PORT_SS_PLACEHOLDER|$PORT_SS|g" "$TEMP_INBOUNDS"
-        sed -i "s|METHOD_SS_PLACEHOLDER|$SS_METHOD|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_SS_PLACEHOLDER|$PSK_SS|g" "$TEMP_INBOUNDS"
-        need_comma=true
-    fi
-    
-    if $ENABLE_HY2; then
-        $need_comma && echo "," >> "$TEMP_INBOUNDS"
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_HY2'
-    {
-      "type": "hysteria2",
-      "tag": "hy2-in",
-      "listen": "::",
-      "listen_port": PORT_HY2_PLACEHOLDER,
-      "users": [
-        {
-          "password": "PSK_HY2_PLACEHOLDER"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "/etc/sing-box/certs/fullchain.pem",
-        "key_path": "/etc/sing-box/certs/privkey.pem"
-      }
-    }
-INBOUND_HY2
-        sed -i "s|PORT_HY2_PLACEHOLDER|$PORT_HY2|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_HY2_PLACEHOLDER|$PSK_HY2|g" "$TEMP_INBOUNDS"
-        need_comma=true
-    fi
-    
-    if $ENABLE_TUIC; then
-        $need_comma && echo "," >> "$TEMP_INBOUNDS"
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_TUIC'
-    {
-      "type": "tuic",
-      "tag": "tuic-in",
-      "listen": "::",
-      "listen_port": PORT_TUIC_PLACEHOLDER,
-      "users": [
-        {
-          "uuid": "UUID_TUIC_PLACEHOLDER",
-          "password": "PSK_TUIC_PLACEHOLDER"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "alpn": ["h3"],
-        "certificate_path": "/etc/sing-box/certs/fullchain.pem",
-        "key_path": "/etc/sing-box/certs/privkey.pem"
-      }
-    }
-INBOUND_TUIC
-        sed -i "s|PORT_TUIC_PLACEHOLDER|$PORT_TUIC|g" "$TEMP_INBOUNDS"
-        sed -i "s|UUID_TUIC_PLACEHOLDER|$UUID_TUIC|g" "$TEMP_INBOUNDS"
-        sed -i "s|PSK_TUIC_PLACEHOLDER|$PSK_TUIC|g" "$TEMP_INBOUNDS"
-        need_comma=true
-    fi
-    
-    if $ENABLE_REALITY; then
-        $need_comma && echo "," >> "$TEMP_INBOUNDS"
-        cat >> "$TEMP_INBOUNDS" <<'INBOUND_REALITY'
-    {
-      "type": "vless",
-      "tag": "vless-in",
-      "listen": "::",
-      "listen_port": PORT_REALITY_PLACEHOLDER,
-      "users": [
-        {
-          "uuid": "UUID_REALITY_PLACEHOLDER",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "REALITY_SNI_PLACEHOLDER",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "REALITY_SNI_PLACEHOLDER",
-            "server_port": 443
-          },
-          "private_key": "REALITY_PK_PLACEHOLDER",
-          "short_id": ["REALITY_SID_PLACEHOLDER"]
-        }
-      }
-    }
-INBOUND_REALITY
-        sed -i "s|PORT_REALITY_PLACEHOLDER|$PORT_REALITY|g" "$TEMP_INBOUNDS"
-        sed -i "s|UUID_REALITY_PLACEHOLDER|$UUID|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_PK_PLACEHOLDER|$REALITY_PK|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_SID_PLACEHOLDER|$REALITY_SID|g" "$TEMP_INBOUNDS"
-        sed -i "s|REALITY_SNI_PLACEHOLDER|$REALITY_SNI|g" "$TEMP_INBOUNDS"
-    fi
-
-    # 生成最终配置
-    cat > "$CONFIG_PATH" <<'CONFIG_HEAD'
-{
-  "log": {
-    "level": "info",
-    "timestamp": true
-  },
-  "inbounds": [
-CONFIG_HEAD
-    
-    cat "$TEMP_INBOUNDS" >> "$CONFIG_PATH"
-    
-    cat >> "$CONFIG_PATH" <<'CONFIG_TAIL'
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct-out"
-    }
-  ]
-}
-CONFIG_TAIL
-
-    rm -f "$TEMP_INBOUNDS"
-
-    sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1 \
-       && info "配置文件验证通过" \
-       || warn "配置文件验证失败,但继续执行"
-
-    # 保存配置缓存（追加/覆盖）
-    cat > /etc/sing-box/.config_cache <<CACHEEOF
-ENABLE_SS=$ENABLE_SS
-ENABLE_HY2=$ENABLE_HY2
-ENABLE_TUIC=$ENABLE_TUIC
-ENABLE_REALITY=$ENABLE_REALITY
-CACHEEOF
-
-    $ENABLE_SS && cat >> /etc/sing-box/.config_cache <<CACHEEOF
-SS_PORT=$PORT_SS
-SS_PSK=$PSK_SS
-SS_METHOD=$SS_METHOD
-CACHEEOF
-
-    $ENABLE_HY2 && cat >> /etc/sing-box/.config_cache <<CACHEEOF
-HY2_PORT=$PORT_HY2
-HY2_PSK=$PSK_HY2
-CACHEEOF
-
-    $ENABLE_TUIC && cat >> /etc/sing-box/.config_cache <<CACHEEOF
-TUIC_PORT=$PORT_TUIC
-TUIC_UUID=$UUID_TUIC
-TUIC_PSK=$PSK_TUIC
-CACHEEOF
-
-    $ENABLE_REALITY && cat >> /etc/sing-box/.config_cache <<CACHEEOF
-REALITY_PORT=$PORT_REALITY
-REALITY_UUID=$UUID
-REALITY_PK=$REALITY_PK
-REALITY_SID=$REALITY_SID
-REALITY_PUB=$REALITY_PUB
-REALITY_SNI=$REALITY_SNI
-CACHEEOF
-
-    # 全局写入 CUSTOM_IP（哪怕为空也写）
-    echo "CUSTOM_IP=$CUSTOM_IP" >> /etc/sing-box/.config_cache
-
-    info "配置缓存已保存到 /etc/sing-box/.config_cache"
-}
-
-# 调用配置生成
-create_config
-
-info "配置生成完成，准备设置服务..."
-
-# -----------------------
-# 设置服务
-setup_service() {
-    info "配置系统服务..."
-    
-    if [ "$OS" = "alpine" ]; then
-        SERVICE_PATH="/etc/init.d/sing-box"
-        
-        cat > "$SERVICE_PATH" <<'OPENRC'
-#!/sbin/openrc-run
-
-name="sing-box"
-description="Sing-box Proxy Server"
-command="/usr/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-pidfile="/run/${RC_SVCNAME}.pid"
-command_background="yes"
-output_log="/var/log/sing-box.log"
-error_log="/var/log/sing-box.err"
-# 自动拉起（程序崩溃、OOM、被 kill 后自动恢复）
-supervisor=supervise-daemon
-supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
-
-depend() {
-    need net
-    after firewall
-}
-
-start_pre() {
-    checkpath --directory --mode 0755 /var/log
-    checkpath --directory --mode 0755 /run
-}
-OPENRC
-        
-        chmod +x "$SERVICE_PATH"
-        rc-update add sing-box default >/dev/null 2>&1 || warn "添加开机自启失败"
-        rc-service sing-box restart || {
-            err "服务启动失败"
-            tail -20 /var/log/sing-box.err 2>/dev/null || tail -20 /var/log/sing-box.log 2>/dev/null || true
-            exit 1
-        }
-        
-        sleep 2
-        if rc-service sing-box status >/dev/null 2>&1; then
-            info "✅ OpenRC 服务已启动"
-        else
-            err "服务状态异常"
-            exit 1
-        fi
-        
-    else
-        SERVICE_PATH="/etc/systemd/system/sing-box.service"
-        
-        cat > "$SERVICE_PATH" <<'SYSTEMD'
-[Unit]
-Description=Sing-box Proxy Server
-Documentation=https://sing-box.sagernet.org
-After=network.target nss-lookup.target
-Wants=network.target
-
-[Service]
-Type=simple
-User=root
-WorkingDirectory=/etc/sing-box
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
-ExecReload=/bin/kill -HUP $MAINPID
-Restart=on-failure
-RestartSec=10s
-LimitNOFILE=1048576
-
-[Install]
-WantedBy=multi-user.target
-SYSTEMD
-        
-        systemctl daemon-reload
-        systemctl enable sing-box >/dev/null 2>&1
-        systemctl restart sing-box || {
-            err "服务启动失败"
-            journalctl -u sing-box -n 30 --no-pager
-            exit 1
-        }
-        
-        sleep 2
-        if systemctl is-active sing-box >/dev/null 2>&1; then
-            info "✅ Systemd 服务已启动"
-        else
-            err "服务状态异常"
-            exit 1
-        fi
-    fi
-    
-    info "服务配置完成: $SERVICE_PATH"
-}
-
-setup_service
-
-# -----------------------
-# 获取公网 IP
-get_public_ip() {
-    local ip=""
-    for url in \
-        "https://api.ipify.org" \
-        "https://ipinfo.io/ip" \
-        "https://ifconfig.me" \
-        "https://icanhazip.com" \
-        "https://ipecho.net/plain"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]' || true)
-        if [ -n "$ip" ] && [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            echo "$ip"
-            return 0
-        fi
-    done
-    return 1
-}
-
-# 如果用户提供了 CUSTOM_IP，则优先使用；否则自动检测出口 IP
-if [ -n "${CUSTOM_IP:-}" ]; then
-    PUB_IP="$CUSTOM_IP"
-    info "使用用户提供的连接IP或ddns域名 : $PUB_IP"
-else
-    PUB_IP=$(get_public_ip || echo "YOUR_SERVER_IP")
-    if [ "$PUB_IP" = "YOUR_SERVER_IP" ]; then
-        warn "无法获取公网 IP,请手动替换"
-    else
-        info "检测到公网 IP: $PUB_IP"
-    fi
-fi
-
-# -----------------------
-# 生成链接(仅生成已选择的协议)
-generate_uris() {
-    local host="$PUB_IP"
-    
-    if $ENABLE_SS; then
-        local ss_userinfo="${SS_METHOD}:${PSK_SS}"
-        ss_encoded=$(printf "%s" "$ss_userinfo" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-
-        echo "=== Shadowsocks (SS) ==="
-        echo "ss://${ss_encoded}@${host}:${PORT_SS}#ss${suffix}"
-        echo "ss://${ss_b64}@${host}:${PORT_SS}#ss${suffix}"
-        echo ""
-    fi
-    
-    if $ENABLE_HY2; then
-        hy2_encoded=$(printf "%s" "$PSK_HY2" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        echo "=== Hysteria2 (HY2) ==="
-        echo "hy2://${hy2_encoded}@${host}:${PORT_HY2}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${suffix}"
-        echo ""
-    fi
-
-    if $ENABLE_TUIC; then
-        tuic_encoded=$(printf "%s" "$PSK_TUIC" | sed 's/:/%3A/g; s/+/%2B/g; s/\//%2F/g; s/=/%3D/g')
-        echo "=== TUIC ==="
-        echo "tuic://${UUID_TUIC}:${tuic_encoded}@${host}:${PORT_TUIC}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${suffix}"
-        echo ""
-    fi
-    
-    if $ENABLE_REALITY; then
-        echo "=== VLESS Reality ==="
-        echo "vless://${UUID}@${host}:${PORT_REALITY}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${suffix}"
-        echo ""
-    fi
-}
-
-# -----------------------
-# 最终输出
-echo ""
-echo "=========================================="
-info "🎉 Sing-box 部署完成!"
-echo "=========================================="
-echo ""
-info "📋 配置信息:"
-$ENABLE_SS && echo "   SS 端口: $PORT_SS | 密码: $PSK_SS | 加密: $SS_METHOD"
-$ENABLE_HY2 && echo "   HY2 端口: $PORT_HY2 | 密码: $PSK_HY2"
-$ENABLE_TUIC && echo "   TUIC 端口: $PORT_TUIC | UUID: $UUID_TUIC | 密码: $PSK_TUIC"
-$ENABLE_REALITY && echo "   Reality 端口: $PORT_REALITY | UUID: $UUID"
-echo "   服务器: $PUB_IP"
-echo "   Reality server_name(SNI): ${REALITY_SNI:-addons.mozilla.org}"
-echo ""
-info "📂 文件位置:"
-echo "   配置: $CONFIG_PATH"
-($ENABLE_HY2 || $ENABLE_TUIC) && echo "   证书: /etc/sing-box/certs/"
-echo "   服务: $SERVICE_PATH"
-echo ""
-info "📜 客户端链接:"
-generate_uris | while IFS= read -r line; do
-    echo "   $line"
-done
-echo ""
-info "🔧 管理命令:"
-if [ "$OS" = "alpine" ]; then
-    echo "   启动: rc-service sing-box start"
-    echo "   停止: rc-service sing-box stop"
-    echo "   重启: rc-service sing-box restart"
-    echo "   状态: rc-service sing-box status"
-    echo "   日志: tail -f /var/log/sing-box.log"
-else
-    echo "   启动: systemctl start sing-box"
-    echo "   停止: systemctl stop sing-box"
-    echo "   重启: systemctl restart sing-box"
-    echo "   状态: systemctl status sing-box"
-    echo "   日志: journalctl -u sing-box -f"
-fi
-echo ""
-echo "=========================================="
-
-# -----------------------
-# 创建 sb 管理脚本
-SB_PATH="/usr/local/bin/sb"
-info "正在创建 sb 管理面板: $SB_PATH"
-
-cat > "$SB_PATH" <<'SB_SCRIPT'
-#!/usr/bin/env bash
-set -euo pipefail
-
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-warn() { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
-
-CONFIG_PATH="/etc/sing-box/config.json"
-CACHE_FILE="/etc/sing-box/.config_cache"
-SERVICE_NAME="sing-box"
-
-# 检测系统
-detect_os() {
-    if [ -f /etc/os-release ]; then
-        . /etc/os-release
-        ID="${ID:-}"
-        ID_LIKE="${ID_LIKE:-}"
-    else
-        ID=""
-        ID_LIKE=""
-    fi
-
-    if echo "$ID $ID_LIKE" | grep -qi "alpine"; then
-        OS="alpine"
-    elif echo "$ID $ID_LIKE" | grep -Ei "debian|ubuntu" >/dev/null; then
-        OS="debian"
-    elif echo "$ID $ID_LIKE" | grep -Ei "centos|rhel|fedora" >/dev/null; then
-        OS="redhat"
-    else
-        OS="unknown"
-    fi
-}
-
-detect_os
-
-# 服务控制
-service_start() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" start || systemctl start "$SERVICE_NAME"
-}
-service_stop() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" stop || systemctl stop "$SERVICE_NAME"
-}
-service_restart() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" restart || systemctl restart "$SERVICE_NAME"
-}
-service_status() {
-    [ "$OS" = "alpine" ] && rc-service "$SERVICE_NAME" status || systemctl status "$SERVICE_NAME" --no-pager
-}
-
-# 生成随机值
-rand_port() { shuf -i 10000-60000 -n 1 2>/dev/null || echo $((RANDOM % 50001 + 10000)); }
-rand_pass() { openssl rand -base64 16 | tr -d '\n\r' || head -c 16 /dev/urandom | base64 | tr -d '\n\r'; }
-rand_uuid() { cat /proc/sys/kernel/random/uuid 2>/dev/null || openssl rand -hex 16 | sed 's/\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)\(..\)/\1\2\3\4-\5\6-\7\8-\9\10-\11\12\13\14\15\16/'; }
-
-# URL 编码
-url_encode() {
-    printf "%s" "$1" | sed -e 's/%/%25/g' -e 's/:/%3A/g' -e 's/+/%2B/g' -e 's/\//%2F/g' -e 's/=/%3D/g'
-}
-
-# 读取配置
-read_config() {
-    if [ ! -f "$CONFIG_PATH" ]; then
-        err "未找到配置文件: $CONFIG_PATH"
-        return 1
-    fi
-    
-    # 优先加载 .protocols 文件（确认协议标记）
-    PROTOCOL_FILE="/etc/sing-box/.protocols"
-    if [ -f "$PROTOCOL_FILE" ]; then
-        . "$PROTOCOL_FILE"
-    fi
-    
-    # 加载缓存文件（包含端口密码等详细配置）
-    if [ -f "$CACHE_FILE" ]; then
-        . "$CACHE_FILE"
-    fi
-    
-    # 确保有默认值
-    REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
-    CUSTOM_IP="${CUSTOM_IP:-}"
-
-    # 读取各协议配置
-    if [ "${ENABLE_SS:-false}" = "true" ]; then
-        SS_PORT=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-        SS_PSK=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .password // empty' "$CONFIG_PATH" | head -n1)
-        SS_METHOD=$(jq -r '.inbounds[] | select(.type=="shadowsocks") | .method // empty' "$CONFIG_PATH" | head -n1)
-    fi
-    
-    if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        HY2_PORT=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-        HY2_PSK=$(jq -r '.inbounds[] | select(.type=="hysteria2") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
-    fi
-    
-    if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        TUIC_PORT=$(jq -r '.inbounds[] | select(.type=="tuic") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-        TUIC_UUID=$(jq -r '.inbounds[] | select(.type=="tuic") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
-        TUIC_PSK=$(jq -r '.inbounds[] | select(.type=="tuic") | .users[0].password // empty' "$CONFIG_PATH" | head -n1)
-    fi
-    
-    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        REALITY_PORT=$(jq -r '.inbounds[] | select(.type=="vless") | .listen_port // empty' "$CONFIG_PATH" | head -n1)
-        REALITY_UUID=$(jq -r '.inbounds[] | select(.type=="vless") | .users[0].uuid // empty' "$CONFIG_PATH" | head -n1)
-        REALITY_PK=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.private_key // empty' "$CONFIG_PATH" | head -n1)
-        REALITY_SID=$(jq -r '.inbounds[] | select(.type=="vless") | .tls.reality.short_id[0] // empty' "$CONFIG_PATH" | head -n1)
-        [ -f /etc/sing-box/.reality_pub ] && REALITY_PUB=$(cat /etc/sing-box/.reality_pub)
-    fi
-}
-
-# 获取公网IP（原始方法）
-get_public_ip() {
-    local ip=""
-    for url in "https://api.ipify.org" "https://ipinfo.io/ip" "https://ifconfig.me"; do
-        ip=$(curl -s --max-time 5 "$url" 2>/dev/null | tr -d '[:space:]')
-        [ -n "$ip" ] && echo "$ip" && return 0
-    done
-    echo "YOUR_SERVER_IP"
-}
-
-# 生成并保存URI
-generate_uris() {
-    read_config || return 1
-
-    # 优先使用用户自定义入口 IP
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        PUBLIC_IP="$CUSTOM_IP"
-    else
-        PUBLIC_IP=$(get_public_ip)
-    fi
-
-    node_suffix=$(cat /root/node_names.txt 2>/dev/null || echo "")
-    
-    URI_FILE="/etc/sing-box/uris.txt"
-    > "$URI_FILE"
-    
-    if [ "${ENABLE_SS:-false}" = "true" ]; then
-        ss_userinfo="${SS_METHOD}:${SS_PSK}"
-        ss_encoded=$(url_encode "$ss_userinfo")
-        ss_b64=$(printf "%s" "$ss_userinfo" | base64 -w0 2>/dev/null || printf "%s" "$ss_userinfo" | base64 | tr -d '\n')
-        
-        echo "=== Shadowsocks (SS) ===" >> "$URI_FILE"
-        echo "ss://${ss_encoded}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
-        echo "ss://${ss_b64}@${PUBLIC_IP}:${SS_PORT}#ss${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
-    fi
-    
-    if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        hy2_encoded=$(url_encode "$HY2_PSK")
-        echo "=== Hysteria2 (HY2) ===" >> "$URI_FILE"
-        echo "hy2://${hy2_encoded}@${PUBLIC_IP}:${HY2_PORT}/?sni=www.bing.com&alpn=h3&insecure=1#hy2${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
-    fi
-    
-    if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        tuic_encoded=$(url_encode "$TUIC_PSK")
-        echo "=== TUIC ===" >> "$URI_FILE"
-        echo "tuic://${TUIC_UUID}:${tuic_encoded}@${PUBLIC_IP}:${TUIC_PORT}/?congestion_control=bbr&alpn=h3&sni=www.bing.com&insecure=1#tuic${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
-    fi
-    
-    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        REALITY_SNI="${REALITY_SNI:-addons.mozilla.org}"
-        echo "=== VLESS Reality ===" >> "$URI_FILE"
-        echo "vless://${REALITY_UUID}@${PUBLIC_IP}:${REALITY_PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${REALITY_SNI}&fp=chrome&pbk=${REALITY_PUB}&sid=${REALITY_SID}#reality${node_suffix}" >> "$URI_FILE"
-        echo "" >> "$URI_FILE"
-    fi
-    
-    info "URI 已保存到: $URI_FILE"
-}
-
-# 查看URI
-action_view_uri() {
-    info "正在生成并显示 URI..."
-    generate_uris || { err "生成 URI 失败"; return 1; }
-    echo ""
-    cat /etc/sing-box/uris.txt
-}
-
-# 查看配置文件路径
-action_view_config() {
-    echo "$CONFIG_PATH"
-}
-
-# 编辑配置
-action_edit_config() {
-    if [ ! -f "$CONFIG_PATH" ]; then
-        err "配置文件不存在: $CONFIG_PATH"
-        return 1
-    fi
-    
-    ${EDITOR:-nano} "$CONFIG_PATH" 2>/dev/null || ${EDITOR:-vi} "$CONFIG_PATH"
-    
-    if command -v sing-box >/dev/null 2>&1; then
-        if sing-box check -c "$CONFIG_PATH" >/dev/null 2>&1; then
-            info "配置校验通过,已重启服务"
-            service_restart || warn "重启失败"
-            generate_uris || true
-        else
-            warn "配置校验失败,服务未重启"
-        fi
-    fi
-}
-
-# 重置SS端口
-action_reset_ss() {
-    read_config || return 1
-    
-    if [ "${ENABLE_SS:-false}" != "true" ]; then
-        err "SS 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 SS 端口(回车保持 $SS_PORT): " new_port
-    new_port="${new_port:-$SS_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="shadowsocks" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 SS 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 重置HY2端口
-action_reset_hy2() {
-    read_config || return 1
-    
-    if [ "${ENABLE_HY2:-false}" != "true" ]; then
-        err "HY2 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 HY2 端口(回车保持 $HY2_PORT): " new_port
-    new_port="${new_port:-$HY2_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="hysteria2" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 HY2 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 重置TUIC端口
-action_reset_tuic() {
-    read_config || return 1
-    
-    if [ "${ENABLE_TUIC:-false}" != "true" ]; then
-        err "TUIC 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 TUIC 端口(回车保持 $TUIC_PORT): " new_port
-    new_port="${new_port:-$TUIC_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="tuic" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 TUIC 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 重置Reality端口
-action_reset_reality() {
-    read_config || return 1
-    
-    if [ "${ENABLE_REALITY:-false}" != "true" ]; then
-        err "Reality 协议未启用"
-        return 1
-    fi
-    
-    read -p "输入新的 Reality 端口(回车保持 $REALITY_PORT): " new_port
-    new_port="${new_port:-$REALITY_PORT}"
-    
-    info "正在停止服务..."
-    service_stop || warn "停止服务失败"
-    
-    cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-    
-    jq --argjson port "$new_port" '
-    .inbounds |= map(if .type=="vless" then .listen_port = $port else . end)
-    ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-    
-    info "已启动服务并更新 Reality 端口: $new_port"
-    service_start || warn "启动服务失败"
-    sleep 1
-    generate_uris || warn "生成 URI 失败"
-}
-
-# 更新sing-box
-action_update() {
-    info "开始更新 sing-box..."
-    if [ "$OS" = "alpine" ]; then
-        apk update && apk upgrade sing-box || bash <(curl -fsSL https://sing-box.app/install.sh)
-    else
-        bash <(curl -fsSL https://sing-box.app/install.sh)
-    fi
-    
-    info "更新完成,已重启服务..."
-    if command -v sing-box >/dev/null 2>&1; then
-        NEW_VER=$(sing-box version 2>/dev/null | head -n1)
-        info "当前版本: $NEW_VER"
-        service_restart || warn "重启失败"
-    fi
-}
-
-# 卸载
-action_uninstall() {
-    read -p "确认卸载 sing-box?(y/N): " confirm
-    [[ ! "$confirm" =~ ^[Yy]$ ]] && info "已取消" && return 0
-    
-    info "正在卸载..."
-    service_stop || true
-    if [ "$OS" = "alpine" ]; then
-        rc-update del sing-box default 2>/dev/null || true
-        rm -f /etc/init.d/sing-box
-        apk del sing-box 2>/dev/null || true
-    else
-        systemctl stop sing-box 2>/dev/null || true
-        systemctl disable sing-box 2>/dev/null || true
-        rm -f /etc/systemd/system/sing-box.service
-        systemctl daemon-reload 2>/dev/null || true
-        apt purge -y sing-box >/dev/null 2>&1 || true
-    fi
-    rm -rf /etc/sing-box /var/log/sing-box* /usr/local/bin/sb /usr/bin/sing-box /root/node_names.txt 2>/dev/null || true
-    info "卸载完成"
-}
-
-# 生成线路机脚本
-action_generate_relay() {
-    read_config || return 1
-    
-    # 检查是否启用了SS
-    if [ "${ENABLE_SS:-false}" != "true" ]; then
-        warn "未检测到 SS 协议,需要先部署 SS 作为入站"
-        read -p "是否现在部署 SS 协议?(y/N): " deploy_ss
-        if [[ "$deploy_ss" =~ ^[Yy]$ ]]; then
-            info "开始部署 SS 协议..."
-            
-            # 让用户选择端口
-            read -p "请输入 SS 端口(留空则随机 10000-60000): " USER_SS_PORT
-            SS_PORT="${USER_SS_PORT:-$(rand_port)}"
-            SS_PSK=$(rand_pass)
-            SS_METHOD="aes-128-gcm"
-            
-            info "SS 端口: $SS_PORT | 密码已自动生成"
-            
-            info "正在停止服务..."
-            service_stop || warn "停止服务失败"
-            
-            cp "$CONFIG_PATH" "${CONFIG_PATH}.bak"
-            
-            # 添加 SS inbound
-            jq --argjson port "$SS_PORT" --arg psk "$SS_PSK" '
-            .inbounds += [{
-              "type": "shadowsocks",
-              "listen": "::",
-              "listen_port": $port,
-              "method": "aes-128-gcm",
-              "password": $psk,
-              "tag": "ss-in"
-            }]
-            ' "$CONFIG_PATH" > "${CONFIG_PATH}.tmp" && mv "${CONFIG_PATH}.tmp" "$CONFIG_PATH"
-            
-            # 更新缓存和协议标记
-            sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' "$CACHE_FILE" 2>/dev/null || echo "ENABLE_SS=true" >> "$CACHE_FILE"
-            echo "SS_PORT=$SS_PORT" >> "$CACHE_FILE"
-            echo "SS_PSK=$SS_PSK" >> "$CACHE_FILE"
-            echo "SS_METHOD=$SS_METHOD" >> "$CACHE_FILE"
-            
-            # 同步更新协议标记文件
-            PROTOCOL_FILE="/etc/sing-box/.protocols"
-            if [ -f "$PROTOCOL_FILE" ]; then
-                sed -i 's/ENABLE_SS=false/ENABLE_SS=true/' "$PROTOCOL_FILE"
-            else
-                echo "ENABLE_SS=true" >> "$PROTOCOL_FILE"
-            fi
-            
-            # 更新当前会话变量
-            ENABLE_SS=true
-            
-            info "SS 已部署 - 端口: $SS_PORT"
-            service_start || warn "启动服务失败"
-            sleep 1
-            
-            # 重新读取配置
-            read_config
-        else
-            err "取消生成线路机脚本"
-            return 1
-        fi
-    fi
-    
-    # 线路机模板使用 CUSTOM_IP（若设置）或当前公共 IP
-    if [ -n "${CUSTOM_IP:-}" ]; then
-        INBOUND_IP="${CUSTOM_IP}"
-    else
-        INBOUND_IP="$(get_public_ip)"
-    fi
-
-    PUBLIC_IP="$INBOUND_IP"
-    RELAY_SCRIPT="/tmp/relay-install.sh"
-    
-    info "正在生成线路机脚本: $RELAY_SCRIPT"
-    
-    cat > "$RELAY_SCRIPT" <<'RELAY_EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-
-info() { echo -e "\033[1;34m[INFO]\033[0m $*"; }
-err()  { echo -e "\033[1;31m[ERR]\033[0m $*" >&2; }
-
-[ "$(id -u)" != "0" ] && err "必须以 root 运行" && exit 1
-
-detect_os(){
-    . /etc/os-release 2>/dev/null || true
-    case "${ID:-}" in
-        alpine) OS=alpine ;;
-        debian|ubuntu) OS=debian ;;
-        centos|rhel|fedora) OS=redhat ;;
-        *) OS=unknown ;;
+        '') menu ;;
+        *) fail "不支持的参数：$1" ;;
     esac
 }
-detect_os
-
-info "安装依赖..."
-case "$OS" in
-    alpine) apk update; apk add --no-cache curl jq bash openssl ca-certificates ;;
-    debian) apt-get update -y; apt-get install -y curl jq bash openssl ca-certificates ;;
-    redhat) yum install -y curl jq bash openssl ca-certificates ;;
-esac
-
-info "安装 sing-box..."
-case "$OS" in
-    alpine) apk add --repository=http://dl-cdn.alpinelinux.org/alpine/edge/community sing-box ;;
-    *) bash <(curl -fsSL https://sing-box.app/install.sh) ;;
-esac
-
-UUID=$(cat /proc/sys/kernel/random/uuid 2>/dev/null || echo "00000000-0000-0000-0000-000000000000")
-
-info "生成 Reality 密钥对"
-REALITY_KEYS=$(sing-box generate reality-keypair 2>/dev/null || echo "")
-REALITY_PK=$(echo "$REALITY_KEYS" | grep "PrivateKey" | awk '{print $NF}' | tr -d '\r' || echo "")
-REALITY_PUB=$(echo "$REALITY_KEYS" | grep "PublicKey" | awk '{print $NF}' | tr -d '\r' || echo "")
-REALITY_SID=$(sing-box generate rand 8 --hex 2>/dev/null || echo "0123456789abcdef")
-
-read -p "请输入线路机监听端口(留空随机 20000-65000): " USER_PORT
-LISTEN_PORT="${USER_PORT:-$(shuf -i 20000-65000 -n 1 2>/dev/null || echo 20443)}"
-
-mkdir -p /etc/sing-box
-
-cat > /etc/sing-box/config.json <<EOF
-{
-  "log": { "level": "info", "timestamp": true },
-  "inbounds": [
-    {
-      "type": "vless",
-      "listen": "::",
-      "listen_port": $LISTEN_PORT,
-      "sniff": true,
-      "users": [{ "uuid": "$UUID", "flow": "xtls-rprx-vision" }],
-      "tls": {
-        "enabled": true,
-        "server_name": "__REALITY_SNI__",
-        "reality": {
-          "enabled": true,
-          "handshake": { "server": "__REALITY_SNI__", "server_port": 443 },
-          "private_key": "$REALITY_PK",
-          "short_id": ["$REALITY_SID"]
-        }
-      },
-      "tag": "vless-in"
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "shadowsocks",
-      "server": "__INBOUND_IP__",
-      "server_port": __INBOUND_PORT__,
-      "method": "__INBOUND_METHOD__",
-      "password": "__INBOUND_PASSWORD__",
-      "tag": "relay-out"
-    },
-    { "type": "direct", "tag": "direct-out" }
-  ],
-  "route": { "rules": [{ "inbound": "vless-in", "outbound": "relay-out" }] }
-}
-EOF
-
-if [ "$OS" = "alpine" ]; then
-    cat > /etc/init.d/sing-box <<'SVC'
-#!/sbin/openrc-run
-name="sing-box"
-command="/usr/bin/sing-box"
-command_args="run -c /etc/sing-box/config.json"
-command_background="yes"
-pidfile="/run/sing-box.pid"
-supervisor=supervise-daemon
-supervise_daemon_args="--respawn-max 0 --respawn-delay 5"
-
-depend() { need net; }
-SVC
-    chmod +x /etc/init.d/sing-box
-    rc-update add sing-box default
-    rc-service sing-box restart
-else
-    cat > /etc/systemd/system/sing-box.service <<'SYSTEMD'
-[Unit]
-Description=Sing-box Relay
-After=network.target
-[Service]
-ExecStart=/usr/bin/sing-box run -c /etc/sing-box/config.json
-Restart=on-failure
-RestartSec=10s
-[Install]
-WantedBy=multi-user.target
-SYSTEMD
-    systemctl daemon-reload
-    systemctl enable sing-box
-    systemctl restart sing-box
-fi
-
-PUB_IP=$(curl -s https://api.ipify.org 2>/dev/null || echo "YOUR_RELAY_IP")
-
-# 生成并保存链接
-RELAY_URI="vless://$UUID@$PUB_IP:$LISTEN_PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=__REALITY_SNI__&fp=chrome&pbk=$REALITY_PUB&sid=$REALITY_SID#relay"
-
-mkdir -p /etc/sing-box
-echo "$RELAY_URI" > /etc/sing-box/relay_uri.txt
-
-echo ""
-info "✅ 安装完成"
-echo "=============== 中转节点 Reality 链接 ==============="
-echo "$RELAY_URI"
-echo "===================================================="
-echo ""
-info "💡 链接已保存到: /etc/sing-box/relay_uri.txt"
-info "💡 查看链接命令: cat /etc/sing-box/relay_uri.txt"
-RELAY_EOF
-
-    # 替换占位符（INBOUND_IP/PORT/METHOD/PASSWORD 同时替换 REALITY_SNI）
-    sed -i "s|__INBOUND_IP__|$INBOUND_IP|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PORT__|$SS_PORT|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_METHOD__|$SS_METHOD|g" "$RELAY_SCRIPT"
-    sed -i "s|__INBOUND_PASSWORD__|$SS_PSK|g" "$RELAY_SCRIPT"
-    sed -i "s|__REALITY_SNI__|${REALITY_SNI:-addons.mozilla.org}|g" "$RELAY_SCRIPT"
-    
-    chmod +x "$RELAY_SCRIPT"
-    
-    info "✅ 线路机脚本已生成: $RELAY_SCRIPT"
-    echo ""
-    info "请复制以下内容到线路机执行:"
-    echo "----------------------------------------"
-    cat "$RELAY_SCRIPT"
-    echo "----------------------------------------"
-    echo ""
-    info "在线路机执行命令示例："
-    echo "   nano /tmp/relay-install.sh 保存后执行"
-    echo "   chmod +x /tmp/relay-install.sh && bash /tmp/relay-install.sh"
-    echo ""
-    info "复制执行完成后，即可在线路机完成 sing-box 中转节点部署。"
-}
-
-# 动态生成菜单
-show_menu() {
-    read_config 2>/dev/null || true
-    
-    cat <<'MENU'
-
-==========================
- Sing-box 管理面板 (快速指令sb)
-==========================
-1) 查看协议链接
-2) 查看配置文件路径
-3) 编辑配置文件
-MENU
-
-    # 构建协议重置选项映射
-    declare -g -A MENU_MAP
-    local option=4
-    
-    if [ "${ENABLE_SS:-false}" = "true" ]; then
-        echo "$option) 重置 SS 端口"
-        MENU_MAP[$option]="reset_ss"
-        option=$((option + 1))
-    fi
-    
-    if [ "${ENABLE_HY2:-false}" = "true" ]; then
-        echo "$option) 重置 HY2 端口"
-        MENU_MAP[$option]="reset_hy2"
-        option=$((option + 1))
-    fi
-    
-    if [ "${ENABLE_TUIC:-false}" = "true" ]; then
-        echo "$option) 重置 TUIC 端口"
-        MENU_MAP[$option]="reset_tuic"
-        option=$((option + 1))
-    fi
-    
-    if [ "${ENABLE_REALITY:-false}" = "true" ]; then
-        echo "$option) 重置 Reality 端口"
-        MENU_MAP[$option]="reset_reality"
-        option=$((option + 1))
-    fi
-    
-    # 固定功能选项
-    MENU_MAP[$option]="start"
-    echo "$option) 启动服务"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="stop"
-    echo "$((option))) 停止服务"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="restart"
-    echo "$((option))) 重启服务"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="status"
-    echo "$((option))) 查看状态"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="update"
-    echo "$((option))) 更新 sing-box"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="relay"
-    echo "$((option))) 生成线路机脚本(出口为本机ss协议)"
-    option=$((option + 1))
-    
-    MENU_MAP[$option]="uninstall"
-    echo "$((option))) 卸载 sing-box"
-    
-    cat <<MENU2
-0) 退出
-==========================
-MENU2
-}
-
-# 主循环
-while true; do
-    show_menu
-    read -p "请输入选项: " opt
-    
-    # 处理退出
-    if [ "$opt" = "0" ]; then
-        exit 0
-    fi
-    
-    # 处理固定选项
-    case "$opt" in
-        1) action_view_uri ;;
-        2) action_view_config ;;
-        3) action_edit_config ;;
-        *)
-            # 处理动态选项
-            action="${MENU_MAP[$opt]:-}"
-            case "$action" in
-                reset_ss) action_reset_ss ;;
-                reset_hy2) action_reset_hy2 ;;
-                reset_tuic) action_reset_tuic ;;
-                reset_reality) action_reset_reality ;;
-                start) service_start && info "已启动" ;;
-                stop) service_stop && info "已停止" ;;
-                restart) service_restart && info "已重启" ;;
-                status) service_status ;;
-                update) action_update ;;
-                relay) action_generate_relay ;;
-                uninstall) action_uninstall; exit 0 ;;
-                *) warn "无效选项: $opt" ;;
-            esac
-            ;;
-    esac
-    
-    echo ""
-done
-SB_SCRIPT
-
-chmod +x "$SB_PATH"
-info "✅ 管理面板已创建,可输入 sb 打开管理面板"
+main "$@"
