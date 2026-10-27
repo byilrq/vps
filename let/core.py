@@ -8,7 +8,7 @@ import os
 import cfscrape
 from dotenv import load_dotenv
 from urllib.parse import urlparse
-from msgparse import thread_message, comment_message
+from msgparse import thread_message, comment_message, watched_comment_message
 import curl_cffi
 from storage_sqlite import SQLiteDB
 from filter import Filter
@@ -221,6 +221,9 @@ class ForumTask:
         self.config.setdefault('rss_interval', 300)
         self.config.setdefault('comment_interval', 300)
         self.config.setdefault('comment_filter', 'by_author')
+        # 只在用户手动填写的爬楼帖中按用户名优先命中，默认关闭。
+        self.config.setdefault('enable_user_translation', False)
+        self.config.setdefault('monitor_usernames', [])
         # 24H 命中推送限制：默认关闭，即不限制评论/主题时间。
         self.config.setdefault('restrict_24h', False)
 
@@ -324,6 +327,41 @@ class ForumTask:
                 new_thread = self.fetch_thread_page(url)
                 if new_thread:
                     self.fetch_comments(new_thread)
+
+    @staticmethod
+    def _watch_link_key(url):
+        return str(url or '').strip().rstrip('/')
+
+    def is_watched_comment_author(self, author, thread):
+        """只匹配用户手工维护的爬楼链接；RSS 自动添加的链接不触发用户名汉化。"""
+        if not self.config.get('enable_user_translation', False):
+            return False
+
+        link = self._watch_link_key(thread.get('link'))
+        manual_links = {
+            self._watch_link_key(url) for url in (self.config.get('extra_urls') or [])
+        }
+        if not link or link not in manual_links:
+            return False
+
+        auto_urls = self._normalize_auto_extra_urls()
+        if any(
+            self._watch_link_key(meta.get('url') if isinstance(meta, dict) and meta.get('url') else key) == link
+            for key, meta in auto_urls.items()
+        ):
+            return False
+
+        usernames = self.config.get('monitor_usernames') or []
+        if isinstance(usernames, str):
+            usernames = usernames.splitlines()
+        if not isinstance(usernames, list):
+            return False
+
+        normalized_author = str(author or '').strip().lstrip('@').casefold()
+        return bool(normalized_author) and any(
+            str(name).strip().lstrip('@').casefold() == normalized_author
+            for name in usernames
+        )
 
     def parse_rss_date(self, text):
         for fmt in ("%a, %d %b %Y %H:%M:%S +0000", "%a, %d %b %Y %H:%M:%S %z"):
@@ -520,6 +558,8 @@ class ForumTask:
         new_comments = 0
         pushed_comments = 0
         filtered_comments = 0
+        retry_comments = 0
+        earliest_retry_page = None
 
         while True:
             if getattr(self, '_shutdown', False):
@@ -564,9 +604,13 @@ class ForumTask:
 
             if res.status_code != 200:
                 if res.status_code == 404:
+                    completed_page = last_page - 1
+                    # 关注用户 AI/推送失败时，保留失败页作为下一轮扫描起点。
+                    # 否则游标前进后，失败评论可能永远不会再次被扫描到。
+                    resume_page = max(1, min(completed_page, earliest_retry_page or completed_page))
                     self.threads.update_one(
                         {'link': thread['link']},
-                        {'$set': {'last_page': last_page - 1}}
+                        {'$set': {'last_page': resume_page}}
                     )
                     self.manual_runtime_log(
                         thread['link'],
@@ -579,19 +623,20 @@ class ForumTask:
                         message_preview="",
                         matched=(pushed_comments > 0),
                         reason=(
-                            f"手动链接本轮刷楼完成：从 p{start_page} 刷到 p{last_page - 1}，"
+                            f"手动链接本轮刷楼完成：从 p{start_page} 刷到 p{completed_page}，"
                             f"遇到 p{last_page} 404 停止；解析 {total_comments} 条，新入库 {new_comments} 条，"
                             f"推送 {pushed_comments} 条，过滤 {filtered_comments} 条"
+                            + (f"，关注用户待重试 {retry_comments} 条（下轮从 p{resume_page} 重扫）" if retry_comments else "")
                         ),
                         features=[
                             "manual_done",
                             f"start_page={start_page}",
-                            f"end_page={last_page - 1}",
+                            f"end_page={completed_page}",
                             f"parsed={total_comments}",
                             f"new={new_comments}",
                             f"pushed={pushed_comments}",
                             f"filtered={filtered_comments}",
-                        ],
+                        ] + ([f"retry={retry_comments}", f"resume_page={resume_page}"] if retry_comments else []),
                     )
                     break
                 else:
@@ -617,6 +662,10 @@ class ForumTask:
             new_comments += result["new"]
             pushed_comments += result["pushed"]
             filtered_comments += result["filtered"]
+            retry_count = result.get("retry", 0)
+            if retry_count:
+                retry_comments += retry_count
+                earliest_retry_page = min(earliest_retry_page or last_page, last_page)
 
             last_page += 1
             time.sleep(1)
@@ -626,7 +675,7 @@ class ForumTask:
         soup = BeautifulSoup(html, 'html.parser')
         items = soup.find_all('li', class_='ItemComment')
 
-        stats = {"total": 0, "new": 0, "pushed": 0, "filtered": 0}
+        stats = {"total": 0, "new": 0, "pushed": 0, "filtered": 0, "retry": 0}
 
         for it in items:
             cid = it.get('id')
@@ -637,7 +686,7 @@ class ForumTask:
             author_el = it.find('a', class_='Username')
             if not author_el:
                 continue
-            author = author_el.text
+            author = author_el.get_text(' ', strip=True)
 
             role = it.find('span', class_='RoleTitle').text if it.find('span', class_='RoleTitle') else None
 
@@ -659,16 +708,23 @@ class ForumTask:
             if not time_el or not time_el.has_attr('datetime'):
                 continue
             created = time_el['datetime']
+            try:
+                created_at = datetime.fromisoformat(created.replace('Z', '+00:00'))
+                if created_at.tzinfo is None:
+                    created_at = created_at.replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
 
             stats["total"] += 1
 
-            # 保持原始过滤策略：在解析阶段先过滤角色/作者。
-            if self.config.get('comment_filter') == 'by_role':
+            # 指定用户优先：仅限手动爬楼帖，命中后跳过角色/作者、关键词、促销 AI 过滤。
+            watched_author = self.is_watched_comment_author(author, thread)
+            if not watched_author and self.config.get('comment_filter') == 'by_role':
                 if not role or role.strip().lower() == 'member':
                     stats["filtered"] += 1
                     continue
 
-            if self.config.get('comment_filter') == 'by_author':
+            if not watched_author and self.config.get('comment_filter') == 'by_author':
                 if author != thread['creator']:
                     stats["filtered"] += 1
                     continue
@@ -678,13 +734,16 @@ class ForumTask:
                 'thread_url': thread['link'],
                 'author': author,
                 'message': msg,
-                'created_at': datetime.strptime(created, "%Y-%m-%dT%H:%M:%S+00:00"),
+                'created_at': created_at,
                 'created_at_recorded': datetime.now(timezone.utc),
                 'url': f"https://{thread['domain']}.com/discussion/comment/{cid}/#Comment_{cid}"
             }
 
             result = self.handle_comment(comment, thread)
             if result == "duplicate":
+                continue
+            if result == "retry":
+                stats["retry"] += 1
                 continue
             stats["new"] += 1
             if result == "pushed":
@@ -694,18 +753,112 @@ class ForumTask:
 
         return stats
 
+    def log_user_translation(self, comment, thread, matched, reason, features, push_message=""):
+        """关注用户名命中及失败日志也进入原有楼层日志，不额外建立日志模块。"""
+        self.manual_runtime_log(
+            thread['link'],
+            type="comment",
+            thread_title=thread.get('title', ''),
+            thread_url=thread.get('link', ''),
+            comment_id=comment.get('comment_id', ''),
+            author=comment.get('author', ''),
+            role="",
+            url=comment.get('url', ''),
+            message_preview=self.summarize_message(comment.get('message', '')),
+            push_message=push_message,
+            matched=matched,
+            reason=reason,
+            features=["watched_username", "ai_translation"] + features,
+        )
+
+    def handle_watched_comment(self, comment, thread, existing=None):
+        """优先汉化指定用户；只有通知真正成功，才永久视为已处理。"""
+        query = {'comment_id': comment['comment_id']}
+        translated = (existing or {}).get('translated_text', '') if (existing or {}).get('watch_status') == 'pending_send' else ''
+
+        if not translated:
+            try:
+                translated = self.filter.ai_translate(comment.get('message', ''))
+                if not translated or not translated.strip():
+                    raise ValueError("AI 返回空翻译")
+            except Exception as exc:
+                error = str(exc)[:200]
+                self.comments.update_one(query, {'$set': {
+                    **comment,
+                    'watch_status': 'pending_ai',
+                    'last_error': error,
+                }}, upsert=True)
+                self.log_user_translation(
+                    comment, thread, False,
+                    f"关注用户 AI 汉化失败，等待下轮重试：{error}",
+                    ["ai_failed", "retry_pending"],
+                )
+                return "retry"
+
+        message = watched_comment_message(thread, comment, translated)
+        try:
+            sent = bool(self.notifier.send_message(message))
+            error = "推送渠道返回失败" if not sent else ""
+        except Exception as exc:
+            sent = False
+            error = str(exc)[:200]
+
+        if not sent:
+            # 保留成功汉化的文字，通知失败后只重试推送，避免重复消耗 AI 配额。
+            self.comments.update_one(query, {'$set': {
+                **comment,
+                'watch_status': 'pending_send',
+                'translated_text': translated,
+                'last_error': error,
+            }}, upsert=True)
+            self.log_user_translation(
+                comment, thread, False,
+                f"关注用户通知失败，等待下轮重试：{error}",
+                ["push_failed", "retry_pending"],
+                push_message=translated,
+            )
+            return "retry"
+
+        self.comments.update_one(query, {'$set': {
+            **comment,
+            'watch_status': 'pushed',
+            'translated_text': translated,
+            'last_error': '',
+            'pushed_at': datetime.now(timezone.utc),
+        }}, upsert=True)
+        self.log_user_translation(
+            comment, thread, True, "手动爬楼指定用户名命中，AI 汉化并推送成功",
+            ["new_comment", "translated", "pushed"],
+            push_message=translated,
+        )
+        return "pushed"
+
     # -------- 存储评论 + 通知 --------
     def handle_comment(self, comment, thread):
-        if self.comments.find_one({'comment_id': comment['comment_id']}):
+        watched = self.is_watched_comment_author(comment.get('author', ''), thread)
+        existing = self.comments.find_one({'comment_id': comment['comment_id']})
+        # 仅关注用户的暂存失败记录可以重试；其他已处理评论保持原有去重行为。
+        if existing and not (watched and existing.get('watch_status') in ('pending_ai', 'pending_send')):
             return "duplicate"
 
-        self.comments.update_one({'comment_id': comment['comment_id']},
-                                 {'$set': comment}, upsert=True)
+        if not watched:
+            # 普通评论仍沿用旧处理策略；不改变现有关键词/AI 优惠过滤和去重。
+            self.comments.update_one({'comment_id': comment['comment_id']},
+                                     {'$set': comment}, upsert=True)
 
-        age_seconds = (datetime.now(timezone.utc) - comment['created_at'].replace(tzinfo=timezone.utc)).total_seconds()
+        comment_time = comment['created_at']
+        if comment_time.tzinfo is None:
+            comment_time = comment_time.replace(tzinfo=timezone.utc)
+        age_seconds = (datetime.now(timezone.utc) - comment_time.astimezone(timezone.utc)).total_seconds()
         restrict_24h = self.config.get('restrict_24h', False)
 
         if restrict_24h and age_seconds > 86400:
+            if watched:
+                self.comments.update_one(
+                    {'comment_id': comment['comment_id']},
+                    {'$set': {**comment, 'watch_status': 'filtered_24h'}},
+                    upsert=True,
+                )
             self.manual_runtime_log(
                 thread['link'],
                 type="comment",
@@ -721,6 +874,9 @@ class ForumTask:
                 features=["older_than_24h", "restrict_24h=true"],
             )
             return "filtered"
+
+        if watched:
+            return self.handle_watched_comment(comment, thread, existing)
 
         if self.config.get('use_comment_keywords_filter', self.config.get('use_keywords_filter', False)) and (
             not self.filter.keywords_filter(comment['message'], self.config.get('comment_keywords_rule', self.config.get('keywords_rule', '')))

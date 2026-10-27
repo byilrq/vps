@@ -5,6 +5,7 @@ import shutil
 import time
 import logging
 import threading
+import re
 from datetime import datetime
 
 # ---------- 配置日志 ----------
@@ -16,6 +17,14 @@ LOG_FILE = os.path.join(LOG_DIR, f"ai_filter_{datetime.now().strftime('%Y%m%d')}
 _AI_STATS_FILE = os.path.join(LOG_DIR, "ai_stats.json")
 _ai_stats_lock = threading.Lock()
 _ai_stats = {"date": "", "calls": 0, "failures": 0}
+
+# 指定用户名的评论只翻译，不做折扣/优惠检测，也不使用 comment_prompt 中的 FALSE / END 协议。
+DEFAULT_USER_TRANSLATION_PROMPT = (
+    "你是一名精通 VPS、服务器和网络术语的翻译助手。请把以下论坛评论忠实翻译成简体中文。"
+    "原文已有中文时保持原意，不必改写。保留原文的链接、价格、货币、优惠码、"
+    "配置参数、命令、代码及必要的排版；不要总结、删减、推测或添加原文没有的信息。"
+    "不要判断是否属于优惠信息，不要输出 FALSE、END、解释或分析过程，只输出汉化正文。"
+)
 
 
 def _today_str():
@@ -165,6 +174,46 @@ class Filter:
                     logger.error(f"AI 过滤已重试 {max_retries} 次仍失败，跳过")
                     return "true"
                 time.sleep(10)
+
+    def ai_translate(self, description):
+        """独立的关注用户汉化通道，失败抛异常，由爬楼层保留待重试状态。"""
+        if not str(description or '').strip():
+            return "（该评论没有可翻译的文字内容）"
+
+        prompt = self.config.get('user_translation_prompt') or DEFAULT_USER_TRANSLATION_PROMPT
+        last_error = None
+        for attempt in range(1, 4):
+            try:
+                inputs = [
+                    {"role": "system", "content": prompt},
+                    {"role": "user", "content": description},
+                ]
+                output = self.workers_ai_run(self.config['model'], inputs)
+                result = output.get('result') if isinstance(output, dict) else None
+                if not isinstance(result, dict):
+                    raise ValueError("Workers AI 响应缺少 result")
+                if isinstance(result.get('response'), str):
+                    translated = result['response']
+                elif result.get('choices'):
+                    translated = result['choices'][0]['message']['content']
+                else:
+                    raise ValueError("Workers AI 响应无翻译正文")
+                if not isinstance(translated, str):
+                    raise ValueError("Workers AI 返回非文本内容")
+                # 一些思考模型会带 <think> 标签；它们不是翻译内容。
+                translated = re.sub(r'<think\b[^>]*>.*?</think\s*>', '', translated, flags=re.I | re.S).strip()
+                translated = re.sub(r'^</think\s*>', '', translated, flags=re.I).strip()
+                if not translated or translated.casefold() in ('false', 'true', 'end'):
+                    raise ValueError("Workers AI 未返回有效汉化正文")
+                logger.info("关注用户名 AI 汉化成功，输出长度: %s", len(translated))
+                return translated
+            except Exception as exc:
+                last_error = exc
+                logger.warning("关注用户名 AI 汉化失败 (%s/3): %s", attempt, exc)
+                if attempt < 3:
+                    time.sleep(5)
+
+        raise RuntimeError(f"AI 汉化连续 3 次失败：{last_error}")
 
     # ---------- 新增：测试连通性 ----------
     def test_workers_ai(self):

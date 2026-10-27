@@ -2144,6 +2144,15 @@
                             <el-option label="仅作者评论" value="by_author"></el-option>
                         </el-select>
                     </el-form-item>
+                    <el-form-item label="指定用户名 AI 汉化推送">
+                        <el-checkbox v-model="config.enable_user_translation">启用</el-checkbox>
+                        <div class="hint">仅监控下方“手动帖子链接”中的楼层，RSS 自动添加的链接不适用。命中指定用户名后跳过作者/角色、关键词及优惠 AI 过滤，直接汉化推送；仍遵守 24H 限制。</div>
+                    </el-form-item>
+                    <template v-if="config.enable_user_translation">
+                        <el-form-item label="监控用户名（每行一个，忽略大小写）">
+                            <el-input v-model="config.monitor_usernames_text" type="textarea" :rows="3" placeholder="例如：GreenCloud&#10;RackNerd"></el-input>
+                        </el-form-item>
+                    </template>
                     <el-form-item label="楼层关键词过滤">
                         <el-checkbox v-model="config.use_comment_keywords_filter">启用</el-checkbox>
                     </el-form-item>
@@ -2159,7 +2168,7 @@
                     <el-form-item label="启用 AI 过滤">
                         <el-checkbox v-model="config.use_ai_filter"></el-checkbox>
                     </el-form-item>
-                    <template v-if="config.use_ai_filter">
+                    <template v-if="config.use_ai_filter || config.enable_user_translation">
                         <el-form-item label="Cloudflare Account ID">
                             <el-input v-model="config.cf_account_id" placeholder="Cloudflare Account ID"></el-input>
                         </el-form-item>
@@ -2170,12 +2179,15 @@
                             <el-input v-model="config.model" placeholder="@cf/qwen/qwen1.5-14b-chat-awq"></el-input>
                         </el-form-item>
                         <el-button :loading="testingAI" type="success" plain :disabled="!filterEditing" @click="testWorkersAI">测试 Workers AI 有效性</el-button>
-                        <el-form-item label="主题帖 AI 提示词">
-                            <el-input v-model="config.thread_prompt" type="textarea" :rows="3"></el-input>
-                        </el-form-item>
-                        <el-form-item label="楼层评论 AI 提示词">
-                            <el-input v-model="config.comment_prompt" type="textarea" :rows="3"></el-input>
-                        </el-form-item>
+                        <template v-if="config.use_ai_filter">
+                            <el-form-item label="主题帖 AI 提示词">
+                                <el-input v-model="config.thread_prompt" type="textarea" :rows="3"></el-input>
+                            </el-form-item>
+                            <el-form-item label="楼层评论 AI 提示词">
+                                <el-input v-model="config.comment_prompt" type="textarea" :rows="3"></el-input>
+                            </el-form-item>
+                        </template>
+                        <div v-if="config.enable_user_translation" class="hint">关注用户的汉化使用独立的中文翻译提示词；即使关闭“启用 AI 过滤”，关注用户汉化仍需使用此处配置的 Cloudflare 模型。</div>
                     </template>
                 </div>
 
@@ -2342,6 +2354,9 @@ createApp({
                 comment_keywords_rule: '',
                 use_ai_filter: false,
                 comment_filter: 'by_author',
+                enable_user_translation: false,
+                monitor_usernames: [],
+                monitor_usernames_text: '',
                 urls: [
                     'https://lowendspirit.com/categories/offers/feed.rss',
                     'https://lowendtalk.com/categories/offers/feed.rss'
@@ -2416,6 +2431,11 @@ createApp({
             if (this.config.auto_add_rss_hits_to_extra_urls === undefined) this.config.auto_add_rss_hits_to_extra_urls = false;
             if (!this.config.auto_extra_urls || typeof this.config.auto_extra_urls !== 'object' || Array.isArray(this.config.auto_extra_urls)) this.config.auto_extra_urls = {};
             if (this.config.comment_filter === undefined || this.config.comment_filter === null || this.config.comment_filter === '') this.config.comment_filter = 'by_author';
+            if (this.config.enable_user_translation === undefined) this.config.enable_user_translation = false;
+            if (!Array.isArray(this.config.monitor_usernames)) {
+                this.config.monitor_usernames = typeof this.config.monitor_usernames === 'string' ? this.config.monitor_usernames.split(/\r?\n/) : [];
+            }
+            this.config.monitor_usernames_text = this.config.monitor_usernames.join('\n');
             if (this.config.restrict_24h === undefined) this.config.restrict_24h = true;
             if (this.config.use_thread_keywords_filter === undefined) this.config.use_thread_keywords_filter = false;
             if (this.config.thread_keywords_rule === undefined) this.config.thread_keywords_rule = '';
@@ -2428,12 +2448,22 @@ createApp({
             const configToSend = { ...this.config };
             configToSend.urls = (this.config.urls_text || '').split('\n').map(url => url.trim()).filter(Boolean);
             configToSend.extra_urls = (this.config.extra_urls_text || '').split('\n').map(url => url.trim()).filter(Boolean);
+            const uniqueUsernames = new Set();
+            configToSend.monitor_usernames = (this.config.monitor_usernames_text || '')
+                .split(/\r?\n/).map(name => name.trim().replace(/^@/, '')).filter(Boolean)
+                .filter(name => {
+                    const key = name.toLocaleLowerCase();
+                    if (uniqueUsernames.has(key)) return false;
+                    uniqueUsernames.add(key);
+                    return true;
+                });
             configToSend.rss_interval = Number(configToSend.rss_interval || 300);
             configToSend.comment_interval = Number(configToSend.comment_interval || 300);
             configToSend.rss_scan_limit = 20;
             delete configToSend.frequency;
             delete configToSend.urls_text;
             delete configToSend.extra_urls_text;
+            delete configToSend.monitor_usernames_text;
             return configToSend;
         },
         authenticate() {

@@ -28,3 +28,15 @@ def comment_message(thread, comment, ai_description):
     )
     return msg
 
+
+def watched_comment_message(thread, comment, translated_text):
+    """手动爬楼中的指定用户评论，完整展示汉化内容及原文地址。"""
+    return (
+        f"{thread['domain'].upper()} 关注用户新评论\n"
+        f"用户：{comment['author']}\n"
+        f"主题：{thread.get('title', '')}\n"
+        f"时间：{comment['created_at'].strftime('%Y/%m/%d %H:%M')}\n\n"
+        f"{str(translated_text).strip()}\n\n"
+        f"原文链接：{comment['url']}"
+    )
+
