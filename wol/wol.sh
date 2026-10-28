@@ -3,7 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.5.12"
+VERSION="1.5.14"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
 ETC_DIR="${APP_DIR}"
@@ -616,7 +616,8 @@ configure_nas() {
         "$mac" "$host_input" "${backup_input:-（未启用）}" "$port_input"
     info "每次点击都依次发送到主域名和备域名（间隔约 200 毫秒）。"
     info "每个目标先发送 5 个 Magic Packet，尽力使用源端口 UDP 9 补发 2 个。"
-    info "只要任一目标本机 UDP 发送成功，本次记成功；两个目标都失败才记一次失败。"
+    info "若两域名解析的 IPv4 不一致，WEB 提示 IP解析不一致（仍向两个目标发送）。"
+    info "解析一致时，任一目标本机 UDP 发送成功即记成功；两个目标都失败才记一次失败。"
     warn "UDP 发送成功不代表 NAS 已开机；整个点击仅有一条历史记录及一次冷却时间。"
     if command -v getent >/dev/null 2>&1; then
         local resolved

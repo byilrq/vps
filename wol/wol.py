@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.5.12"
+WOL_WEB_APP_VERSION = "1.5.14"
 
 import errno
 import fcntl
@@ -50,7 +50,14 @@ body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320
 .wake:active{transform:scale(.97)}.wake:disabled{cursor:not-allowed;opacity:.55}.wake:focus-visible,.refresh:focus-visible{outline:3px solid #f0fffc;outline-offset:5px}
 .power-icon{display:block;width:72px;height:72px;fill:none;stroke:#84f4c4;stroke-width:5.5;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .feedback{margin:13px 0 14px;min-height:24px;text-align:center;color:#91aac2;font-size:13px;overflow-wrap:anywhere}
+/* Independent IP-check and UDP-send indicators share the existing mint/red palette. */
 .feedback.ok{color:#9cf6d0}.feedback.err{color:#ffb0b9}.feedback.refused{color:#ffcf8b}
+.result-pair{display:inline-flex;flex-wrap:wrap;align-items:center;justify-content:center;row-gap:4px;line-height:1.55}
+.entry .result-pair{justify-content:flex-start}
+.result-item{display:inline-flex;align-items:center;white-space:nowrap;font-size:13px;font-weight:650}
+.result-item.ok{color:#8eebbf}.result-item.err{color:#ffacb9}.result-item.refused{color:#ffcf8b}
+.result-icon{display:inline-block;flex:none;width:15px;height:15px;margin-right:4px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.result-separator{margin:0 4px;color:#8296ad}
 .history{margin-top:5px;background:#111f31dc;border:1px solid var(--border);border-radius:18px;padding:18px 17px 12px}
 .heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:10px}
 .heading strong{font-size:15px;font-weight:700}.heading small{font-size:11px;color:#7890aa;margin-left:5px;font-weight:400}
@@ -91,6 +98,32 @@ const wakeButton = document.getElementById('wakeButton');
 const refreshButton = document.getElementById('refreshButton');
 const feedback = document.getElementById('feedback');
 function makeEl(tag, cls, text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
+function resultIcon(kind){
+  const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('class','result-icon');svg.setAttribute('viewBox','0 0 20 20');
+  svg.setAttribute('aria-hidden','true');svg.setAttribute('focusable','false');
+  const circle=document.createElementNS('http://www.w3.org/2000/svg','circle');
+  circle.setAttribute('cx','10');circle.setAttribute('cy','10');circle.setAttribute('r','8');svg.append(circle);
+  const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+  path.setAttribute('d',kind==='ok'?'M5.7 10.2l2.8 2.8 5.8-6':'M7.2 7.2l5.6 5.6m0-5.6l-5.6 5.6');
+  svg.append(path);return svg;
+}
+function resultItem(kind,text){
+  const item=makeEl('span','result-item '+kind);
+  item.append(resultIcon(kind),document.createTextNode(text));return item;
+}
+function makeResultPair(ipStatus,sendStatus){
+  const line=makeEl('span','result-pair');
+  const parts=[];
+  if(ipStatus==='matched')parts.push(resultItem('ok','IP解析一致'));
+  if(ipStatus==='mismatched')parts.push(resultItem('err','IP解析不一致'));
+  if(sendStatus==='sent')parts.push(resultItem('ok','唤醒数据包已发送'));
+  if(sendStatus==='refused')parts.push(resultItem('refused','Send refused！'));
+  if(sendStatus==='failed')parts.push(resultItem('err','WOL 发送失败'));
+  if(sendStatus==='sending')parts.push(makeEl('span','','… 正在发送'));
+  parts.forEach((part,index)=>{if(index)line.append(makeEl('span','result-separator','，'));line.append(part);});
+  return line;
+}
 async function refreshHistory(){
   refreshButton.disabled=true;
   try{
@@ -101,9 +134,9 @@ async function refreshHistory(){
     if(!data.records || !data.records.length){historyList.className='empty';historyList.textContent='暂无发送记录';return;}
     for(const item of data.records){
       const div=makeEl('div','entry');
-      const ok=item.status==='sent';const pending=item.status==='sending';const refused=item.status==='refused';
-      const statusText=ok?'✓ 唤醒数据包已发送':(pending?'… 正在发送':refused?'Send refused！':'发送失败');
-      div.append(makeEl('div','state '+(ok?'ok':pending?'':refused?'refused':'err'),statusText));
+      const ipStatus=item.ip_status || (item.status==='ip_mismatch'?'mismatched':'none');
+      const sendStatus=item.send_status || (item.status==='ip_mismatch'?'none':item.status);
+      div.append(makeResultPair(ipStatus,sendStatus));
       div.append(makeEl('time','when',item.time));historyList.append(div);
     }
   }catch(ex){historyList.className='empty';historyList.textContent='记录加载失败，请点击刷新';}
@@ -114,8 +147,15 @@ wakeButton.addEventListener('click',async()=>{
   try{
     const resp=await fetch('/api/wake',{method:'POST',headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store'});
     if(resp.status===401){location.reload();return;}
-    const data=await resp.json();feedback.className='feedback '+(data.refused?'refused':resp.ok?'ok':'err');
-    feedback.textContent=data.message || '请求失败';await refreshHistory();
+    const data=await resp.json();
+    feedback.className='feedback';
+    if(data.ip_status || data.send_status){
+      feedback.replaceChildren(makeResultPair(data.ip_status||'none',data.send_status||'failed'));
+    }else{
+      feedback.className='feedback '+(resp.ok?'ok':'err');
+      feedback.textContent=data.message || '请求失败';
+    }
+    await refreshHistory();
   }catch(ex){feedback.className='feedback err';feedback.textContent='连接失败，请检查 WEB 服务或网络连接';}
   finally{wakeButton.disabled=false;}
 });
@@ -233,11 +273,8 @@ class WOLSendError(OSError):
         self.errors = list(errors or [])
 
 
-def _send_wol_to_host(host, port, packet):
-    """Submit separate unconnected IPv4 UDP datagrams to one DDNS host.
-
-    A successful sendto only proves local submission, not receipt or boot.
-    """
+def _resolve_host_ipv4(host, port):
+    """Resolve once so the compared IPs are exactly the ones used to send."""
     target = validate_host(host)
     try:
         resolved = socket.getaddrinfo(target, port, socket.AF_INET, socket.SOCK_DGRAM)
@@ -249,7 +286,15 @@ def _send_wol_to_host(host, port, packet):
         raise ValueError("域名没有解析到 IPv4 地址")
     if len(ips) > 4:
         raise ValueError("域名解析出过多 IPv4 地址；请检查是否误开 CDN 代理")
+    return ips
 
+
+def _send_wol_to_host(host, port, packet, *, resolved_ips=None):
+    """Submit unconnected IPv4 UDP datagrams using a fixed DNS snapshot.
+
+    A successful sendto only proves local submission, not receipt or boot.
+    """
+    ips = _resolve_host_ipv4(host, port) if resolved_ips is None else list(resolved_ips)
     sent = 0
     sources = []
     errors = []
@@ -339,12 +384,48 @@ def send_wol(config):
     if backup:
         targets.append(("backup", backup))
 
+    # Take one DNS snapshot for each configured domain BEFORE transmitting.
+    # The same resolved addresses are then used by the UDP sender, so DNS
+    # changes between resolution and send cannot hide a mismatch.
+    resolved_ips = {}
+    resolution_errors = {}
+    for route, host in targets:
+        try:
+            resolved_ips[route] = _resolve_host_ipv4(host, port)
+        except (OSError, ValueError) as exc:
+            resolution_errors[route] = exc
+
+    # A backup DNS failure is ALSO shown as an IP mismatch warning: equality
+    # cannot be established unless both names resolve to the same IPv4 set.
+    # Store the detailed reason separately to distinguish unequal IPs from
+    # DNS resolution errors in the local diagnostic log.
+    compared = bool(backup)
+    fully_resolved = bool(compared and "primary" in resolved_ips and "backup" in resolved_ips)
+    ips_equal = bool(fully_resolved and
+                     set(resolved_ips["primary"]) == set(resolved_ips["backup"]))
+    ip_mismatch = bool(compared and not ips_equal)
+    ip_comparison = {
+        "checked": compared,
+        "matched": ips_equal if compared else None,
+        "resolution_complete": fully_resolved,
+        "reason": ("not_configured" if not compared else
+                   "resolution_failed" if not fully_resolved else
+                   "matched" if ips_equal else "different_ipv4"),
+        "host1_ipv4": list(resolved_ips.get("primary", [])),
+        "host2_ipv4": list(resolved_ips.get("backup", [])),
+    }
+
+    # A mismatch is a DDNS diagnostic warning, not a UDP delivery verdict.
+    # Continue sending to BOTH configured domains to preserve redundancy.
     attempts = []
     for i, (route, host) in enumerate(targets):
         if i:
             time.sleep(0.20)
         try:
-            ips, sent, sources, errors, refused, failed_packets = _send_wol_to_host(host, port, packet)
+            if route in resolution_errors:
+                raise resolution_errors[route]
+            ips, sent, sources, errors, refused, failed_packets = _send_wol_to_host(
+                host, port, packet, resolved_ips=resolved_ips[route])
             attempts.append({
                 "route": route, "host": host, "ok": True,
                 "ips": ips, "packets": sent, "failed_packets": failed_packets,
@@ -371,6 +452,8 @@ def send_wol(config):
     return {
         "ok": bool(succeeded),
         "refused": any(item["refused"] for item in attempts),
+        "ip_mismatch": ip_mismatch,
+        "ip_comparison": ip_comparison,
         "attempts": attempts,
         "port": port,
         "success_count": len(succeeded),
@@ -425,6 +508,7 @@ def append_send_log(config, result=None, *, trigger="web", error=""):
     to a private temporary file and atomically rename to avoid torn lines.
     """
     attempts = result.get("attempts", []) if result else []
+    # Overall is the UDP submission outcome; IP comparison is independent.
     overall = ("sent" if result and result.get("ok") else
                "refused" if result and result.get("refused") else "failed")
     entry = {
@@ -433,6 +517,10 @@ def append_send_log(config, result=None, *, trigger="web", error=""):
         "overall": overall,
         "host1": _log_host(config, "primary", attempts, error),
         "host2": _log_host(config, "backup", attempts, error),
+        "ip_comparison": (result.get("ip_comparison") if result else {
+            "checked": False, "matched": None,
+            "host1_ipv4": [], "host2_ipv4": [],
+        }),
     }
     line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
     logfile = SEND_LOG_FILE
@@ -483,14 +571,31 @@ def database():
 
 
 def history_items():
-    """Expose only status and Beijing time; never return saved network details."""
+    """Return separate display states, without exposing IPs or log diagnostics."""
     with database() as con:
-        rows = con.execute("SELECT at,status FROM sends ORDER BY id DESC LIMIT 5").fetchall()
-    return [
-        {"time": datetime.fromtimestamp(ts, TZ).strftime("%m/%d %H:%M:%S"),
-         "status": status}
-        for ts, status in rows
-    ]
+        rows = con.execute("SELECT at,status,detail FROM sends ORDER BY id DESC LIMIT 5").fetchall()
+    items = []
+    for ts, status, detail in rows:
+        ip_status = "none"
+        send_status = status
+        if status == "ip_mismatch":
+            # Older rows lack a separate send outcome; do not invent one.
+            ip_status, send_status = "mismatched", "none"
+        else:
+            try:
+                metadata = json.loads(detail)
+                if isinstance(metadata, dict):
+                    ip_status = metadata.get("ip_status", "none")
+                    send_status = metadata.get("send_status", status)
+            except (TypeError, ValueError):
+                pass
+        items.append({
+            "time": datetime.fromtimestamp(ts, TZ).strftime("%m/%d %H:%M:%S"),
+            "status": status,
+            "ip_status": ip_status if ip_status in ("none", "matched", "mismatched") else "none",
+            "send_status": send_status if send_status in ("none", "sent", "refused", "failed", "sending") else "failed",
+        })
+    return items
 
 
 def reserve_send(cooldown):
@@ -630,21 +735,30 @@ def wake():
               attempt["packets"], attempt["failed_packets"],
               attempt["refused"], attempt["warnings"] or attempt["error"])
 
-    if result["ok"]:
-        # Success of either host wins.  Even ECONNREFUSED on the other host
-        # must not turn the whole click into a failure.
-        finish_send(row_id, "sent", "唤醒数据包已发送")
-        return jsonify({"ok": True, "refused": False,
-                        "message": "✓ 唤醒数据包已发送"})
+    # The IP warning and UDP submission result are independent. A bad/missing
+    # backup DNS result must NOT suppress a successful primary WOL submission.
+    ip_status = ("mismatched" if result["ip_mismatch"] else
+                 "matched" if result["ip_comparison"]["checked"] else "none")
+    send_status = ("sent" if result["ok"] else
+                   "refused" if result["refused"] else "failed")
+    ip_text = ("IP解析一致" if ip_status == "matched" else
+               "IP解析不一致" if ip_status == "mismatched" else "")
+    send_text = ("唤醒数据包已发送" if send_status == "sent" else
+                 "Send refused！" if send_status == "refused" else "WOL 发送失败")
+    display_message = "，".join(text for text in (ip_text, send_text) if text)
 
-    if result["refused"]:
-        finish_send(row_id, "refused", "Send refused！")
-        return jsonify({"ok": False, "refused": True,
-                        "message": "Send refused！"}), 502
+    if result["ip_mismatch"]:
+        app.logger.warning("WOL DDNS IPv4 comparison warning: %s", result["ip_comparison"])
 
-    finish_send(row_id, "failed", "发送失败")
-    return jsonify({"ok": False, "refused": False,
-                    "message": "WOL 发送失败"}), 502
+    # A single click is one history row. Store only display states there;
+    # detailed independent host outcomes remain in the rolling JSONL log.
+    history_detail = json.dumps({"ip_status": ip_status, "send_status": send_status},
+                                ensure_ascii=False, separators=(",", ":"))
+    finish_send(row_id, send_status, history_detail)
+    response = {"ok": result["ok"], "ip_mismatch": result["ip_mismatch"],
+                "ip_status": ip_status, "send_status": send_status,
+                "refused": send_status == "refused", "message": display_message}
+    return jsonify(response), (200 if result["ok"] else 502)
 
 
 if __name__ == "__main__":
@@ -658,8 +772,13 @@ if __name__ == "__main__":
                 label = "主域名" if attempt["route"] == "primary" else "备域名"
                 status = "已提交" if attempt["ok"] else "失败"
                 print(f"{label} {attempt['host']}：{status} {attempt['packets']} 个包；错误包 {attempt['failed_packets']} 个；Errno111={attempt['refused']}")
+            if result["ip_comparison"]["checked"]:
+                print("✖ IP解析不一致" if result["ip_mismatch"] else "✔ IP解析一致")
+                if result["ip_mismatch"]:
+                    print("主域名 IPv4：" + ", ".join(result["ip_comparison"]["host1_ipv4"]))
+                    print("备域名 IPv4：" + ", ".join(result["ip_comparison"]["host2_ipv4"]))
             if result["ok"]:
-                print("✓ 唤醒数据包已发送")
+                print("✔ 唤醒数据包已发送")
             elif result["refused"]:
                 print("Send refused！", file=sys.stderr)
                 sys.exit(1)
