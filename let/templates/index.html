@@ -2032,7 +2032,7 @@
                     <el-input-number v-model="config.rss_interval" :min="30" :step="10"></el-input-number>
                 </el-form-item>
                 <el-form-item label="爬楼监控间隔（秒）">
-                    <el-input-number v-model="config.comment_interval" :min="30" :step="10"></el-input-number>
+                    <el-input-number v-model="config.comment_interval" :min="1" :step="1" :precision="0"></el-input-number>
                 </el-form-item>
 
                 <el-form-item label="选择通知方式">
