@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.5.9"
+WOL_WEB_APP_VERSION = "1.5.12"
 
+import errno
+import fcntl
 import hmac
 import ipaddress
 import json
@@ -13,6 +15,7 @@ import socket
 import sqlite3
 import threading
 import time
+import tempfile
 from datetime import datetime
 from functools import wraps
 from contextlib import contextmanager
@@ -26,6 +29,7 @@ from werkzeug.security import check_password_hash
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_FILE = Path(os.environ.get("WOL_CONFIG_FILE", str(APP_DIR / "config.json")))
 DB_FILE = Path(os.environ.get("WOL_HISTORY_FILE", str(APP_DIR / "wol_history.db")))
+SEND_LOG_FILE = Path(os.environ.get("WOL_SEND_LOG_FILE", str(APP_DIR / "wol_send.log")))
 TZ = ZoneInfo("Asia/Shanghai")
 os.umask(0o077)
 
@@ -46,14 +50,14 @@ body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320
 .wake:active{transform:scale(.97)}.wake:disabled{cursor:not-allowed;opacity:.55}.wake:focus-visible,.refresh:focus-visible{outline:3px solid #f0fffc;outline-offset:5px}
 .power-icon{display:block;width:72px;height:72px;fill:none;stroke:#84f4c4;stroke-width:5.5;stroke-linecap:round;stroke-linejoin:round;flex:none}
 .feedback{margin:13px 0 14px;min-height:24px;text-align:center;color:#91aac2;font-size:13px;overflow-wrap:anywhere}
-.feedback.ok{color:#9cf6d0}.feedback.err{color:#ffb0b9}
+.feedback.ok{color:#9cf6d0}.feedback.err{color:#ffb0b9}.feedback.refused{color:#ffcf8b}
 .history{margin-top:5px;background:#111f31dc;border:1px solid var(--border);border-radius:18px;padding:18px 17px 12px}
 .heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding-bottom:10px}
 .heading strong{font-size:15px;font-weight:700}.heading small{font-size:11px;color:#7890aa;margin-left:5px;font-weight:400}
 .refresh{border:1px solid #37506a;background:#172d40;color:#bdebd9;padding:8px 12px;font:inherit;font-size:12px;border-radius:9px;cursor:pointer}
 .empty{color:#8196af;text-align:center;padding:26px 2px;font-size:13px}
 .entry{padding:11px 0;border-top:1px solid #23394d;display:flex;gap:7px 12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
-.state{font-size:13px;font-weight:650}.state.ok{color:#8eebbf}.state.err{color:#ffacb9}
+.state{font-size:13px;font-weight:650}.state.ok{color:#8eebbf}.state.err{color:#ffacb9}.state.refused{color:#ffcf8b}
 .when{font-size:11px;color:#839ab4;white-space:nowrap;margin-left:auto;font-variant-numeric:tabular-nums}
 .login{background:#101e2fcf;border:1px solid var(--border);border-radius:20px;padding:30px 24px 28px;margin:clamp(40px,12vh,112px) auto 0;width:100%;max-width:390px}
 .login-mark{display:flex;align-items:center;justify-content:center;margin:0 auto 20px;width:40px;height:40px;border-radius:50%;background:#132b3a;border:1px solid #477c78;box-shadow:0 0 14px #33d9a31a}.login-mark svg{width:22px;height:22px;fill:none;stroke:#84f4c4;stroke-width:4;stroke-linecap:round;stroke-linejoin:round}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border:0}
@@ -97,9 +101,9 @@ async function refreshHistory(){
     if(!data.records || !data.records.length){historyList.className='empty';historyList.textContent='暂无发送记录';return;}
     for(const item of data.records){
       const div=makeEl('div','entry');
-      const ok=item.status==='sent';const pending=item.status==='sending';
-      const statusText=ok?'✓ 唤醒数据包已发送':(pending?'… 正在发送':'发送失败');
-      div.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),statusText));
+      const ok=item.status==='sent';const pending=item.status==='sending';const refused=item.status==='refused';
+      const statusText=ok?'✓ 唤醒数据包已发送':(pending?'… 正在发送':refused?'Send refused！':'发送失败');
+      div.append(makeEl('div','state '+(ok?'ok':pending?'':refused?'refused':'err'),statusText));
       div.append(makeEl('time','when',item.time));historyList.append(div);
     }
   }catch(ex){historyList.className='empty';historyList.textContent='记录加载失败，请点击刷新';}
@@ -110,7 +114,7 @@ wakeButton.addEventListener('click',async()=>{
   try{
     const resp=await fetch('/api/wake',{method:'POST',headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store'});
     if(resp.status===401){location.reload();return;}
-    const data=await resp.json();feedback.className='feedback '+(resp.ok?'ok':'err');
+    const data=await resp.json();feedback.className='feedback '+(data.refused?'refused':resp.ok?'ok':'err');
     feedback.textContent=data.message || '请求失败';await refreshHistory();
   }catch(ex){feedback.className='feedback err';feedback.textContent='连接失败，请检查 WEB 服务或网络连接';}
   finally{wakeButton.disabled=false;}
@@ -131,20 +135,14 @@ def load_config():
         return {}
 
 
+# Missing optional configuration fields do not prevent the web service from
+# starting. The management script fills in defaults before deploying the app.
+# Keep authentication unavailable until a persistent secret/password exists.
 _boot = load_config()
-if not _boot.get("secret_key"):
-    raise SystemExit(f"WOL 配置文件不可用或缺少 secret_key: {CONFIG_FILE}")
-CONFIG_KEYS = {
-    "host1", "host2", "mac", "port", "send_count", "cooldown_seconds",
-    "auth_enabled", "web_domain", "external_port", "internal_port",
-    "password_hash", "secret_key", "firewall", "nginx_config_path", "nginx_link_path",
-}
-if (not all(isinstance(_boot.get(k), str) for k in ("host1", "host2"))
-        or set(_boot) - CONFIG_KEYS):
-    raise SystemExit("WOL 配置文件不符合本版 host1/host2 格式。请先备份原配置，再重新初始化。")
+_has_persistent_secret = isinstance(_boot.get("secret_key"), str) and bool(_boot.get("secret_key"))
 
 app = Flask(__name__)
-app.secret_key = _boot["secret_key"]
+app.secret_key = _boot["secret_key"] if _has_persistent_secret else secrets.token_hex(32)
 # Only trust the locally configured Nginx proxy; do not bind the app to public interfaces.
 app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)
 app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax", SESSION_COOKIE_SECURE=True)
@@ -221,11 +219,24 @@ def build_packet(mac):
     return b"\xff" * 6 + normalize_mac(mac) * 16
 
 
-def _send_wol_to_host(host, port, packet):
-    """Resolve one DDNS/IPv4 target, then send the existing UDP Magic Packets.
+class WOLSendError(OSError):
+    """UDP submission failure, optionally carrying ICMP-related errno 111.
 
-    A successful UDP send only means that the local OS accepted the datagram;
-    neither its delivery nor NAS power-on can be confirmed at this layer.
+    ECONNREFUSED is a network hint, never proof of NAS online/offline status.
+    """
+
+    def __init__(self, message, *, refused=False, ips=None, failed_packets=0, errors=None):
+        super().__init__(message)
+        self.refused = bool(refused)
+        self.ips = list(ips or [])
+        self.failed_packets = int(failed_packets)
+        self.errors = list(errors or [])
+
+
+def _send_wol_to_host(host, port, packet):
+    """Submit separate unconnected IPv4 UDP datagrams to one DDNS host.
+
+    A successful sendto only proves local submission, not receipt or boot.
     """
     target = validate_host(host)
     try:
@@ -240,49 +251,70 @@ def _send_wol_to_host(host, port, packet):
         raise ValueError("域名解析出过多 IPv4 地址；请检查是否误开 CDN 代理")
 
     sent = 0
-    source_descriptions = []
-    for address in ips:
-        destination = (address, port)
-        # Standard first pass; send errors for this target do not skip the other target.
+    sources = []
+    errors = []
+    refused = False
+
+    def send_one(destination, use_source_port_9):
+        # One fresh UDP socket per packet avoids stale errors on a connected
+        # socket; it does not guarantee the remote router/NAS received data.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(3)
-            sock.connect(destination)
-            source_ip, source_port = sock.getsockname()
-            source_descriptions.append(f"{source_ip}:{source_port}")
-            for index in range(5):
-                sock.send(packet)
-                sent += 1
-                if index != 4:
-                    time.sleep(0.10)
-
-        # Optional second send from source UDP/9. Failure is best-effort and
-        # does not invalidate the five standard packets already sent.
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-                sock.settimeout(3)
+            if use_source_port_9:
                 sock.bind(("0.0.0.0", 9))
-                sock.connect(destination)
-                source_ip, source_port = sock.getsockname()
-                source_descriptions.append(f"{source_ip}:{source_port}")
-                for index in range(2):
-                    sock.send(packet)
-                    sent += 1
-                    if index == 0:
-                        time.sleep(0.10)
-        except OSError as exc:
-            source_descriptions.append(f"源端口9不可用({exc.__class__.__name__})")
+            written = sock.sendto(packet, destination)
+            if written != len(packet):
+                raise OSError(f"UDP 发包不完整：{written}/{len(packet)} 字节")
+            try:
+                return sock.getsockname()[1]
+            except OSError:
+                return 9 if use_source_port_9 else 0
 
-    return ips, sent, source_descriptions
+    for ip in ips:
+        destination = (ip, port)
+        for index in range(5):
+            try:
+                src_port = send_one(destination, False)
+                sent += 1
+                sources.append(f"随机源端口:{src_port}")
+            except OSError as exc:
+                if exc.errno == errno.ECONNREFUSED:
+                    refused = True
+                errors.append(f"{ip} UDP 发送：{exc}")
+            if index < 4:
+                time.sleep(0.10)
+
+        # Two best-effort packets from UDP source port 9. A bind failure
+        # does not invalidate successful submissions from random ports.
+        for index in range(2):
+            try:
+                src_port = send_one(destination, True)
+                sent += 1
+                sources.append(f"源端口:{src_port}")
+            except OSError as exc:
+                if exc.errno == errno.ECONNREFUSED:
+                    refused = True
+                errors.append(f"{ip} 源端口9：{exc}")
+            if index == 0:
+                time.sleep(0.10)
+
+    unique_errors = list(dict.fromkeys(errors))
+    if sent == 0:
+        brief = "；".join(unique_errors[:3]) or "没有数据包提交成功"
+        raise WOLSendError(
+            f"没有数据包成功提交：{brief}", refused=refused,
+            ips=ips, failed_packets=len(errors), errors=unique_errors,
+        )
+
+    return ips, sent, sources, unique_errors, refused, len(errors)
 
 
 def send_wol(config):
-    """Send to *both* configured DDNS targets, primary then backup.
+    """Attempt host1 then host2; a single successful host wins overall.
 
-    One click is one logical attempt, regardless of the number of targets.
-    Each target is independently resolved; UDP has no delivery ACK, so a
-    successful local send MUST NOT be treated as proof the NAS powered on.
-    Only the host1/host2 configuration format is supported.
-    host2 may be an empty string to disable the second target.
+    For any configured target, capture its own genuine UDP submission
+    outcome.  Both failures are represented in the result instead of
+    throwing away per-host diagnostics in an exception.
     """
     try:
         port = int(config.get("port", 9))
@@ -294,50 +326,147 @@ def send_wol(config):
     if len(packet) != 102:
         raise ValueError("Magic Packet 长度不正确")
 
-    if not isinstance(config.get("host1"), str) or not isinstance(config.get("host2"), str):
-        raise ValueError("配置格式无效：请在菜单 2 设置 host1 和 host2")
-    primary = config["host1"].strip()
-    backup = config["host2"].strip()
+    primary = config.get("host1", "")
+    backup = config.get("host2", "")
+    primary = primary.strip() if isinstance(primary, str) else ""
+    backup = backup.strip() if isinstance(backup, str) else ""
+    if not primary:
+        raise ValueError("主域名尚未设置，请在管理菜单 2 填写 host1")
     if backup and backup.lower().rstrip(".") == primary.lower().rstrip("."):
         raise ValueError("主域名和备域名不能相同")
+
     targets = [("primary", primary)]
     if backup:
         targets.append(("backup", backup))
 
     attempts = []
     for i, (route, host) in enumerate(targets):
-        # Keep 200 ms between target rounds, not between packets of one round.
         if i:
             time.sleep(0.20)
         try:
-            ips, sent, sources = _send_wol_to_host(host, port, packet)
+            ips, sent, sources, errors, refused, failed_packets = _send_wol_to_host(host, port, packet)
             attempts.append({
                 "route": route, "host": host, "ok": True,
-                "ips": ips, "packets": sent, "sources": sources,
-                "error": "",
+                "ips": ips, "packets": sent, "failed_packets": failed_packets,
+                "sources": sources, "error": "", "warnings": errors,
+                "refused": refused,
             })
         except (OSError, ValueError) as exc:
             attempts.append({
                 "route": route, "host": host, "ok": False,
-                "ips": [], "packets": 0, "sources": [],
-                "error": str(exc),
+                "ips": list(getattr(exc, "ips", [])), "packets": 0,
+                "failed_packets": int(getattr(exc, "failed_packets", 0)),
+                "sources": [], "error": str(exc),
+                "warnings": list(getattr(exc, "errors", [])),
+                "refused": bool(getattr(exc, "refused", False) or
+                                getattr(exc, "errno", None) == errno.ECONNREFUSED),
             })
 
     succeeded = [attempt for attempt in attempts if attempt["ok"]]
-    if not succeeded:
-        reasons = [
-            f"{'主域名' if a['route'] == 'primary' else '备域名'}"
-            f"({a['host'] or '未设置'})：{a['error']}"
-            for a in attempts
-        ]
-        raise ValueError("；".join(reasons) or "未配置可用的 WOL 目标")
+    reasons = [
+        f"{'主域名' if item['route'] == 'primary' else '备域名'}"
+        f"({item['host']})：{item['error']}"
+        for item in attempts if not item["ok"]
+    ]
     return {
+        "ok": bool(succeeded),
+        "refused": any(item["refused"] for item in attempts),
         "attempts": attempts,
         "port": port,
         "success_count": len(succeeded),
         "target_count": len(attempts),
-        "packets": sum(a["packets"] for a in attempts),
+        "packets": sum(item["packets"] for item in attempts),
+        "error": "；".join(reasons),
     }
+
+
+def _log_host(config, route, attempts, error=""):
+    """One independent and truthful status per host, per click."""
+    key = "host1" if route == "primary" else "host2"
+    configured = config.get(key, "")
+    configured = configured.strip() if isinstance(configured, str) else ""
+    attempt = next((item for item in attempts if item["route"] == route), None)
+    if attempt is None:
+        return {
+            "domain": configured,
+            "status": "not_attempted" if (route == "primary" or configured) else "disabled",
+            "resolved_ipv4": [], "packets_sent": 0, "packets_failed": 0,
+            "errno111": False,
+            "errors": [str(error)[:250]] if error and (route == "primary" or configured) else [],
+        }
+
+    sent = int(attempt.get("packets", 0))
+    failed = int(attempt.get("failed_packets", 0))
+    if sent and failed:
+        status = "partial"
+    elif sent:
+        status = "sent"
+    else:
+        status = "failed"
+    errors = list(attempt.get("warnings", []))
+    if attempt.get("error") and attempt["error"] not in errors:
+        errors.append(attempt["error"])
+    return {
+        "domain": attempt.get("host", configured),
+        "status": status,
+        "resolved_ipv4": list(attempt.get("ips", [])),
+        "packets_sent": sent,
+        "packets_failed": failed,
+        "errno111": bool(attempt.get("refused", False)),
+        "errors": [str(message)[:250] for message in errors[:4]],
+    }
+
+
+def append_send_log(config, result=None, *, trigger="web", error=""):
+    """Keep exactly the latest 20 actual send attempts in a local JSONL log.
+
+    Each line = one click, with separate host1 / host2 network outcomes.
+    A stable sidecar flock serializes updates among Gunicorn workers; write
+    to a private temporary file and atomically rename to avoid torn lines.
+    """
+    attempts = result.get("attempts", []) if result else []
+    overall = ("sent" if result and result.get("ok") else
+               "refused" if result and result.get("refused") else "failed")
+    entry = {
+        "time": datetime.now(TZ).isoformat(timespec="seconds"),
+        "trigger": trigger,
+        "overall": overall,
+        "host1": _log_host(config, "primary", attempts, error),
+        "host2": _log_host(config, "backup", attempts, error),
+    }
+    line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
+    logfile = SEND_LOG_FILE
+    lockfile = logfile.with_name(logfile.name + ".lock")
+    logfile.parent.mkdir(parents=True, exist_ok=True)
+    lockfd = os.open(str(lockfile), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        with os.fdopen(lockfd, "rb") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                try:
+                    with logfile.open("r", encoding="utf-8") as existing:
+                        previous = existing.readlines()[-19:]
+                except FileNotFoundError:
+                    previous = []
+                fd, name = tempfile.mkstemp(prefix=".wol-send-", dir=str(logfile.parent))
+                try:
+                    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                        for old in previous:
+                            if old.strip():
+                                handle.write(old.rstrip("\r\n") + "\n")
+                        handle.write(line)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.chmod(name, 0o600)
+                    os.replace(name, logfile)
+                finally:
+                    if os.path.exists(name):
+                        os.unlink(name)
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+    except Exception:
+        raise
+    return entry
 
 
 @contextmanager
@@ -405,8 +534,9 @@ def healthz():
 
 @app.get("/")
 def index():
-    if not load_config().get("password_hash"):
-        return "WEB 未完成初始化：请运行 wol.sh，选择菜单 3 设置访问密码。", 503
+    config = load_config()
+    if not config.get("password_hash") or not config.get("secret_key"):
+        return "WEB 未完成初始化：请运行 wol.sh，选择菜单 1 补齐配置，再在菜单 3 设置访问密码。", 503
     return render_template_string(PAGE, csrf=csrf_token(),
                                   auth_enabled=auth_enabled(), logged_in=logged_in(),
                                   message=request.args.get("error", ""))
@@ -455,13 +585,24 @@ def history():
     return jsonify({"records": history_items()})
 
 
+def _safe_log_send(config, result=None, *, trigger="web", error=""):
+    try:
+        append_send_log(config, result, trigger=trigger, error=error)
+    except (OSError, ValueError, TypeError):
+        # A log I/O problem must never mask the real packet submission result.
+        app.logger.exception("Unable to rotate 20-entry WOL send log")
+
+
 @app.post("/api/wake")
 @require_auth
 def wake():
     if not check_csrf():
         return jsonify({"ok": False, "message": "页面验证失效，请刷新后重试"}), 400
     config = load_config()
-    cooldown = max(5, min(600, int(config.get("cooldown_seconds", 20))))
+    try:
+        cooldown = max(5, min(600, int(config.get("cooldown_seconds") or 20)))
+    except (TypeError, ValueError):
+        cooldown = 20
     try:
         row_id, seconds_left = reserve_send(cooldown)
     except sqlite3.Error:
@@ -469,55 +610,65 @@ def wake():
         return jsonify({"ok": False, "message": "发送记录数据库暂时不可写，请检查服务权限"}), 503
     if row_id is None:
         return jsonify({"ok": False, "message": f"操作过于频繁，请 {seconds_left} 秒后再试"}), 429
+
     try:
         result = send_wol(config)
-        both_ok = result["target_count"] == 2 and result["success_count"] == 2
-        partial_ok = result["success_count"] < result["target_count"]
-        status_detail = "主备均已发送" if both_ok else ("部分目标已发送" if partial_ok else "发送成功")
-        finish_send(row_id, "sent", status_detail)
-        # The UI keeps one record and one cooldown per click, not per target.
-        for attempt in result["attempts"]:
-            if attempt["ok"]:
-                app.logger.info(
-                    "WOL sent: route=%s host=%s resolved=%s port=%s packets=%s sources=%s",
-                    attempt["route"], attempt["host"], attempt["ips"],
-                    result["port"], attempt["packets"], attempt["sources"],
-                )
-            else:
-                app.logger.warning(
-                    "WOL target failed: route=%s host=%s error=%s",
-                    attempt["route"], attempt["host"], attempt["error"],
-                )
-        if both_ok:
-            message = "✓ 主备域名唤醒包均已发送"
-        elif partial_ok:
-            route = next(a["route"] for a in result["attempts"] if a["ok"])
-            message = "✓ 主域名已发送（备域名发送失败）" if route == "primary" else "✓ 备域名已发送（主域名发送失败）"
-        else:
-            message = "✓ 唤醒数据包已发送"
-        return jsonify({"ok": True, "message": message})
     except (OSError, ValueError, TypeError, KeyError) as exc:
-        app.logger.warning("WOL failed: %s", exc)
+        # A malformed configuration did not begin sending to either host.
+        _safe_log_send(config, trigger="web", error=str(exc))
+        app.logger.warning("WOL preparation failed: %s", exc)
         finish_send(row_id, "failed", "发送失败")
-        return jsonify({"ok": False, "message": f"WOL 发送失败：{exc}"}), 502
+        return jsonify({"ok": False, "message": "WOL 发送失败"}), 502
+
+    # One click -> exactly one rotated local log entry, with BOTH independent
+    # host outcomes, even when one target fails DNS or all packets fail.
+    _safe_log_send(config, result)
+    for attempt in result["attempts"]:
+        level = app.logger.info if attempt["ok"] else app.logger.warning
+        level("WOL route=%s host=%s ips=%s submitted=%s failed=%s errno111=%s details=%s",
+              attempt["route"], attempt["host"], attempt["ips"],
+              attempt["packets"], attempt["failed_packets"],
+              attempt["refused"], attempt["warnings"] or attempt["error"])
+
+    if result["ok"]:
+        # Success of either host wins.  Even ECONNREFUSED on the other host
+        # must not turn the whole click into a failure.
+        finish_send(row_id, "sent", "唤醒数据包已发送")
+        return jsonify({"ok": True, "refused": False,
+                        "message": "✓ 唤醒数据包已发送"})
+
+    if result["refused"]:
+        finish_send(row_id, "refused", "Send refused！")
+        return jsonify({"ok": False, "refused": True,
+                        "message": "Send refused！"}), 502
+
+    finish_send(row_id, "failed", "发送失败")
+    return jsonify({"ok": False, "refused": False,
+                    "message": "WOL 发送失败"}), 502
 
 
 if __name__ == "__main__":
     import sys
     if len(sys.argv) == 2 and sys.argv[1] == "--test-wol":
-        # Operator-only SSH diagnostic: use the installed config, bypassing
-        # browser/HTTPS. This makes it possible to isolate VPS UDP vs WEB.
+        config = load_config()
         try:
-            result = send_wol(load_config())
+            result = send_wol(config)
+            _safe_log_send(config, result, trigger="ssh_test")
             for attempt in result["attempts"]:
                 label = "主域名" if attempt["route"] == "primary" else "备域名"
-                if attempt["ok"]:
-                    print(f"WOL 测试：{label} {attempt['host']} → {', '.join(attempt['ips'])}:{result['port']}；已发送 {attempt['packets']} 个 Magic Packet")
-                else:
-                    print(f"WOL 测试：{label} {attempt['host']} 发送失败：{attempt['error']}")
-            print(f"本次发送结果：成功 {result['success_count']}/{result['target_count']}，共发送 {result['packets']} 个 Magic Packet")
-            print("注意：发送成功不代表家庭路由器已转发或 NAS 已启动。")
+                status = "已提交" if attempt["ok"] else "失败"
+                print(f"{label} {attempt['host']}：{status} {attempt['packets']} 个包；错误包 {attempt['failed_packets']} 个；Errno111={attempt['refused']}")
+            if result["ok"]:
+                print("✓ 唤醒数据包已发送")
+            elif result["refused"]:
+                print("Send refused！", file=sys.stderr)
+                sys.exit(1)
+            else:
+                print("WOL 发送失败", file=sys.stderr)
+                sys.exit(1)
+            print("注意：本地发送成功不等于 NAS 已经开机。")
         except (OSError, ValueError, TypeError, KeyError) as exc:
+            _safe_log_send(config, trigger="ssh_test", error=str(exc))
             print(f"WOL 测试发送失败：{exc}", file=sys.stderr)
             sys.exit(1)
     elif len(sys.argv) > 1:

@@ -3,7 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.5.9"
+VERSION="1.5.12"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
 ETC_DIR="${APP_DIR}"
@@ -68,7 +68,7 @@ PY
 
 config_set_fields() {
     local arg
-    [[ -f "$CONFIG_FILE" ]] || { err "配置文件不存在，请先执行菜单 1。"; return 1; }
+    ensure_config || return 1
     python3 - "$CONFIG_FILE" "$@" <<'PY'
 import json, os, sys, tempfile
 path = sys.argv[1]
@@ -106,6 +106,7 @@ PY
 
 record_firewall_port() {
     local kind="$1" port="$2"
+    ensure_config || return 1
     python3 - "$CONFIG_FILE" "$kind" "$port" <<'PY'
 import json, os, sys, tempfile
 path, kind, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
@@ -235,51 +236,95 @@ download_wol_program() {
     info "已安装本地 v${VERSION} 的 wol.py。"
 }
 
-validate_new_config() {
-    [[ -f "$CONFIG_FILE" ]] || return 0
-    python3 - "$CONFIG_FILE" <<'PY_VALIDATE'
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as handle:
-        data = json.load(handle)
-    allowed = {
-        "host1", "host2", "mac", "port", "send_count", "cooldown_seconds",
-        "auth_enabled", "web_domain", "external_port", "internal_port",
-        "password_hash", "secret_key", "firewall", "nginx_config_path", "nginx_link_path"
-    }
-    valid = (isinstance(data, dict)
-             and all(isinstance(data.get(k), str) for k in ("host1", "host2"))
-             and not (set(data) - allowed))
-except (OSError, ValueError, TypeError):
-    valid = False
-if not valid:
-    print("配置文件不是 host1/host2 新格式。请先备份并移走 config.json，再运行菜单 1 创建全新配置。", file=sys.stderr)
-    raise SystemExit(1)
-PY_VALIDATE
-}
-
-initialize_config() {
-    # Menu 1 deliberately has no interactive settings: no WEB password, no
-    # external/internal port prompts, and no firewall manipulation.
-    # Menu 3 configures password/ports and opens its own firewall port.
-    WOL_CONFIG_FILE="$CONFIG_FILE" python3 - <<'PY_CONFIG'
-import json, os, secrets
+ensure_config() {
+    # A missing config is initialized. Missing or unusable individual fields
+    # receive safe defaults; existing password, host and port values remain.
+    # No schema-version gate and no conversion of unrelated field names.
+    python3 - "$CONFIG_FILE" <<'PY_CONFIG'
+import json, os, secrets, sys, tempfile
 from pathlib import Path
-path = Path(os.environ["WOL_CONFIG_FILE"])
-obj = {
-    "host1": "", "host2": "", "mac": "", "port": 9,
-    "send_count": 5, "cooldown_seconds": 20,
-    "auth_enabled": True,
-    "web_domain": "", "external_port": 8119, "internal_port": 8109,
-    "password_hash": "", "secret_key": secrets.token_hex(32),
-    "firewall": {"ufw_added_ports": [], "firewalld_added_ports": [], "iptables_added_ports": []},
-    "nginx_config_path": "", "nginx_link_path": ""
-}
-with path.open("x", encoding="utf-8") as f:
-    json.dump(obj, f, ensure_ascii=False, indent=2)
-    f.write("\n")
+
+path = Path(sys.argv[1])
+path.parent.mkdir(parents=True, exist_ok=True)
+created = not path.exists()
+try:
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {}
+except (OSError, ValueError) as exc:
+    print(f"[ERROR] config.json 无法读取或不是有效 JSON；为保护原配置，未自动覆盖：{exc}", file=sys.stderr)
+    raise SystemExit(1)
+if not isinstance(data, dict):
+    print("[ERROR] config.json 的根内容必须是 JSON 对象；为保护原配置，未自动覆盖。", file=sys.stderr)
+    raise SystemExit(1)
+
+changed = created
+added = []
+strings = ("host1", "host2", "mac", "web_domain", "password_hash",
+           "nginx_config_path", "nginx_link_path")
+for key in strings:
+    if not isinstance(data.get(key), str):
+        data[key] = ""
+        changed = True
+        added.append(key)
+if not isinstance(data.get("secret_key"), str) or not data["secret_key"].strip():
+    data["secret_key"] = secrets.token_hex(32)
+    changed = True
+    added.append("secret_key")
+for key, default in (("port", 9), ("send_count", 5),
+                     ("cooldown_seconds", 20), ("external_port", 8119),
+                     ("internal_port", 8109)):
+    val = data.get(key)
+    if isinstance(val, bool):
+        val = None
+    try:
+        num = int(val)
+    except (TypeError, ValueError):
+        num = default
+    valid = (1 <= num <= 65535) if key.endswith("port") or key == "port" else (num > 0)
+    if not valid:
+        num = default
+    if data.get(key) != num or isinstance(data.get(key), bool):
+        data[key] = num
+        changed = True
+        added.append(key)
+if data.get("auth_enabled") is not True:
+    data["auth_enabled"] = True
+    changed = True
+    added.append("auth_enabled")
+if not isinstance(data.get("firewall"), dict):
+    data["firewall"] = {}
+    changed = True
+    added.append("firewall")
+for kind in ("ufw", "firewalld", "iptables"):
+    key = kind + "_added_ports"
+    if not isinstance(data["firewall"].get(key), list):
+        data["firewall"][key] = []
+        changed = True
+        added.append("firewall." + key)
+
+if changed:
+    fd, tmp = tempfile.mkstemp(prefix=".wol-config-", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.unlink(tmp)
 os.chmod(path, 0o600)
+if created:
+    print("[INFO] 已创建默认 config.json；NAS 域名和 WEB 设置请在菜单 2/3 填写。")
+elif added:
+    print("[INFO] 已自动补齐缺失参数：" + ", ".join(added))
 PY_CONFIG
+    local rc=$?
+    (( rc == 0 )) || return "$rc"
+    chown root:root "$CONFIG_FILE" 2>/dev/null || true
+    chmod 600 "$CONFIG_FILE" 2>/dev/null || true
 }
 
 make_password_hash() {
@@ -453,7 +498,6 @@ install_deploy() {
         err "$SERVICE_FILE 已存在且不是本脚本管理的服务，已停止以保护现有服务。"
         return 1
     fi
-    validate_new_config || return 1
     prepare_managed_dir "$APP_DIR" ".wol-web-managed" || return 1
 
     info "安装 Python 运行环境及下载工具..."
@@ -473,12 +517,11 @@ install_deploy() {
     }
 
     download_wol_program || return 1
-    if [[ ! -f "$CONFIG_FILE" ]]; then
-        initialize_config || { err "创建默认配置失败。"; return 1; }
-        info "已创建配置文件，未设置 WEB 密码和对外端口；请在菜单 3 完成。"
-    else
-        # Preserve existing password/ports on upgrade; never prompt during menu 1.
-        config_set_fields "auth_enabled=true" || return 1
+    local is_new_config=0
+    [[ -f "$CONFIG_FILE" ]] || is_new_config=1
+    ensure_config || { err "创建或补齐配置失败。"; return 1; }
+    if (( is_new_config == 1 )); then
+        info "请在菜单 3 设置 WEB 密码和端口。"
     fi
     chown root:root "$APP_DIR" 2>/dev/null || true
     chmod 700 "$APP_DIR"
@@ -521,8 +564,11 @@ install_deploy() {
 
 configure_nas() {
     need_root || return 1
-    is_configured || { err "请先运行菜单 1 安装部署。"; return 1; }
-    validate_new_config || return 1
+    if [[ ! -f "$SERVICE_FILE" && ! -f "$APP_DIR/.wol-web-managed" ]]; then
+        err "请先运行菜单 1 安装部署。"
+        return 1
+    fi
+    ensure_config || return 1
 
     local old_mac old_host old_backup old_port mac_input host_input backup_input port_input mac
     old_mac="$(config_get mac)"
@@ -749,7 +795,8 @@ sync_existing_nginx() {
 
 web_settings() {
     need_root || return 1
-    is_installed || { err "请先运行菜单 1 安装部署。"; return 1; }
+    [[ -f "$SERVICE_FILE" ]] || { err "请先运行菜单 1 安装部署。"; return 1; }
+    ensure_config || return 1
 
     local domain old_domain external_port internal_port old_external old_internal
     local password password_confirm password_hash=""
@@ -993,6 +1040,7 @@ show_status() {
         fi
         printf '  应用目录：%s\n' "$APP_DIR"
         printf '  配置文件：%s\n' "$CONFIG_FILE"
+        printf '  最近20次本地发送日志：%s\n' "$APP_DIR/wol_send.log"
         if command -v curl >/dev/null 2>&1 && curl -fsS --max-time 3 "http://127.0.0.1:${internal_port:-8109}/healthz" 2>/dev/null | grep -q '"ok":true'; then
             printf '  页面健康检测：%s正常%s\n' "$GREEN" "$RESET"
         else
