@@ -86,6 +86,10 @@ logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 # -------------------------------
 
+class AIOnlyBooleanResponse(RuntimeError):
+    """AI API succeeded but only returned a positive boolean, not a usable summary."""
+
+
 class Filter:
     def __init__(self, config):
         self.config = config
@@ -141,39 +145,88 @@ class Filter:
                 logger.error(f"响应体: {e.response.text}")
             raise
 
-    def ai_filter(self, description, prompt):
+    def ai_filter(self, description, prompt, *, accept_true=False):
+        """Parse a real AI reply; never use TRUE as an API-error fallback.
+
+        RSS calls with accept_true=True use a standalone affirmative reply as
+        TRUE immediately (title + link notification). Other callers retain
+        the original summary-retry behavior on pure boolean responses.
+        """
         max_retries = 3
+        last_error = None
+        only_positive_boolean = True
         for retry_count in range(1, max_retries + 1):
             try:
-                logger.info(f"第 {retry_count} 次调用 AI 过滤，描述: {description[:50]}...")
+                logger.info("第 %s 次调用 AI 过滤，描述: %s...", retry_count, str(description or '')[:50])
+                system_prompt = str(prompt or '')
+                if retry_count > 1 and isinstance(last_error, AIOnlyBooleanResponse):
+                    # 只针对错误的单独 TRUE 作格式纠错，不改变用户配置的原有优惠判断范围。
+                    system_prompt += (
+                        "\n【输出格式纠错】刚才模型仅输出了 TRUE/YES 等判断词，无法用于推送。"
+                        "请重新完整阅读标题及摘要；若确有促销，请直接写出中文总结、套餐和折扣码，"
+                        "缺失的资料写‘未提供/见原文’，不可编造。"
+                        "如果不是优惠活动，仅输出 FALSE。绝对不要单独输出 TRUE、YES 或 1。"
+                    )
                 inputs = [
-                    {"role": "system", "content": prompt},
+                    {"role": "system", "content": system_prompt},
                     {"role": "user", "content": description}
                 ]
                 output = self.workers_ai_run(self.config['model'], inputs)
-                
-                # 兼容响应格式
-                if 'result' in output:
-                    if 'response' in output['result']:
-                        content = output['result']['response']
-                    elif 'choices' in output['result']:
-                        content = output['result']['choices'][0]['message']['content']
-                    else:
-                        logger.error("未知的响应格式: " + json.dumps(output, ensure_ascii=False))
-                        raise ValueError("Unknown response format")
-                else:
-                    logger.error("响应缺少 'result' 字段: " + json.dumps(output, ensure_ascii=False))
-                    raise ValueError("Missing 'result' in response")
-                
-                result = content.split('END')[0]
-                logger.info(f"AI 过滤成功，返回结果长度: {len(result)}")
+                if not isinstance(output, dict) or output.get('success') is False or output.get('errors'):
+                    raise ValueError("Workers AI 返回失败状态")
+                response = output.get('result')
+                if not isinstance(response, dict):
+                    raise ValueError("Workers AI 响应缺少有效 result 字段")
+                content = response.get('response')
+                if not isinstance(content, str) or not content.strip():
+                    choices = response.get('choices')
+                    if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+                        message = choices[0].get('message')
+                        content = message.get('content') if isinstance(message, dict) else None
+                if not isinstance(content, str):
+                    raise ValueError("Workers AI 返回的正文不是文本")
+
+                # Qwen3 等思考模型可能携带 <think> 内容；仅保留面向用户的结果。
+                content = re.sub(r'<think\b[^>]*>.*?</think\s*>', '', content, flags=re.I | re.S)
+                content = re.sub(r'^\s*</think\s*>', '', content, flags=re.I)
+                if re.search(r'<think\b', content, flags=re.I):
+                    raise ValueError("模型思考内容未正确闭合，拒绝作为摘要")
+                # 旧评论提示词采用 END 后缀；只去掉位于末尾的 END，不截断正文中的单词或 URL。
+                result = re.sub(r'(?i)\s+END\s*$', '', content).strip()
+                if not result:
+                    raise ValueError("Workers AI 返回空正文")
+
+                # 容忍模型用引号、代码标记、标点包裹布尔答案。
+                marker = re.sub(r'^[\s`*\"“”\'‘’]+|[\s`*\"“”\'‘’]+$', '', result)
+                marker = re.sub(r'[\s.!。！,，;；:：]+$', '', marker).strip().casefold()
+                if marker in ('true', 'yes', '1', '是', '对', '命中'):
+                    if accept_true:
+                        logger.info("RSS AI returned a positive boolean; title-only push requested")
+                        return 'TRUE'
+                    raise AIOnlyBooleanResponse("Workers AI 仅返回肯定布尔值，没有可推送的优惠内容")
+                if marker in ('false', 'no', '0', '否'):
+                    logger.info("AI 过滤正常返回 FALSE（未命中）")
+                    return 'FALSE'
+
+                # 正文不允许仅以布尔标签开头并把 TRUE 作为内容推送。
+                result = re.sub(r'(?i)^\s*(?:TRUE|YES)\s*(?:[：:]\s*|\n+)\s*(?=\S)', '', result).strip()
+                if not result:
+                    raise AIOnlyBooleanResponse("Workers AI 未返回可用的优惠摘要")
+                logger.info("AI 过滤成功，返回结果长度: %s", len(result))
                 return result
             except Exception as e:
-                logger.warning(f"AI 过滤失败 (尝试 {retry_count}/{max_retries}): {e}")
-                if retry_count >= max_retries:
-                    logger.error(f"AI 过滤已重试 {max_retries} 次仍失败，跳过")
-                    return "true"
-                time.sleep(10)
+                last_error = e
+                if not isinstance(e, AIOnlyBooleanResponse):
+                    only_positive_boolean = False
+                logger.warning("AI 过滤失败 (尝试 %s/%s): %s", retry_count, max_retries, e)
+                if retry_count < max_retries:
+                    time.sleep(1 if isinstance(e, AIOnlyBooleanResponse) else 10)
+
+        if only_positive_boolean:
+            logger.error("AI 连续 %s 次仅输出 TRUE/YES，未得到摘要", max_retries)
+            raise AIOnlyBooleanResponse(f"AI 连续 {max_retries} 次只返回 TRUE/YES，没有摘要")
+        logger.error("AI 过滤连续 %s 次失败，交由调用方保留待重试；最后错误：%s", max_retries, last_error)
+        raise RuntimeError(f"AI 过滤失败（已重试 {max_retries} 次）：{last_error}")
 
     def ai_translate(self, description):
         """独立的关注用户汉化通道，失败抛异常，由爬楼层保留待重试状态。"""

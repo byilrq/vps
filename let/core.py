@@ -8,6 +8,7 @@ import os
 import cfscrape
 from dotenv import load_dotenv
 from urllib.parse import urlparse
+import re
 from msgparse import thread_message, comment_message, watched_comment_message
 import curl_cffi
 from storage_sqlite import SQLiteDB
@@ -405,6 +406,15 @@ class ForumTask:
         # 注意：按本次要求，RSS 不再 fetch_comments，不爬楼层。
 
     # -------- 线程存储 + 通知 --------
+    @staticmethod
+    def _rss_ai_context(thread):
+        """RSS 描述通常被论坛截断，标题必须同步交给模型判断。"""
+        return (
+            f"【主题标题】\n{thread.get('title', '')}\n\n"
+            f"【RSS 正文摘要（可能不完整）】\n{thread.get('description', '') or '（空）'}\n\n"
+            f"【原文链接】\n{thread.get('link', '')}"
+        )
+
     def handle_thread(self, thread):
         rss_index = thread.get('rss_index')
         rss_limit = thread.get('rss_limit') or self.config.get('rss_scan_limit', 10)
@@ -436,6 +446,8 @@ class ForumTask:
                 'rss_filter_features': filter_features or [],
                 'rss_push_message': push_message or "",
                 'rss_checked_at': datetime.now(timezone.utc),
+                # 清除手动修复的临时 24H 豁免标记，仅影响选中的旧 TRUE 记录。
+                'rss_manual_requeued_at': '',
             }
             if pushed:
                 update['rss_pushed_at'] = datetime.now(timezone.utc)
@@ -500,7 +512,10 @@ class ForumTask:
         age_seconds = (datetime.now(timezone.utc) - thread['pub_date'].replace(tzinfo=timezone.utc)).total_seconds()
         restrict_24h = self.config.get('restrict_24h', False)
 
-        if restrict_24h and age_seconds > 86400:
+        # 手动重排队的历史 TRUE 误推记录单次豁免 24H，避免修复后仍被时间规则挡下；
+        # 其他帖子完全沿用原有 24H 限制。确认处理后 save_state 会清除此标记。
+        manual_requeue = bool(exists and exists.get('rss_manual_requeued_at'))
+        if restrict_24h and age_seconds > 86400 and not manual_requeue:
             reason = rss_prefix
             features = ["超24小时", "未推送", "已处理"]
             save_state(False, reason, features)
@@ -519,9 +534,34 @@ class ForumTask:
             log_thread(False, reason, features)
             return
 
+        title_only = False
         if self.config.get('use_ai_filter', False):
-            ai_description = self.filter.ai_filter(thread['description'], self.config['thread_prompt'])
-            if 'false' in ai_description.lower():
+            try:
+                ai_description = self.filter.ai_filter(
+                    self._rss_ai_context(thread),
+                    self.config.get('thread_prompt', ''),
+                    accept_true=True,
+                )
+                if not isinstance(ai_description, str) or not ai_description.strip():
+                    raise ValueError("AI returned no usable text")
+
+                # Only the model's actual reply can qualify as TRUE. Errors are
+                # exceptions, not values; they never trigger a title-only push.
+                marker = re.sub(r'(?i)\s+END\s*$', '', ai_description.strip())
+                marker = marker.strip(" \t\r\n`*\"'\u201c\u201d\u2018\u2019")
+                marker = marker.rstrip(".!\u3002\uff01,\uff0c;\uff1b:\uff1a").strip().casefold()
+                if marker in ('true', 'yes', '1', '\u662f', '\u5bf9', '\u547d\u4e2d'):
+                    title_only = True
+                    ai_description = ""
+                elif marker in ('false', 'no', '0', '\u5426'):
+                    ai_description = 'FALSE'
+            except Exception as exc:
+                # 调用失败不标记处理状态，以便下一轮仍能重试。
+                log_thread(False, f"{rss_prefix}，AI 异常，未推送，待下轮重试：{str(exc)[:180]}",
+                           ["ai_error", "pending_retry"])
+                return
+            # FALSE 仅指独立的否定答案，不能对摘要中出现的 false 字样误判。
+            if ai_description.strip().casefold() == 'false':
                 reason = f"{rss_prefix}，过滤未通过，未推送，已处理"
                 features = []
                 save_state(False, reason, features)
@@ -532,12 +572,26 @@ class ForumTask:
 
         msg = thread_message(thread, ai_description)
 
-        # 当前配置下命中，并且没有推送记录，只推送一次。
-        self.notifier.send_message(msg)
+        # 只有通知渠道实际确认成功，才写入“已推送”；失败时下轮重试。
+        try:
+            sent = bool(self.notifier.send_message(msg))
+        except Exception as exc:
+            sent = False
+            send_error = str(exc)[:180]
+        else:
+            send_error = "推送接口返回失败"
+        if not sent:
+            log_thread(False, f"{rss_prefix}，推送失败，未处理，待下轮重试：{send_error}",
+                       ["notify_error", "pending_retry"])
+            return
 
         reason = f"{rss_prefix}，命中，已推送，已处理"
         features = []
-        push_message = ai_description or msg
+        if title_only:
+            reason += "\uff08AI \u8fd4\u56de TRUE\uff0c\u6309\u6807\u9898\u63a8\u9001\uff09"
+            features.append("ai_true_title_only")
+        # Persist the actual notification, never the literal TRUE sentinel.
+        push_message = msg if title_only else (ai_description or msg)
         save_state(True, reason, features, push_message)
         log_thread(True, reason, features, push_message)
         self.add_auto_extra_url_from_rss_hit(thread)
@@ -605,7 +659,7 @@ class ForumTask:
             if res.status_code != 200:
                 if res.status_code == 404:
                     completed_page = last_page - 1
-                    # 关注用户 AI/推送失败时，保留失败页作为下一轮扫描起点。
+                    # 关注用户或普通 AI 过滤失败时，保留失败页作为下一轮扫描起点。
                     # 否则游标前进后，失败评论可能永远不会再次被扫描到。
                     resume_page = max(1, min(completed_page, earliest_retry_page or completed_page))
                     self.threads.update_one(
@@ -626,7 +680,7 @@ class ForumTask:
                             f"手动链接本轮刷楼完成：从 p{start_page} 刷到 p{completed_page}，"
                             f"遇到 p{last_page} 404 停止；解析 {total_comments} 条，新入库 {new_comments} 条，"
                             f"推送 {pushed_comments} 条，过滤 {filtered_comments} 条"
-                            + (f"，关注用户待重试 {retry_comments} 条（下轮从 p{resume_page} 重扫）" if retry_comments else "")
+                            + (f"，AI/通知待重试 {retry_comments} 条（下轮从 p{resume_page} 重扫）" if retry_comments else "")
                         ),
                         features=[
                             "manual_done",
@@ -837,14 +891,17 @@ class ForumTask:
     def handle_comment(self, comment, thread):
         watched = self.is_watched_comment_author(comment.get('author', ''), thread)
         existing = self.comments.find_one({'comment_id': comment['comment_id']})
-        # 仅关注用户的暂存失败记录可以重试；其他已处理评论保持原有去重行为。
-        if existing and not (watched and existing.get('watch_status') in ('pending_ai', 'pending_send')):
+        # 关注用户和普通优惠 AI 的失败记录都允许重试；已成功处理的仍严格去重。
+        watched_retry = watched and existing and existing.get('watch_status') in ('pending_ai', 'pending_send')
+        regular_retry = not watched and existing and existing.get('ai_filter_status') == 'pending'
+        if existing and not (watched_retry or regular_retry):
             return "duplicate"
 
         if not watched:
-            # 普通评论仍沿用旧处理策略；不改变现有关键词/AI 优惠过滤和去重。
+            # 保留原有普通评论入库时机；只有 AI 异常才标记为 pending，并回扫所在页。
             self.comments.update_one({'comment_id': comment['comment_id']},
-                                     {'$set': comment}, upsert=True)
+                                     {'$set': {**comment, 'ai_filter_status': 'processed', 'ai_filter_error': ''}},
+                                     upsert=True)
 
         comment_time = comment['created_at']
         if comment_time.tzinfo is None:
@@ -898,7 +955,29 @@ class ForumTask:
             return "filtered"
 
         if self.config.get('use_ai_filter', False):
-            ai_description = self.filter.ai_filter(comment['message'], self.config['comment_prompt'])
+            try:
+                ai_description = self.filter.ai_filter(comment['message'], self.config['comment_prompt'])
+                if not isinstance(ai_description, str) or not ai_description.strip():
+                    raise ValueError("AI 没有返回可用的正文")
+                if ai_description.strip().casefold().rstrip('.!。！').strip() == 'true':
+                    raise ValueError("AI 只返回 TRUE，缺少可推送的正文")
+            except Exception as exc:
+                self.comments.update_one(
+                    {'comment_id': comment['comment_id']},
+                    {'$set': {**comment, 'ai_filter_status': 'pending', 'ai_filter_error': str(exc)[:180]}},
+                    upsert=True,
+                )
+                self.manual_runtime_log(
+                    thread['link'], type="comment",
+                    thread_title=thread.get('title', ''), thread_url=thread.get('link', ''),
+                    comment_id=comment.get('comment_id', ''), author=comment.get('author', ''), role="",
+                    url=comment.get('url', ''),
+                    message_preview=self.summarize_message(comment.get('message', '')),
+                    matched=False,
+                    reason=f"普通评论 AI 异常，未推送，待重试：{str(exc)[:180]}",
+                    features=["ai_error", "pending_retry"],
+                )
+                return "retry"
             if 'false' in ai_description.lower():
                 self.manual_runtime_log(
                     thread['link'],
