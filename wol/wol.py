@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.5.6"
+WOL_WEB_APP_VERSION = "1.5.9"
 
 import hmac
 import ipaddress
@@ -98,7 +98,8 @@ async function refreshHistory(){
     for(const item of data.records){
       const div=makeEl('div','entry');
       const ok=item.status==='sent';const pending=item.status==='sending';
-      div.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),ok?'✓ 唤醒数据包已发送':pending?'… 正在发送':'发送失败'));
+      const statusText=ok?'✓ 唤醒数据包已发送':(pending?'… 正在发送':'发送失败');
+      div.append(makeEl('div','state '+(ok?'ok':pending?'':'err'),statusText));
       div.append(makeEl('time','when',item.time));historyList.append(div);
     }
   }catch(ex){historyList.className='empty';historyList.textContent='记录加载失败，请点击刷新';}
@@ -133,6 +134,14 @@ def load_config():
 _boot = load_config()
 if not _boot.get("secret_key"):
     raise SystemExit(f"WOL 配置文件不可用或缺少 secret_key: {CONFIG_FILE}")
+CONFIG_KEYS = {
+    "host1", "host2", "mac", "port", "send_count", "cooldown_seconds",
+    "auth_enabled", "web_domain", "external_port", "internal_port",
+    "password_hash", "secret_key", "firewall", "nginx_config_path", "nginx_link_path",
+}
+if (not all(isinstance(_boot.get(k), str) for k in ("host1", "host2"))
+        or set(_boot) - CONFIG_KEYS):
+    raise SystemExit("WOL 配置文件不符合本版 host1/host2 格式。请先备份原配置，再重新初始化。")
 
 app = Flask(__name__)
 app.secret_key = _boot["secret_key"]
@@ -212,47 +221,32 @@ def build_packet(mac):
     return b"\xff" * 6 + normalize_mac(mac) * 16
 
 
-def send_wol(config):
-    """Send conventional 102-byte Magic Packets over public IPv4/UDP.
+def _send_wol_to_host(host, port, packet):
+    """Resolve one DDNS/IPv4 target, then send the existing UDP Magic Packets.
 
-    Strategy differs from the previous release:
-      - five datagrams using an OS-selected ephemeral UDP source port;
-      - a second, best-effort two-datagram pass with source UDP port 9.
-    Both use the *configured destination port*, normally UDP/9. The alternate
-    source port can help only with unusual router/firewall rules; it does not
-    solve a home router's missing ARP or broken port forwarding.
-
-    Returns resolved targets, target port, packets sent, source-port summary.
+    A successful UDP send only means that the local OS accepted the datagram;
+    neither its delivery nor NAS power-on can be confirmed at this layer.
     """
-    host = validate_host(config.get("host", ""))
+    target = validate_host(host)
     try:
-        port = int(config.get("port", 9))
-    except (TypeError, ValueError):
-        raise ValueError("WOL 端口不合法")
-    if not 1 <= port <= 65535:
-        raise ValueError("WOL UDP 端口必须在 1-65535 之间")
-    packet = build_packet(config.get("mac", ""))
-    if len(packet) != 102:
-        raise ValueError("Magic Packet 长度不正确")
-    try:
-        resolved = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        resolved = socket.getaddrinfo(target, port, socket.AF_INET, socket.SOCK_DGRAM)
     except socket.gaierror as exc:
-        raise ValueError("DDNS 解析 IPv4 失败，请核实域名 A 记录") from exc
-    ips = list(dict.fromkeys(result[4][0] for result in resolved))
+        raise ValueError(f"DDNS 解析 IPv4 失败：{exc}") from exc
+
+    ips = list(dict.fromkeys(item[4][0] for item in resolved))
     if not ips:
-        raise ValueError("没有解析到 IPv4 地址")
+        raise ValueError("域名没有解析到 IPv4 地址")
     if len(ips) > 4:
         raise ValueError("域名解析出过多 IPv4 地址；请检查是否误开 CDN 代理")
 
-    # Repeating with a different source port is not a substitute for
-    # LAN-level broadcast; keep logging sufficiently detailed to diagnose.
     sent = 0
     source_descriptions = []
     for address in ips:
-        dest = (address, port)
+        destination = (address, port)
+        # Standard first pass; send errors for this target do not skip the other target.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.settimeout(3)
-            sock.connect(dest)
+            sock.connect(destination)
             source_ip, source_port = sock.getsockname()
             source_descriptions.append(f"{source_ip}:{source_port}")
             for index in range(5):
@@ -260,15 +254,16 @@ def send_wol(config):
                 sent += 1
                 if index != 4:
                     time.sleep(0.10)
-        # Optional second attempt, bound to local UDP source port 9.
-        # Binding is not always allowed (port already in use / upstream rules).
+
+        # Optional second send from source UDP/9. Failure is best-effort and
+        # does not invalidate the five standard packets already sent.
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
                 sock.settimeout(3)
                 sock.bind(("0.0.0.0", 9))
-                sock.connect(dest)
-                local_ip, source_port = sock.getsockname()
-                source_descriptions.append(f"{local_ip}:{source_port}")
+                sock.connect(destination)
+                source_ip, source_port = sock.getsockname()
+                source_descriptions.append(f"{source_ip}:{source_port}")
                 for index in range(2):
                     sock.send(packet)
                     sent += 1
@@ -277,7 +272,72 @@ def send_wol(config):
         except OSError as exc:
             source_descriptions.append(f"源端口9不可用({exc.__class__.__name__})")
 
-    return ips, port, sent, source_descriptions
+    return ips, sent, source_descriptions
+
+
+def send_wol(config):
+    """Send to *both* configured DDNS targets, primary then backup.
+
+    One click is one logical attempt, regardless of the number of targets.
+    Each target is independently resolved; UDP has no delivery ACK, so a
+    successful local send MUST NOT be treated as proof the NAS powered on.
+    Only the host1/host2 configuration format is supported.
+    host2 may be an empty string to disable the second target.
+    """
+    try:
+        port = int(config.get("port", 9))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("WOL 端口不合法") from exc
+    if not 1 <= port <= 65535:
+        raise ValueError("WOL UDP 端口必须在 1-65535 之间")
+    packet = build_packet(config.get("mac", ""))
+    if len(packet) != 102:
+        raise ValueError("Magic Packet 长度不正确")
+
+    if not isinstance(config.get("host1"), str) or not isinstance(config.get("host2"), str):
+        raise ValueError("配置格式无效：请在菜单 2 设置 host1 和 host2")
+    primary = config["host1"].strip()
+    backup = config["host2"].strip()
+    if backup and backup.lower().rstrip(".") == primary.lower().rstrip("."):
+        raise ValueError("主域名和备域名不能相同")
+    targets = [("primary", primary)]
+    if backup:
+        targets.append(("backup", backup))
+
+    attempts = []
+    for i, (route, host) in enumerate(targets):
+        # Keep 200 ms between target rounds, not between packets of one round.
+        if i:
+            time.sleep(0.20)
+        try:
+            ips, sent, sources = _send_wol_to_host(host, port, packet)
+            attempts.append({
+                "route": route, "host": host, "ok": True,
+                "ips": ips, "packets": sent, "sources": sources,
+                "error": "",
+            })
+        except (OSError, ValueError) as exc:
+            attempts.append({
+                "route": route, "host": host, "ok": False,
+                "ips": [], "packets": 0, "sources": [],
+                "error": str(exc),
+            })
+
+    succeeded = [attempt for attempt in attempts if attempt["ok"]]
+    if not succeeded:
+        reasons = [
+            f"{'主域名' if a['route'] == 'primary' else '备域名'}"
+            f"({a['host'] or '未设置'})：{a['error']}"
+            for a in attempts
+        ]
+        raise ValueError("；".join(reasons) or "未配置可用的 WOL 目标")
+    return {
+        "attempts": attempts,
+        "port": port,
+        "success_count": len(succeeded),
+        "target_count": len(attempts),
+        "packets": sum(a["packets"] for a in attempts),
+    }
 
 
 @contextmanager
@@ -410,11 +470,32 @@ def wake():
     if row_id is None:
         return jsonify({"ok": False, "message": f"操作过于频繁，请 {seconds_left} 秒后再试"}), 429
     try:
-        ips, port, count, sources = send_wol(config)
-        finish_send(row_id, "sent", "唤醒数据包已发送")
-        # Keep low-level diagnostics in the VPS service log, not in web history.
-        app.logger.info("WOL sent: resolved=%s port=%s packets=%s sources=%s", ips, port, count, sources)
-        return jsonify({"ok": True, "message": "✓ 唤醒数据包已发送"})
+        result = send_wol(config)
+        both_ok = result["target_count"] == 2 and result["success_count"] == 2
+        partial_ok = result["success_count"] < result["target_count"]
+        status_detail = "主备均已发送" if both_ok else ("部分目标已发送" if partial_ok else "发送成功")
+        finish_send(row_id, "sent", status_detail)
+        # The UI keeps one record and one cooldown per click, not per target.
+        for attempt in result["attempts"]:
+            if attempt["ok"]:
+                app.logger.info(
+                    "WOL sent: route=%s host=%s resolved=%s port=%s packets=%s sources=%s",
+                    attempt["route"], attempt["host"], attempt["ips"],
+                    result["port"], attempt["packets"], attempt["sources"],
+                )
+            else:
+                app.logger.warning(
+                    "WOL target failed: route=%s host=%s error=%s",
+                    attempt["route"], attempt["host"], attempt["error"],
+                )
+        if both_ok:
+            message = "✓ 主备域名唤醒包均已发送"
+        elif partial_ok:
+            route = next(a["route"] for a in result["attempts"] if a["ok"])
+            message = "✓ 主域名已发送（备域名发送失败）" if route == "primary" else "✓ 备域名已发送（主域名发送失败）"
+        else:
+            message = "✓ 唤醒数据包已发送"
+        return jsonify({"ok": True, "message": message})
     except (OSError, ValueError, TypeError, KeyError) as exc:
         app.logger.warning("WOL failed: %s", exc)
         finish_send(row_id, "failed", "发送失败")
@@ -427,9 +508,14 @@ if __name__ == "__main__":
         # Operator-only SSH diagnostic: use the installed config, bypassing
         # browser/HTTPS. This makes it possible to isolate VPS UDP vs WEB.
         try:
-            ips, port, count, sources = send_wol(load_config())
-            print(f"WOL 测试：已向 {', '.join(ips)}:{port} 发送 {count} 个 Magic Packet")
-            print("VPS 本机 UDP 出站地址/端口：" + ", ".join(sources))
+            result = send_wol(load_config())
+            for attempt in result["attempts"]:
+                label = "主域名" if attempt["route"] == "primary" else "备域名"
+                if attempt["ok"]:
+                    print(f"WOL 测试：{label} {attempt['host']} → {', '.join(attempt['ips'])}:{result['port']}；已发送 {attempt['packets']} 个 Magic Packet")
+                else:
+                    print(f"WOL 测试：{label} {attempt['host']} 发送失败：{attempt['error']}")
+            print(f"本次发送结果：成功 {result['success_count']}/{result['target_count']}，共发送 {result['packets']} 个 Magic Packet")
             print("注意：发送成功不代表家庭路由器已转发或 NAS 已启动。")
         except (OSError, ValueError, TypeError, KeyError) as exc:
             print(f"WOL 测试发送失败：{exc}", file=sys.stderr)

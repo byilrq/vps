@@ -3,8 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.5.2"
-RAW_WOL_URL="https://raw.githubusercontent.com/byilrq/vps/main/wol/wol.py"
+VERSION="1.5.9"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
 ETC_DIR="${APP_DIR}"
@@ -53,11 +52,13 @@ import json, sys
 try:
     with open(sys.argv[1], "r", encoding="utf-8") as f:
         d = json.load(f)
+    key = sys.argv[2]
     v = d
-    for part in sys.argv[2].split("."):
-        v = v.get(part, {}) if isinstance(v, dict) else {}
+    for part in key.split("."):
+        v = v.get(part) if isinstance(v, dict) else None
+    # Missing values print nothing, not JSON braces.
     if isinstance(v, (dict, list)):
-        print(json.dumps(v, ensure_ascii=False))
+        print("")
     elif v is not None:
         print(v)
 except Exception:
@@ -213,51 +214,48 @@ prepare_managed_dir() {
 }
 
 download_wol_program() {
-    local tmp="${APP_DIR}/.wol.py.download.$$"
-    local source_ok=0
-    rm -f "$tmp"
-    # Prefer the colocated release (signed/copy-managed by the operator) to
-    # avoid accidentally installing a different cloud snapshot on upgrades.
-    if [[ -f "$SCRIPT_DIR/wol.py" ]] && grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$SCRIPT_DIR/wol.py"; then
-        install -o root -g root -m 644 "$SCRIPT_DIR/wol.py" "$APP_DIR/wol.py" || return 1
-        source_ok=1
-        info "已使用 wol.sh 同目录的 v${VERSION} wol.py。"
-    fi
-    if (( source_ok == 0 )) && command -v curl >/dev/null 2>&1; then
-        if curl -fsSL --connect-timeout 10 --max-time 60 "$RAW_WOL_URL" -o "$tmp"; then
-            if grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$tmp" && "$VENV_PY" -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$tmp" >/dev/null 2>&1; then
-                install -o root -g root -m 644 "$tmp" "$APP_DIR/wol.py"
-                source_ok=1
-                info "已从 GitHub Raw 地址下载 wol.py。"
-            else
-                warn "GitHub 上的 wol.py 为空、版本不匹配或语法不正确，将尝试使用本地 wol.py。"
-            fi
-        else
-            warn "GitHub 下载失败，将尝试使用本地 wol.py。"
-        fi
-    fi
-    rm -f "$tmp"
-    if (( source_ok == 0 )); then
-        if [[ -f "$SCRIPT_DIR/wol.py" ]] && grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$SCRIPT_DIR/wol.py"; then
-            if [[ "$(readlink -f "$SCRIPT_DIR/wol.py" 2>/dev/null || printf '%s' "$SCRIPT_DIR/wol.py")" != "$(readlink -f "$APP_DIR/wol.py" 2>/dev/null || printf '%s' "$APP_DIR/wol.py")" ]]; then
-                install -o root -g root -m 644 "$SCRIPT_DIR/wol.py" "$APP_DIR/wol.py"
-            fi
-            source_ok=1
-            info "已使用 wol.sh 同目录中的 wol.py。"
-        elif [[ -f "$APP_DIR/wol.py" ]] && grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$APP_DIR/wol.py"; then
-            source_ok=1
-            info "继续使用已安装的 wol.py。"
-        fi
-    fi
-    if (( source_ok == 0 )); then
-        err "没有可用的 wol.py。请将 wol.py 与 wol.sh 放在同一目录，或先上传 wol.py 到 GitHub 的 wol/wol.py。"
+    # This release is self-contained: install only the bundled matching wol.py.
+    # Do not fetch remote copies or fall back to a different program version.
+    if [[ ! -f "$SCRIPT_DIR/wol.py" ]]; then
+        err "安装缺少 wol.py。请将本版 wol.py 和 wol.sh 放在同一个目录。"
         return 1
     fi
-    if ! "$VENV_PY" -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$APP_DIR/wol.py"; then
+    if ! grep -Fq "WOL_WEB_APP_VERSION = \"$VERSION\"" "$SCRIPT_DIR/wol.py"; then
+        err "wol.py 与 wol.sh 版本不一致，请使用同一 ZIP 中的两个文件。"
+        return 1
+    fi
+    if ! "$VENV_PY" -c 'import ast,sys; ast.parse(open(sys.argv[1], encoding="utf-8").read())' "$SCRIPT_DIR/wol.py"; then
         err "wol.py 语法检查失败。"
         return 1
     fi
+    if [[ "$(readlink -f "$SCRIPT_DIR/wol.py" 2>/dev/null || printf '%s' "$SCRIPT_DIR/wol.py")" != "$(readlink -f "$APP_DIR/wol.py" 2>/dev/null || printf '%s' "$APP_DIR/wol.py")" ]]; then
+        install -o root -g root -m 644 "$SCRIPT_DIR/wol.py" "$APP_DIR/wol.py" || return 1
+    fi
     chmod 644 "$APP_DIR/wol.py"
+    info "已安装本地 v${VERSION} 的 wol.py。"
+}
+
+validate_new_config() {
+    [[ -f "$CONFIG_FILE" ]] || return 0
+    python3 - "$CONFIG_FILE" <<'PY_VALIDATE'
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        data = json.load(handle)
+    allowed = {
+        "host1", "host2", "mac", "port", "send_count", "cooldown_seconds",
+        "auth_enabled", "web_domain", "external_port", "internal_port",
+        "password_hash", "secret_key", "firewall", "nginx_config_path", "nginx_link_path"
+    }
+    valid = (isinstance(data, dict)
+             and all(isinstance(data.get(k), str) for k in ("host1", "host2"))
+             and not (set(data) - allowed))
+except (OSError, ValueError, TypeError):
+    valid = False
+if not valid:
+    print("配置文件不是 host1/host2 新格式。请先备份并移走 config.json，再运行菜单 1 创建全新配置。", file=sys.stderr)
+    raise SystemExit(1)
+PY_VALIDATE
 }
 
 initialize_config() {
@@ -269,7 +267,7 @@ import json, os, secrets
 from pathlib import Path
 path = Path(os.environ["WOL_CONFIG_FILE"])
 obj = {
-    "host": "", "mac": "", "port": 9,
+    "host1": "", "host2": "", "mac": "", "port": 9,
     "send_count": 5, "cooldown_seconds": 20,
     "auth_enabled": True,
     "web_domain": "", "external_port": 8119, "internal_port": 8109,
@@ -455,6 +453,7 @@ install_deploy() {
         err "$SERVICE_FILE 已存在且不是本脚本管理的服务，已停止以保护现有服务。"
         return 1
     fi
+    validate_new_config || return 1
     prepare_managed_dir "$APP_DIR" ".wol-web-managed" || return 1
 
     info "安装 Python 运行环境及下载工具..."
@@ -523,19 +522,24 @@ install_deploy() {
 configure_nas() {
     need_root || return 1
     is_configured || { err "请先运行菜单 1 安装部署。"; return 1; }
+    validate_new_config || return 1
 
-    local old_mac old_host old_port mac_input host_input port_input mac host port
+    local old_mac old_host old_backup old_port mac_input host_input backup_input port_input mac
     old_mac="$(config_get mac)"
-    old_host="$(config_get host)"
+    old_host="$(config_get host1)"
+    old_backup="$(config_get host2)"
     old_port="$(config_get port)"
     old_port="${old_port:-9}"
 
-    printf '\n%s\n' "---- NAS 唤醒参数配置 ----"
+    printf '\n%s\n' "---- NAS 唤醒参数配置（主域名 / 备域名） ----"
     read_default "NAS 网卡 MAC 地址（例如 00:11:22:33:44:55）" "$old_mac" || return 1
     mac_input="$REPLY"
-    read_default "NAS 公网 IP 或 DDNS 域名" "$old_host" || return 1
+    read_default "主域名 host1（第一轮）" "$old_host" || return 1
     host_input="$REPLY"
-    read_default "UDP 端口" "$old_port" || return 1
+    read_default "备域名 host2（第二轮）" "$old_backup" || return 1
+    backup_input="$REPLY"
+    [[ "$backup_input" == "-" ]] && backup_input=""
+    read_default "UDP 端口（主备共用）" "$old_port" || return 1
     port_input="$REPLY"
 
     if ! mac="$(normalize_mac "$mac_input" 2>/dev/null)"; then
@@ -543,26 +547,46 @@ configure_nas() {
         return 1
     fi
     if ! validate_host "$host_input"; then
-        err "域名或 IPv4 地址格式错误；不要填写 http:// 或端口。"
+        err "主域名或 IPv4 地址格式错误；不要填写 http:// 或端口。"
         return 1
+    fi
+    if [[ -n "$backup_input" ]]; then
+        if ! validate_host "$backup_input"; then
+            err "备域名或 IPv4 地址格式错误；不要填写 http:// 或端口。"
+            return 1
+        fi
+        if [[ "${backup_input,,}" == "${host_input,,}" || "${backup_input,,}" == "${host_input,,}." || "${backup_input,,}." == "${host_input,,}" ]]; then
+            err "主域名与备域名不能相同。"
+            return 1
+        fi
     fi
     if ! validate_port "$port_input"; then
         err "UDP 端口必须是 1-65535 的整数。"
         return 1
     fi
-    config_set_fields "mac=$mac" "host=$host_input" "port=$((10#$port_input))" || return 1
-    ok "NAS 参数已保存。"
-    printf 'MAC：%s\n目标：%s\nUDP 端口：%s\n' "$mac" "$host_input" "$port_input"
-    info "这里的 UDP 端口是家庭路由器转发的 WOL 端口，默认 9；与网页外部 TCP 端口不同。"
-    info "每次尝试发送 5 个标准 Magic Packet，并尝试使用源 UDP 9 端口补发 2 个。"
-    warn "如果实际唤醒仍失败，请检查家庭路由器 UDP9 转发到关机 NAS 时的 ARP/广播能力。"
+    config_set_fields "mac=$mac" "host1=$host_input" "host2=$backup_input" "port=$((10#$port_input))" || return 1
+    ok "NAS 主备域名参数已保存（无需重启 WEB 服务，下次唤醒即生效）。"
+    printf 'MAC：%s\n主域名：%s\n备域名：%s\nUDP 端口：%s\n' \
+        "$mac" "$host_input" "${backup_input:-（未启用）}" "$port_input"
+    info "每次点击都依次发送到主域名和备域名（间隔约 200 毫秒）。"
+    info "每个目标先发送 5 个 Magic Packet，尽力使用源端口 UDP 9 补发 2 个。"
+    info "只要任一目标本机 UDP 发送成功，本次记成功；两个目标都失败才记一次失败。"
+    warn "UDP 发送成功不代表 NAS 已开机；整个点击仅有一条历史记录及一次冷却时间。"
     if command -v getent >/dev/null 2>&1; then
         local resolved
         resolved="$(getent ahostsv4 "$host_input" 2>/dev/null | awk 'NR==1 { print $1 }')"
         if [[ -n "$resolved" ]]; then
-            info "当前 DDNS IPv4 解析结果：$resolved（请与手机小程序的目标地址核对）。"
+            info "主域名当前解析 IPv4：$resolved"
         else
-            warn "DDNS 未解析到 IPv4；请检查 DNS A 记录。"
+            warn "主域名暂未解析到 IPv4。"
+        fi
+        if [[ -n "$backup_input" ]]; then
+            resolved="$(getent ahostsv4 "$backup_input" 2>/dev/null | awk 'NR==1 { print $1 }')"
+            if [[ -n "$resolved" ]]; then
+                info "备域名当前解析 IPv4：$resolved"
+            else
+                warn "备域名暂未解析到 IPv4。"
+            fi
         fi
     fi
 }
@@ -956,7 +980,10 @@ show_status() {
         internal_port="$(config_get internal_port)"
         domain="$(config_get web_domain)"
         external_port="$(config_get external_port)"
-        printf '  NAS 目标：%s\n' "$(config_get host)"
+        printf '  NAS 主域名：%s\n' "$(config_get host1)"
+        local backup_display
+        backup_display="$(config_get host2)"
+        printf '  NAS 备域名：%s\n' "${backup_display:-（未启用）}"
         printf '  唤醒端口：UDP %s\n' "$(config_get port)"
         printf '  本地监听：127.0.0.1:%s\n' "${internal_port:-8109}"
         if [[ -n "$domain" ]]; then
@@ -987,7 +1014,7 @@ main_menu() {
     while true; do
         local selection current_status status_text
         printf '\n%s\n' "${BLUE}╔══════════════════════════════════════════════════════╗${RESET}"
-        printf '%s\n' "${BLUE}║${RESET}            ${CYAN}${BOLD}WOL NAS 远程唤醒管理中心${RESET}  ${DIM}v${VERSION}${RESET} ${BLUE}║${RESET}"
+        printf '%s\n' "${BLUE}║${RESET}            ${CYAN}${BOLD}WOL 管理中心${RESET}  ${DIM}v${VERSION}${RESET} ${BLUE}║${RESET}"
         printf '%s\n' "${BLUE}╚══════════════════════════════════════════════════════╝${RESET}"
         current_status="$(systemctl is-active "$SERVICE_NAME" 2>/dev/null || true)"
         if [[ "$current_status" == "active" ]]; then
@@ -1001,7 +1028,7 @@ main_menu() {
         printf '  %s安装目录：%s%s\n' "$DIM" "$APP_DIR" "$RESET"
         printf '\n%s\n' "${PURPLE}  ── 基础管理 ──${RESET}"
         menu_item 1 '安装部署' '仅安装程序，不询问密码/端口'
-        menu_item 2 '配置 NAS' 'MAC / DDNS / UDP 9'
+        menu_item 2 '配置 NAS' 'MAC / 主备 DDNS / UDP 9'
         menu_item 3 'WEB 端设置' '域名 / 端口 / 密码 / 放行防火墙'
         printf '\n%s\n' "${PURPLE}  ── 服务管理 ──${RESET}"
         menu_item 4 '重启服务' '重启后显示当前运行状态'
