@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.6.2"
+WOL_WEB_APP_VERSION = "1.6.3"
 
 import errno
 import hashlib
@@ -45,7 +45,7 @@ PAGE = r'''<!doctype html>
 body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320 77%);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:22px 16px}
 .wrap{width:100%;max-width:460px;margin:0 auto;min-height:calc(100dvh - 44px);display:flex;flex-direction:column}
 .bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:3px 0 12px}
-.logo{font-size:14px;letter-spacing:.12em;color:#d8e8f5;font-weight:850;display:flex;align-items:center;gap:10px}.mode-tag{font-size:10px;letter-spacing:.05em;font-weight:800;border:1px solid #477c78;border-radius:8px;color:#8eebbf;background:#173344;padding:3px 6px}.dot{color:var(--mint);font-size:18px;margin-right:9px}
+.logo{font-size:14px;letter-spacing:.12em;color:#d8e8f5;font-weight:850;display:flex;align-items:center;gap:10px}.mode-tag{font-size:10px;letter-spacing:.05em;font-weight:800;border:1px solid #477c78;border-radius:8px;color:#8eebbf;background:#173344;padding:3px 6px}.mode-tag{font-family:inherit;cursor:pointer}.mode-tag:disabled{cursor:wait;opacity:.65}.mode-tag:focus-visible{outline:2px solid #e9f3ff;outline-offset:3px}.mode-tag.temporary{border-color:#a5834d;color:#ffda95;background:#403424}.dot{color:var(--mint);font-size:18px;margin-right:9px}
 .logout{color:#9eb2c9;background:transparent;border:1px solid #344861;border-radius:10px;padding:7px 13px;cursor:pointer}
 .btn-box{text-align:center;padding:17px 0 5px}
 .wake{width:196px;height:196px;max-width:65vw;max-height:65vw;cursor:pointer;border-radius:50%;border:1px solid #75e6b3;background:radial-gradient(circle at 36% 22%,#2e6b63 0%,#1a514b 43%,#0d3039 82%);box-shadow:0 0 0 11px #70e3b20c,0 0 0 24px #70e3b208,0 0 55px #33d9a331;color:#f1fff9;display:inline-flex;align-items:center;justify-content:center;flex-direction:column;gap:4px;transition:transform .12s,opacity .12s}
@@ -75,7 +75,7 @@ body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320
 @media(max-height:720px){.bar{margin-bottom:12px}.lead{margin-bottom:11px}.wake{width:165px;height:165px}.btn-box{padding:8px 0}.feedback{margin:12px 0}}
 </style></head><body><main class="wrap">
 <header class="bar">
-<div class="logo">WOL <span class="mode-tag">{{ wake_mode|upper }}</span></div>
+<div class="logo">WOL {% if auth_enabled and logged_in %}<button id="modeToggle" class="mode-tag" type="button" title="点击临时切换 IPV4/IPV6，刷新网页恢复默认模式" aria-label="当前 {{ wake_mode|upper }}，点击切换唤醒模式" aria-pressed="false">{{ wake_mode|upper }}</button>{% else %}<span class="mode-tag">{{ wake_mode|upper }}</span>{% endif %}</div>
 {% if auth_enabled and logged_in %}<form action="{{ url_for('logout') }}" method="post"><input name="csrf" type="hidden" value="{{ csrf }}"><button class="logout" type="submit">退出</button></form>{% endif %}
 </header>
 {% if auth_enabled and not logged_in %}
@@ -99,6 +99,29 @@ const historyList = document.getElementById('historyList');
 const wakeButton = document.getElementById('wakeButton');
 const refreshButton = document.getElementById('refreshButton');
 const feedback = document.getElementById('feedback');
+const modeToggle = document.getElementById('modeToggle');
+const defaultWakeMode = {{ wake_mode|tojson }};
+let selectedWakeMode = defaultWakeMode;
+// Only in this page's JavaScript memory; not stored in cookies or config.
+// A full page refresh restores the mode configured by wol.sh.
+function showSelectedWakeMode(){
+  const isTemporary = selectedWakeMode !== defaultWakeMode;
+  modeToggle.textContent = selectedWakeMode.toUpperCase();
+  modeToggle.classList.toggle('temporary', isTemporary);
+  modeToggle.setAttribute('aria-pressed', String(isTemporary));
+  modeToggle.setAttribute('aria-label', '当前 '+selectedWakeMode.toUpperCase()+'，点击临时切换唤醒模式');
+  modeToggle.title = isTemporary
+    ? '临时模式 '+selectedWakeMode.toUpperCase()+'；刷新网页恢复 '+defaultWakeMode.toUpperCase()
+    : '默认模式 '+defaultWakeMode.toUpperCase()+'；点击临时切换 IPV4/IPV6';
+}
+modeToggle.addEventListener('click',()=>{
+  if(modeToggle.disabled)return;
+  selectedWakeMode = selectedWakeMode === 'ipv4' ? 'ipv6' : 'ipv4';
+  showSelectedWakeMode();
+  feedback.className='feedback';
+  feedback.textContent='已临时切换到 '+selectedWakeMode.toUpperCase()+'，刷新网页恢复默认模式';
+});
+showSelectedWakeMode();
 function makeEl(tag, cls, text){const el=document.createElement(tag);if(cls)el.className=cls;if(text!==undefined)el.textContent=text;return el;}
 function resultIcon(kind){
   const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
@@ -145,9 +168,11 @@ async function refreshHistory(){
   finally{refreshButton.disabled=false;}
 }
 wakeButton.addEventListener('click',async()=>{
-  wakeButton.disabled=true;feedback.className='feedback';feedback.textContent='正在发送 WOL 唤醒包...';
+  const sendMode = selectedWakeMode;
+  wakeButton.disabled=true;modeToggle.disabled=true;
+  feedback.className='feedback';feedback.textContent='正在通过 '+sendMode.toUpperCase()+' 发送 WOL 唤醒包...';
   try{
-    const resp=await fetch('/api/wake',{method:'POST',headers:{'X-CSRF-Token':csrf},credentials:'same-origin',cache:'no-store'});
+    const resp=await fetch('/api/wake',{method:'POST',headers:{'X-CSRF-Token':csrf,'Content-Type':'application/json'},body:JSON.stringify({mode:sendMode}),credentials:'same-origin',cache:'no-store'});
     if(resp.status===401){location.reload();return;}
     const data=await resp.json();
     feedback.className='feedback';
@@ -159,7 +184,7 @@ wakeButton.addEventListener('click',async()=>{
     }
     await refreshHistory();
   }catch(ex){feedback.className='feedback err';feedback.textContent='连接失败，请检查 WEB 服务或网络连接';}
-  finally{wakeButton.disabled=false;}
+  finally{wakeButton.disabled=false;modeToggle.disabled=false;}
 });
 refreshButton.addEventListener('click',refreshHistory);
 refreshHistory();
@@ -397,10 +422,10 @@ def _send_ipv4_wol(config):
         except (OSError, ValueError) as exc:
             resolution_errors[route] = exc
 
-    # A backup DNS failure is ALSO shown as an IP mismatch warning: equality
-    # cannot be established unless both names resolve to the same IPv4 set.
-    # Store the detailed reason separately to distinguish unequal IPs from
-    # DNS resolution errors in the local diagnostic log.
+    # IPv4 single-channel mode: an empty/whitespace host2 means ONLY host1
+    # is resolved and used. No host2 DNS lookup and NO IP equality check.
+    # Two configured hosts retain the existing independent DNS comparison
+    # as a diagnostic warning (never a WOL packet-delivery verdict).
     compared = bool(backup)
     fully_resolved = bool(compared and "primary" in resolved_ips and "backup" in resolved_ips)
     ips_equal = bool(fully_resolved and
@@ -410,7 +435,7 @@ def _send_ipv4_wol(config):
         "checked": compared,
         "matched": ips_equal if compared else None,
         "resolution_complete": fully_resolved,
-        "reason": ("not_configured" if not compared else
+        "reason": ("single_channel" if not compared else
                    "resolution_failed" if not fully_resolved else
                    "matched" if ips_equal else "different_ipv4"),
         "host1_ipv4": list(resolved_ips.get("primary", [])),
@@ -849,6 +874,19 @@ def wake():
     if not check_csrf():
         return jsonify({"ok": False, "message": "页面验证失效，请刷新后重试"}), 400
     config = load_config()
+    # A web override is PER REQUEST only: never mutate config.json or session.
+    # With no override, use the persistent mode chosen by wol.sh menu 2.
+    if request.is_json:
+        payload = request.get_json(silent=True)
+        if not isinstance(payload, dict):
+            return jsonify({"ok": False, "message": "无效的模式切换请求"}), 400
+    else:
+        payload = {}
+    selected_mode = payload.get("mode", config.get("wake_mode", "ipv4"))
+    if selected_mode not in ("ipv4", "ipv6"):
+        return jsonify({"ok": False, "message": "无效的唤醒模式，仅支持 IPV4 或 IPV6"}), 400
+    request_config = dict(config)
+    request_config["wake_mode"] = selected_mode
     try:
         cooldown = max(5, min(600, int(config.get("cooldown_seconds") or 20)))
     except (TypeError, ValueError):
@@ -862,17 +900,17 @@ def wake():
         return jsonify({"ok": False, "message": f"操作过于频繁，请 {seconds_left} 秒后再试"}), 429
 
     try:
-        result = send_wol(config)
+        result = send_wol(request_config)
     except (OSError, ValueError, TypeError, KeyError) as exc:
         # A malformed configuration did not begin sending to either host.
-        _safe_log_send(config, trigger="web", error=str(exc))
+        _safe_log_send(request_config, trigger="web", error=str(exc))
         app.logger.warning("WOL preparation failed: %s", exc)
         finish_send(row_id, "failed", "发送失败")
         return jsonify({"ok": False, "message": "WOL 发送失败"}), 502
 
     # One click -> exactly one rotated local log entry, with BOTH independent
     # host outcomes, even when one target fails DNS or all packets fail.
-    _safe_log_send(config, result)
+    _safe_log_send(request_config, result)
     for attempt in result["attempts"]:
         level = app.logger.info if attempt["ok"] else app.logger.warning
         level("WOL mode=%s route=%s host=%s ips=%s submitted=%s failed=%s errno111=%s details=%s",
@@ -905,7 +943,8 @@ def wake():
     history_detail = json.dumps({"ip_status": ip_status, "send_status": send_status},
                                 ensure_ascii=False, separators=(",", ":"))
     finish_send(row_id, send_status, history_detail)
-    response = {"ok": result["ok"], "ip_mismatch": result["ip_mismatch"],
+    response = {"ok": result["ok"], "mode": result.get("mode", selected_mode),
+                "ip_mismatch": result["ip_mismatch"],
                 "ip_status": ip_status, "send_status": send_status,
                 "refused": send_status == "refused", "message": display_message}
     return jsonify(response), (200 if result["ok"] else 502)
