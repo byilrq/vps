@@ -3,7 +3,7 @@
 # Menu inputs use normal terminal line editing; Backspace works in SSH terminals.
 set -uo pipefail
 
-VERSION="1.5.14"
+VERSION="1.6.2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 APP_DIR="${SCRIPT_DIR}/wol"
 ETC_DIR="${APP_DIR}"
@@ -82,7 +82,7 @@ for item in sys.argv[2:]:
     key, sep, value = item.partition("=")
     if not sep:
         continue
-    if key in ("port", "external_port", "internal_port", "send_count", "cooldown_seconds"):
+    if key in ("port", "relay6_port", "external_port", "internal_port", "send_count", "cooldown_seconds"):
         data[key] = int(value)
     elif key == "auth_enabled":
         data[key] = value.lower() in ("true", "yes", "1")
@@ -184,6 +184,24 @@ raise SystemExit(0 if candidate and all(label_re.fullmatch(x) for x in labels) e
 PY
 }
 
+validate_host6() {
+    python3 - "$1" <<'PY'
+import ipaddress, re, sys
+host = sys.argv[1].strip()
+if not host or any(c.isspace() for c in host) or "://" in host or "/" in host or "\\" in host:
+    raise SystemExit(1)
+try:
+    address = ipaddress.ip_address(host.strip("[]"))
+except ValueError:
+    domain = host.rstrip(".")
+    labels = domain.split(".")
+    pattern = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+    raise SystemExit(0 if len(domain) <= 253 and all(pattern.fullmatch(label) for label in labels) else 1)
+else:
+    raise SystemExit(0 if address.version == 6 and address.is_global else 1)
+PY
+}
+
 validate_web_domain() {
     python3 - "$1" <<'PY'
 import ipaddress, re, sys
@@ -262,6 +280,7 @@ if not isinstance(data, dict):
 changed = created
 added = []
 strings = ("host1", "host2", "mac", "web_domain", "password_hash",
+           "relay6_secret_file",
            "nginx_config_path", "nginx_link_path")
 for key in strings:
     if not isinstance(data.get(key), str):
@@ -272,7 +291,15 @@ if not isinstance(data.get("secret_key"), str) or not data["secret_key"].strip()
     data["secret_key"] = secrets.token_hex(32)
     changed = True
     added.append("secret_key")
-for key, default in (("port", 9), ("send_count", 5),
+if not data["relay6_secret_file"]:
+    data["relay6_secret_file"] = str(path.parent / "wol6_secret")
+    changed = True
+    added.append("relay6_secret_file")
+if data.get("wake_mode") not in ("ipv4", "ipv6"):
+    data["wake_mode"] = "ipv4"
+    changed = True
+    added.append("wake_mode")
+for key, default in (("port", 9), ("relay6_port", 41996), ("send_count", 5),
                      ("cooldown_seconds", 20), ("external_port", 8119),
                      ("internal_port", 8109)):
     val = data.get(key)
@@ -282,7 +309,8 @@ for key, default in (("port", 9), ("send_count", 5),
         num = int(val)
     except (TypeError, ValueError):
         num = default
-    valid = (1 <= num <= 65535) if key.endswith("port") or key == "port" else (num > 0)
+    valid = ((1024 <= num <= 65535) if key == "relay6_port" else
+             (1 <= num <= 65535)) if key.endswith("port") or key == "port" else (num > 0)
     if not valid:
         num = default
     if data.get(key) != num or isinstance(data.get(key), bool):
@@ -570,72 +598,124 @@ configure_nas() {
     fi
     ensure_config || return 1
 
-    local old_mac old_host old_backup old_port mac_input host_input backup_input port_input mac
-    old_mac="$(config_get mac)"
+    local current_mode mode_selection mode old_host old_backup old_mac old_port
+    local host_input backup_input mac_input port_input relay_port secret_file mac resolved
+    current_mode="$(config_get wake_mode)"
+    printf '\n%s\n' "---- 唤醒模式选择 ----"
+    printf '  1) 仅 IPV4：host1 + host2，进行 IPv4 解析比对和双域名发送\n'
+    printf '  2) 仅 IPV6：只使用 host1，经 AX6 IPv6 认证中继唤醒，不发送 host2\n'
+    if [[ "$current_mode" == "ipv6" ]]; then mode_selection="2"; else mode_selection="1"; fi
+    read_default "请选择模式（1=IPV4，2=IPV6）" "$mode_selection" || return 1
+    case "$REPLY" in
+        1) mode="ipv4" ;;
+        2) mode="ipv6" ;;
+        *) err "请选择 1（IPV4）或 2（IPV6）。"; return 1 ;;
+    esac
+
     old_host="$(config_get host1)"
     old_backup="$(config_get host2)"
-    old_port="$(config_get port)"
-    old_port="${old_port:-9}"
+    old_mac="$(config_get mac)"
+    old_port="$(config_get port)"; old_port="${old_port:-9}"
 
-    printf '\n%s\n' "---- NAS 唤醒参数配置（主域名 / 备域名） ----"
-    read_default "NAS 网卡 MAC 地址（例如 00:11:22:33:44:55）" "$old_mac" || return 1
-    mac_input="$REPLY"
-    read_default "主域名 host1（第一轮）" "$old_host" || return 1
-    host_input="$REPLY"
-    read_default "备域名 host2（第二轮）" "$old_backup" || return 1
-    backup_input="$REPLY"
-    [[ "$backup_input" == "-" ]] && backup_input=""
-    read_default "UDP 端口（主备共用）" "$old_port" || return 1
-    port_input="$REPLY"
-
-    if ! mac="$(normalize_mac "$mac_input" 2>/dev/null)"; then
-        err "MAC 地址格式错误，请使用 00:11:22:33:44:55 这样的格式。"
-        return 1
-    fi
-    if ! validate_host "$host_input"; then
-        err "主域名或 IPv4 地址格式错误；不要填写 http:// 或端口。"
-        return 1
-    fi
-    if [[ -n "$backup_input" ]]; then
-        if ! validate_host "$backup_input"; then
-            err "备域名或 IPv4 地址格式错误；不要填写 http:// 或端口。"
+    if [[ "$mode" == "ipv4" ]]; then
+        printf '\n%s\n' "---- IPV4 唤醒参数（host1 + host2） ----"
+        read_default "NAS 网卡 MAC 地址（例如 00:11:22:33:44:55）" "$old_mac" || return 1
+        mac_input="$REPLY"
+        read_default "主域名 host1（第一轮）" "$old_host" || return 1
+        host_input="$REPLY"
+        read_default "备域名 host2（第二轮，可留空）" "$old_backup" || return 1
+        backup_input="$REPLY"
+        [[ "$backup_input" == "-" ]] && backup_input=""
+        read_default "UDP 端口（主备共用）" "$old_port" || return 1
+        port_input="$REPLY"
+        if ! mac="$(normalize_mac "$mac_input" 2>/dev/null)"; then
+            err "MAC 地址格式错误，请使用 00:11:22:33:44:55。"
             return 1
         fi
-        if [[ "${backup_input,,}" == "${host_input,,}" || "${backup_input,,}" == "${host_input,,}." || "${backup_input,,}." == "${host_input,,}" ]]; then
-            err "主域名与备域名不能相同。"
+        if ! validate_host "$host_input"; then
+            err "主域名或 IPv4 地址格式错误；不要填写 http:// 或端口。"
             return 1
-        fi
-    fi
-    if ! validate_port "$port_input"; then
-        err "UDP 端口必须是 1-65535 的整数。"
-        return 1
-    fi
-    config_set_fields "mac=$mac" "host1=$host_input" "host2=$backup_input" "port=$((10#$port_input))" || return 1
-    ok "NAS 主备域名参数已保存（无需重启 WEB 服务，下次唤醒即生效）。"
-    printf 'MAC：%s\n主域名：%s\n备域名：%s\nUDP 端口：%s\n' \
-        "$mac" "$host_input" "${backup_input:-（未启用）}" "$port_input"
-    info "每次点击都依次发送到主域名和备域名（间隔约 200 毫秒）。"
-    info "每个目标先发送 5 个 Magic Packet，尽力使用源端口 UDP 9 补发 2 个。"
-    info "若两域名解析的 IPv4 不一致，WEB 提示 IP解析不一致（仍向两个目标发送）。"
-    info "解析一致时，任一目标本机 UDP 发送成功即记成功；两个目标都失败才记一次失败。"
-    warn "UDP 发送成功不代表 NAS 已开机；整个点击仅有一条历史记录及一次冷却时间。"
-    if command -v getent >/dev/null 2>&1; then
-        local resolved
-        resolved="$(getent ahostsv4 "$host_input" 2>/dev/null | awk 'NR==1 { print $1 }')"
-        if [[ -n "$resolved" ]]; then
-            info "主域名当前解析 IPv4：$resolved"
-        else
-            warn "主域名暂未解析到 IPv4。"
         fi
         if [[ -n "$backup_input" ]]; then
-            resolved="$(getent ahostsv4 "$backup_input" 2>/dev/null | awk 'NR==1 { print $1 }')"
-            if [[ -n "$resolved" ]]; then
-                info "备域名当前解析 IPv4：$resolved"
-            else
-                warn "备域名暂未解析到 IPv4。"
+            if ! validate_host "$backup_input"; then
+                err "备域名或 IPv4 地址格式错误。"
+                return 1
+            fi
+            if [[ "${backup_input,,}" == "${host_input,,}" || "${backup_input,,}" == "${host_input,,}." || "${backup_input,,}." == "${host_input,,}" ]]; then
+                err "主域名与备域名不能相同。"
+                return 1
             fi
         fi
+        if ! validate_port "$port_input"; then
+            err "UDP 端口必须是 1-65535 的整数。"
+            return 1
+        fi
+        config_set_fields "wake_mode=ipv4" "mac=$mac" "host1=$host_input" "host2=$backup_input" "port=$((10#$port_input))" || return 1
+        ok "当前模式：IPV4；主备域名参数已保存。"
+        printf 'MAC：%s\n主域名：%s\n备域名：%s\nUDP 端口：%s\n' \
+            "$mac" "$host_input" "${backup_input:-（未启用）}" "$port_input"
+        info "主域名与备域名依次发包，域名解析 IP 比对仍生效。"
+        if command -v getent >/dev/null 2>&1; then
+            resolved="$(getent ahostsv4 "$host_input" 2>/dev/null | awk 'NR==1 {print $1}')"
+            [[ -n "$resolved" ]] && info "主域名 IPv4：$resolved" || warn "主域名暂未解析到 IPv4。"
+            if [[ -n "$backup_input" ]]; then
+                resolved="$(getent ahostsv4 "$backup_input" 2>/dev/null | awk 'NR==1 {print $1}')"
+                [[ -n "$resolved" ]] && info "备域名 IPv4：$resolved" || warn "备域名暂未解析到 IPv4。"
+            fi
+        fi
+    else
+        printf '\n%s\n' "---- IPV6 中继唤醒参数（仅 host1） ----"
+        read_default "AX6 IPv6 中继域名 host1（AAAA：nas.xyrq.de）" "$old_host" || return 1
+        host_input="$REPLY"
+        if ! validate_host6 "$host_input"; then
+            err "请填写具有公网 AAAA 的 AX6 中继域名或全球单播 IPv6 地址。"
+            return 1
+        fi
+        relay_port="$(config_get relay6_port)"
+        read_default "路由器中继 UDP 端口" "${relay_port:-41996}" || return 1
+        relay_port="$REPLY"
+        if ! validate_port "$relay_port" || (( 10#$relay_port < 1024 )); then
+            err "IPv6 中继端口必须是 1024-65535 的整数。"
+            return 1
+        fi
+        secret_file="$(config_get relay6_secret_file)"
+        secret_file="${secret_file:-${APP_DIR}/wol6_secret}"
+        # This secret is shared with the AX6 relay. Never display it in menus/logs.
+        if [[ ! -e "$secret_file" ]]; then
+            if ! python3 - "$secret_file" <<'PY_SECRET'
+import os, secrets, sys
+path = sys.argv[1]
+with open(path, "x", encoding="ascii") as f:
+    f.write(secrets.token_hex(32) + "\n")
+os.chmod(path, 0o600)
+PY_SECRET
+            then
+                err "创建 IPv6 中继共享密钥失败。"
+                return 1
+            fi
+            ok "已生成共享密钥文件：${secret_file}（内容不会显示）"
+        fi
+        chmod 600 "$secret_file" || return 1
+        config_set_fields "wake_mode=ipv6" "host1=$host_input" \
+            "relay6_port=$((10#$relay_port))" "relay6_secret_file=$secret_file" || return 1
+        ok "当前模式：IPV6；host1 单域名发送；host2 已停用发送（配置值保留）。"
+        info "AX6 中继域名：$host_input；中继 UDP 端口：$relay_port"
+        info "共享密钥：$secret_file；需将其安全复制到 AX6 的 /data/wol6/secret。"
+        warn "IPv6 仅使用经 HMAC 验证的路由器中继 ACK 判定发包成功；NAS 开机状态不由此确认。"
+        # One DNS check is informational only; the actual sender does its own AAAA lookup.
+        if command -v python3 >/dev/null 2>&1; then
+            python3 - "$host_input" <<'PY_DNS' || true
+import ipaddress, socket, sys
+try:
+    records = socket.getaddrinfo(sys.argv[1].strip('[]'), 41996, socket.AF_INET6, socket.SOCK_DGRAM)
+    ips = sorted({str(ipaddress.IPv6Address(item[4][0])) for item in records if ipaddress.IPv6Address(item[4][0]).is_global})
+    print('[INFO] 当前 AAAA：' + ', '.join(ips) if ips else '[WARN] 尚未解析到公网 AAAA。')
+except (OSError, ValueError) as exc:
+    print('[WARN] AAAA 暂不可解析：' + str(exc))
+PY_DNS
+        fi
     fi
+    info "设置即时生效，WEB 左上角会显示当前模式。"
 }
 
 restart_service() {
@@ -1028,11 +1108,19 @@ show_status() {
         internal_port="$(config_get internal_port)"
         domain="$(config_get web_domain)"
         external_port="$(config_get external_port)"
-        printf '  NAS 主域名：%s\n' "$(config_get host1)"
-        local backup_display
-        backup_display="$(config_get host2)"
-        printf '  NAS 备域名：%s\n' "${backup_display:-（未启用）}"
-        printf '  唤醒端口：UDP %s\n' "$(config_get port)"
+        local wake_mode
+        wake_mode="$(config_get wake_mode)"
+        printf '  唤醒模式：%s\n' "${wake_mode^^}"
+        printf '  host1：%s\n' "$(config_get host1)"
+        if [[ "$wake_mode" == "ipv6" ]]; then
+            printf '  host2：%s\n' '（IPV6 模式不使用）'
+            printf '  中继端口：UDP %s\n' "$(config_get relay6_port)"
+        else
+            local backup_display
+            backup_display="$(config_get host2)"
+            printf '  备域名 host2：%s\n' "${backup_display:-（未启用）}"
+            printf '  唤醒端口：UDP %s\n' "$(config_get port)"
+        fi
         printf '  本地监听：127.0.0.1:%s\n' "${internal_port:-8109}"
         if [[ -n "$domain" ]]; then
             printf '  网页入口：https://%s:%s/\n' "$domain" "${external_port:-8119}"
@@ -1077,7 +1165,7 @@ main_menu() {
         printf '  %s安装目录：%s%s\n' "$DIM" "$APP_DIR" "$RESET"
         printf '\n%s\n' "${PURPLE}  ── 基础管理 ──${RESET}"
         menu_item 1 '安装部署' '仅安装程序，不询问密码/端口'
-        menu_item 2 '配置 NAS' 'MAC / 主备 DDNS / UDP 9'
+        menu_item 2 '配置 NAS' '仅 IPV4 / 仅 IPV6 / 域名 / 端口'
         menu_item 3 'WEB 端设置' '域名 / 端口 / 密码 / 放行防火墙'
         printf '\n%s\n' "${PURPLE}  ── 服务管理 ──${RESET}"
         menu_item 4 '重启服务' '重启后显示当前运行状态'

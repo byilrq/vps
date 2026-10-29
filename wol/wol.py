@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """WOL WEB: single-button Wake-on-LAN dashboard with persistent send history."""
-WOL_WEB_APP_VERSION = "1.5.14"
+WOL_WEB_APP_VERSION = "1.6.2"
 
 import errno
+import hashlib
+import stat
 import fcntl
 import hmac
 import ipaddress
@@ -43,7 +45,7 @@ PAGE = r'''<!doctype html>
 body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320 77%);color:var(--text);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif;padding:22px 16px}
 .wrap{width:100%;max-width:460px;margin:0 auto;min-height:calc(100dvh - 44px);display:flex;flex-direction:column}
 .bar{display:flex;align-items:center;justify-content:space-between;gap:10px;margin:3px 0 12px}
-.logo{font-size:14px;letter-spacing:.22em;color:#d8e8f5;font-weight:850}.dot{color:var(--mint);font-size:18px;margin-right:9px}
+.logo{font-size:14px;letter-spacing:.12em;color:#d8e8f5;font-weight:850;display:flex;align-items:center;gap:10px}.mode-tag{font-size:10px;letter-spacing:.05em;font-weight:800;border:1px solid #477c78;border-radius:8px;color:#8eebbf;background:#173344;padding:3px 6px}.dot{color:var(--mint);font-size:18px;margin-right:9px}
 .logout{color:#9eb2c9;background:transparent;border:1px solid #344861;border-radius:10px;padding:7px 13px;cursor:pointer}
 .btn-box{text-align:center;padding:17px 0 5px}
 .wake{width:196px;height:196px;max-width:65vw;max-height:65vw;cursor:pointer;border-radius:50%;border:1px solid #75e6b3;background:radial-gradient(circle at 36% 22%,#2e6b63 0%,#1a514b 43%,#0d3039 82%);box-shadow:0 0 0 11px #70e3b20c,0 0 0 24px #70e3b208,0 0 55px #33d9a331;color:#f1fff9;display:inline-flex;align-items:center;justify-content:center;flex-direction:column;gap:4px;transition:transform .12s,opacity .12s}
@@ -73,7 +75,7 @@ body{background:radial-gradient(circle at 50% 22%,#18344b 0%,#101c2e 36%,#0b1320
 @media(max-height:720px){.bar{margin-bottom:12px}.lead{margin-bottom:11px}.wake{width:165px;height:165px}.btn-box{padding:8px 0}.feedback{margin:12px 0}}
 </style></head><body><main class="wrap">
 <header class="bar">
-<div class="logo">WOL</div>
+<div class="logo">WOL <span class="mode-tag">{{ wake_mode|upper }}</span></div>
 {% if auth_enabled and logged_in %}<form action="{{ url_for('logout') }}" method="post"><input name="csrf" type="hidden" value="{{ csrf }}"><button class="logout" type="submit">退出</button></form>{% endif %}
 </header>
 {% if auth_enabled and not logged_in %}
@@ -354,7 +356,7 @@ def _send_wol_to_host(host, port, packet, *, resolved_ips=None):
     return ips, sent, sources, unique_errors, refused, len(errors)
 
 
-def send_wol(config):
+def _send_ipv4_wol(config):
     """Attempt host1 then host2; a single successful host wins overall.
 
     For any configured target, capture its own genuine UDP submission
@@ -463,17 +465,150 @@ def send_wol(config):
     }
 
 
-def _log_host(config, route, attempts, error=""):
+
+def _ipv6_relay_wol(config):
+    """IPv6-only: host1 -> authenticated AX6 relay -> LAN broadcast.
+
+    A valid ACK with submitted packets is required. UDP submission from VPS
+    alone NEVER counts as successful relay delivery or NAS boot.
+    """
+    host = str(config.get("host1") or "").strip()
+    if not host:
+        raise ValueError("IPv6 模式必须配置 host1（AX6 的 AAAA 域名）")
+    # Validate the host and require a public IPv6 DNS result below.
+    host = validate_relay6_host(host)
+    try:
+        port = int(config.get("relay6_port", 41996))
+    except (ValueError, TypeError) as exc:
+        raise ValueError("IPv6 中继端口无效") from exc
+    if not 1024 <= port <= 65535:
+        raise ValueError("IPv6 中继端口必须在 1024-65535 之间")
+    key_path = Path(config.get("relay6_secret_file") or str(APP_DIR / "wol6_secret"))
+    if not key_path.is_file():
+        raise ValueError("缺少 IPv6 中继密钥，请按部署手册上传 wol6_secret")
+    if not key_path.is_absolute():
+        raise ValueError("IPv6 中继密钥必须使用绝对路径")
+    if stat.S_IMODE(key_path.stat().st_mode) & 0o077:
+        raise ValueError("IPv6 中继密钥权限过宽，请执行 chmod 600")
+    try:
+        key = bytes.fromhex(key_path.read_text(encoding="ascii").strip())
+    except (OSError, ValueError, UnicodeError) as exc:
+        raise ValueError("IPv6 中继密钥内容无效") from exc
+    if len(key) != 32:
+        raise ValueError("IPv6 中继密钥长度必须为 32 字节")
+
+    ips = []
+    dns_error = ""
+    try:
+        records = socket.getaddrinfo(host, port, socket.AF_INET6, socket.SOCK_DGRAM)
+        ips = list(dict.fromkeys(str(ipaddress.IPv6Address(item[4][0])) for item in records
+                                  if ipaddress.IPv6Address(item[4][0]).is_global))
+        if len(ips) != 1:
+            raise ValueError("IPv6 中继域名必须仅解析到一个公网 AAAA 地址")
+    except (socket.gaierror, ValueError, OSError) as exc:
+        dns_error = str(exc)
+
+    ack_ok = False
+    sent_lan = 0
+    error_text = dns_error
+    refused = False
+    if not dns_error:
+        nonce = secrets.token_hex(16)
+        body = f"WOL1|{int(time.time())}|{nonce}"
+        signed = hmac.new(key, body.encode("ascii"), hashlib.sha256).hexdigest()
+        payload = f"{body}|{signed}".encode("ascii")
+        try:
+            with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as sock:
+                sock.settimeout(3.5)
+                sock.sendto(payload, (ips[0], port, 0, 0))
+                raw, peer = sock.recvfrom(512)
+            # The router/ISP may use or NAT to another public IPv6 for replies.
+            # A matching DNS address is not a cryptographic identity. Authenticate
+            # nonce + HMAC BEFORE accepting this ACK, independent of source IP.
+            # Check the expected UDP service port as additional hygiene.
+            if peer[1] != port:
+                raise ValueError("IPv6 中继确认来源端口不正确")
+            parts = raw.decode("ascii").split("|")
+            if len(parts) != 4 or parts[0] != "ACK1" or parts[1] != nonce:
+                raise ValueError("IPv6 中继确认格式不正确")
+            proof = "|".join(parts[:3]).encode("ascii")
+            expected = hmac.new(key, proof, hashlib.sha256).hexdigest()
+            if not hmac.compare_digest(parts[3], expected):
+                raise ValueError("IPv6 中继确认签名不正确")
+            # Authenticated ACK is accepted even if its reply address differs
+            # from the Cloudflare AAAA target (multi-address router / NAT66).
+            if not parts[2].isdigit():
+                raise ValueError("IPv6 中继确认包数无效")
+            sent_lan = int(parts[2])
+            if not 1 <= sent_lan <= 7:
+                raise ValueError("IPv6 中继未能提交局域网唤醒包")
+            ack_ok = True
+        except (OSError, ValueError, UnicodeError) as exc:
+            refused = getattr(exc, "errno", None) == errno.ECONNREFUSED
+            error_text = str(exc)
+
+    attempt = {
+        "route": "primary", "host": host, "ok": ack_ok,
+        "ips": [], "ipv6": ips, "packets": sent_lan if ack_ok else 0,
+        "failed_packets": 0 if ack_ok else 1,
+        "sources": [], "error": error_text, "warnings": [],
+        "refused": refused, "relay_ack": ack_ok,
+    }
+    return {
+        "mode": "ipv6", "ok": ack_ok, "refused": refused,
+        "ip_mismatch": False,
+        "ip_comparison": {"checked": False, "matched": None,
+                          "resolution_complete": False, "reason": "ipv6_mode",
+                          "host1_ipv4": [], "host2_ipv4": []},
+        "attempts": [attempt], "port": port,
+        "success_count": 1 if ack_ok else 0, "target_count": 1,
+        "packets": sent_lan if ack_ok else 0, "error": error_text,
+        "ipv6_relay": {"domain": host, "resolved_ipv6": ips,
+                       "status": "acknowledged" if ack_ok else "failed",
+                       "relay_ack": ack_ok, "lan_packets_submitted": sent_lan if ack_ok else 0,
+                       "error": error_text[:250]},
+    }
+
+
+def validate_relay6_host(value):
+    host = str(value or "").strip()
+    if not host or len(host) > 253 or any(ch.isspace() for ch in host) or "://" in host or "/" in host or "\\" in host:
+        raise ValueError("IPv6 中继 host1 格式不正确")
+    try:
+        ip = ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        domain = host.rstrip(".")
+        label_re = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$")
+        if not domain or not all(label_re.fullmatch(label) for label in domain.split(".")):
+            raise ValueError("IPv6 中继 host1 域名不合法")
+    else:
+        if not isinstance(ip, ipaddress.IPv6Address) or not ip.is_global:
+            raise ValueError("IPv6 中继 host1 必须是公网 IPv6 地址或 AAAA 域名")
+    return host.strip("[]")
+
+
+def send_wol(config):
+    mode = config.get("wake_mode", "ipv4")
+    if mode == "ipv4":
+        result = _send_ipv4_wol(config)
+        result["mode"] = "ipv4"
+        return result
+    if mode == "ipv6":
+        return _ipv6_relay_wol(config)
+    raise ValueError("不支持的唤醒模式：请在菜单 2 选择 IPV4 或 IPV6")
+
+def _log_host(config, route, attempts, error="", *, mode="ipv4"):
     """One independent and truthful status per host, per click."""
     key = "host1" if route == "primary" else "host2"
-    configured = config.get(key, "")
+    configured = "" if mode == "ipv6" and route == "backup" else config.get(key, "")
     configured = configured.strip() if isinstance(configured, str) else ""
     attempt = next((item for item in attempts if item["route"] == route), None)
     if attempt is None:
         return {
             "domain": configured,
             "status": "not_attempted" if (route == "primary" or configured) else "disabled",
-            "resolved_ipv4": [], "packets_sent": 0, "packets_failed": 0,
+            "resolved_ipv4": [], "resolved_ipv6": [], "relay_ack": False,
+            "packets_sent": 0, "packets_failed": 0,
             "errno111": False,
             "errors": [str(error)[:250]] if error and (route == "primary" or configured) else [],
         }
@@ -493,6 +628,8 @@ def _log_host(config, route, attempts, error=""):
         "domain": attempt.get("host", configured),
         "status": status,
         "resolved_ipv4": list(attempt.get("ips", [])),
+        "resolved_ipv6": list(attempt.get("ipv6", [])),
+        "relay_ack": bool(attempt.get("relay_ack", False)),
         "packets_sent": sent,
         "packets_failed": failed,
         "errno111": bool(attempt.get("refused", False)),
@@ -508,20 +645,27 @@ def append_send_log(config, result=None, *, trigger="web", error=""):
     to a private temporary file and atomically rename to avoid torn lines.
     """
     attempts = result.get("attempts", []) if result else []
+    mode = result.get("mode", config.get("wake_mode", "ipv4")) if result else config.get("wake_mode", "ipv4")
     # Overall is the UDP submission outcome; IP comparison is independent.
     overall = ("sent" if result and result.get("ok") else
                "refused" if result and result.get("refused") else "failed")
     entry = {
         "time": datetime.now(TZ).isoformat(timespec="seconds"),
         "trigger": trigger,
+        "mode": mode,
         "overall": overall,
-        "host1": _log_host(config, "primary", attempts, error),
-        "host2": _log_host(config, "backup", attempts, error),
+        "host1": _log_host(config, "primary", attempts, error, mode=mode),
+        "host2": _log_host(config, "backup", attempts, error, mode=mode),
         "ip_comparison": (result.get("ip_comparison") if result else {
             "checked": False, "matched": None,
             "host1_ipv4": [], "host2_ipv4": [],
         }),
     }
+    if mode == "ipv6":
+        entry["ipv6_relay"] = (result.get("ipv6_relay") if result else {
+            "domain": str(config.get("host1") or ""), "resolved_ipv6": [],
+            "status": "not_attempted", "relay_ack": False,
+            "lan_packets_submitted": 0, "error": str(error)[:250]})
     line = json.dumps(entry, ensure_ascii=False, separators=(",", ":")) + "\n"
     logfile = SEND_LOG_FILE
     lockfile = logfile.with_name(logfile.name + ".lock")
@@ -644,7 +788,8 @@ def index():
         return "WEB 未完成初始化：请运行 wol.sh，选择菜单 1 补齐配置，再在菜单 3 设置访问密码。", 503
     return render_template_string(PAGE, csrf=csrf_token(),
                                   auth_enabled=auth_enabled(), logged_in=logged_in(),
-                                  message=request.args.get("error", ""))
+                                  message=request.args.get("error", ""),
+                                  wake_mode=("ipv6" if config.get("wake_mode") == "ipv6" else "ipv4"))
 
 
 @app.post("/login")
@@ -730,17 +875,22 @@ def wake():
     _safe_log_send(config, result)
     for attempt in result["attempts"]:
         level = app.logger.info if attempt["ok"] else app.logger.warning
-        level("WOL route=%s host=%s ips=%s submitted=%s failed=%s errno111=%s details=%s",
-              attempt["route"], attempt["host"], attempt["ips"],
+        level("WOL mode=%s route=%s host=%s ips=%s submitted=%s failed=%s errno111=%s details=%s",
+              result.get("mode", "ipv4"), attempt["route"], attempt["host"],
+              attempt.get("ipv6") or attempt["ips"],
               attempt["packets"], attempt["failed_packets"],
               attempt["refused"], attempt["warnings"] or attempt["error"])
 
-    # The IP warning and UDP submission result are independent. A bad/missing
-    # backup DNS result must NOT suppress a successful primary WOL submission.
-    ip_status = ("mismatched" if result["ip_mismatch"] else
-                 "matched" if result["ip_comparison"]["checked"] else "none")
-    send_status = ("sent" if result["ok"] else
-                   "refused" if result["refused"] else "failed")
+    # IPv4 retains dual-host DNS and errno111 presentation. IPv6 has only
+    # one host and a signed relay ACK: no IP comparison / no Send refused label.
+    if result.get("mode") == "ipv6":
+        ip_status = "none"
+        send_status = "sent" if result["ok"] else "failed"
+    else:
+        ip_status = ("mismatched" if result["ip_mismatch"] else
+                     "matched" if result["ip_comparison"]["checked"] else "none")
+        send_status = ("sent" if result["ok"] else
+                       "refused" if result["refused"] else "failed")
     ip_text = ("IP解析一致" if ip_status == "matched" else
                "IP解析不一致" if ip_status == "mismatched" else "")
     send_text = ("唤醒数据包已发送" if send_status == "sent" else
