@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s.sh v4 - standalone sing-box deployment/management (no S-UI, no web panel).
+# s.sh v5 - standalone sing-box deployment/management (no S-UI, no web panel).
 # Revised from the user's s(9).sh: SS, HY2, VLESS REALITY; independent protocol submenus.
 # Protocol removal edits only the named sing-box inbound, not other services.
 # Kernel updates preserve configs; full uninstall removes ALL protocols and credentials.
@@ -37,6 +37,11 @@ ui_banner() {
 require_root() { [[ $EUID -eq 0 ]] || { fail 'Run as root: sudo bash s.sh'; exit 1; }; }
 command_ok() { command -v "$1" >/dev/null 2>&1; }
 
+# read -e uses readline; explicitly support both usual Backspace encodings.
+if [[ -t 0 ]]; then
+    bind '"\C-h": backward-delete-char' 2>/dev/null || true
+    bind '"\C-?": backward-delete-char' 2>/dev/null || true
+fi
 ask() {
     local __var="$1" prompt="$2" default="${3:-}" value=''
     if [[ -t 0 ]]; then
@@ -210,6 +215,17 @@ select_host() {
     set_meta_values --arg h "$picked" '.connect_host=$h'
 }
 
+# Avoid asking the connection address again after menu 1 already saved it.
+ensure_connect_host() {
+    local h
+    h="$(get_meta '.connect_host')"
+    if [[ -n "$h" ]]; then
+        CONNECT_HOST="$h"
+        return 0
+    fi
+    select_host
+}
+
 listener_lines() {
     local proto="$1" port="$2"
     if ! command_ok ss; then fail '未安装 ss（请在菜单 1 安装 iproute2）'; return 2; fi
@@ -337,6 +353,33 @@ find_cert_for_domain() {
     fi
     return 1
 }
+# Preflight for Let's Encrypt HTTP-01. Reusing a local cert never requires DNS checks.
+cert_dns_preflight() {
+    local domain="$1" current="" records="" line="" match=false
+    if command_ok getent; then
+        records="$(getent ahostsv4 "$domain" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
+    fi
+    current="$(get_public_ip || true)"
+    printf '  证书域名：%s\n  DNS A 记录：%s\n  VPS 公网 IPv4：%s\n' \
+        "$domain" "${records:-未解析到 IPv4}" "${current:-未检测到}"
+    if [[ -z "$records" ]]; then
+        warn '未检测到 IPv4 A 记录。仅 IPv6 的域名请确保 AAAA 解析正确，且 HTTP/80 能从公网访问。'
+        return 0
+    fi
+    if [[ -n "$current" ]]; then
+        local ip
+        IFS=',' read -r -a iplist <<< "$records"
+        for ip in "${iplist[@]}"; do
+            [[ "$ip" == "$current" ]] && match=true
+        done
+        if ! $match; then
+            warn '域名 A 记录与本机公网 IPv4 不一致，HTTP-01 可能失败。'
+            warn '若使用 Cloudflare 代理/CDN，请确认回源与 HTTP-01 挑战可达。'
+            confirm '仍要继续申请证书？' || return 1
+        fi
+    fi
+}
+
 cert_acme() {
     local d="$1" mode="$2" webroot=''
     command_ok certbot || { fail 'certbot is not installed; use menu 1'; return 1; }
@@ -368,35 +411,88 @@ cert_selfsigned() {
     chmod 600 "$certdir/privkey.pem"
     CERT_FILE="$certdir/fullchain.pem"; KEY_FILE="$certdir/privkey.pem"; CERT_INSECURE=true
 }
+# x.sh-style interactive Y/n/q certificate flow, with safe ACME methods:
+# Do not stop Nginx, rewrite sites-enabled, or touch the owner's HTTP website.
 prepare_domain_cert() {
-    local d='' chosen='' mode=''
+    local d='' saved='' connect='' choice='' method='' listeners='' cert_found=false
     ensure_state || return 1
-    chosen="$(get_meta '.cert_domain')"
-    ask d "TLS 证书域名 [${chosen:-example.org}]: " "$chosen" || return 1
-    domain_valid "$d" || { fail "Invalid domain: $d"; return 1; }
-    if find_cert_for_domain "$d"; then
-        say "Reusing existing valid certificate: $CERT_FILE"
-    else
-        say "No valid certificate for $d."
-        printf '%s\n' '1) ACME HTTP-01 独立签发（要求 TCP 80 空闲）' \
-            '2) ACME webroot 验证（复用已有 80 网站，不修改站点）' \
-            '3) 临时自签证书（客户端必须启用 insecure=1）' \
-            '0) 取消'
-        ask mode '请选择证书方式 [0]: ' 0 || return 1
-        case "$mode" in
-            1) cert_acme "$d" standalone || return 1; find_cert_for_domain "$d" || fail 'Issued certificate not found/valid' ;;
-            2) cert_acme "$d" webroot || return 1; find_cert_for_domain "$d" || fail 'Issued certificate not found/valid' ;;
-            3)
-                confirm 'Self-signed is for testing only and weakens client certificate authentication. Continue?' || return 1
-                cert_selfsigned "$d" || return 1 ;;
-            *) return 1 ;;
-        esac
+    saved="$(get_meta '.cert_domain')"
+    connect="$(get_meta '.connect_host')"
+    if [[ -z "$saved" ]] && domain_valid "$connect"; then saved="$connect"; fi
+    printf '\n%s\n' '========== TLS 域名证书申请 / 复用（参考 x.sh） =========='
+    ask d "TLS 证书域名 [${saved:-输入域名}]: " "$saved" || return 1
+    if [[ -z "$d" ]]; then
+        warn '没有填写域名，已跳过证书流程；不影响 Shadowsocks。'
+        return 0
     fi
+    domain_valid "$d" || { fail "域名格式无效：$d"; return 1; }
+    printf '  当前域名：%s\n' "$d"
+    if find_cert_for_domain "$d"; then
+        cert_found=true
+        say "发现可复用的有效证书：$CERT_FILE"
+        openssl x509 -in "$CERT_FILE" -noout -issuer -dates 2>/dev/null || true
+    else
+        say "尚未发现可用的 $d 证书。"
+    fi
+    while true; do
+        printf '\n%s\n' "Y = 申请 / 重新申请 Let's Encrypt 证书" \
+            'n = 复用 VPS 本地已有有效证书' \
+            's = 生成自签证书（仅测试，客户端需 insecure=1）' \
+            'q = 跳过证书配置（返回安装向导）'
+        if $cert_found; then
+            ask choice '请选择 [Y/n/s/q，默认 n]: ' n || return 1
+        else
+            ask choice '请选择 [Y/n/s/q，默认 Y]: ' Y || return 1
+        fi
+        case "$choice" in
+            n|N)
+                if ! find_cert_for_domain "$d"; then
+                    warn '未找到可用的域名证书；可以重新申请或稍后手动上传后选择 n。'
+                    continue
+                fi
+                say '本地证书有效，域名和私钥匹配，使用现有证书。'
+                break
+                ;;
+            y|Y)
+                cert_dns_preflight "$d" || { warn '已放弃本次申请，请先检查域名 DNS。'; continue; }
+                listeners="$(listener_lines tcp 80 2>/dev/null || true)"
+                if [[ -z "$listeners" ]]; then
+                    say 'TCP/80 空闲，使用 certbot standalone HTTP-01 签发。'
+                    method=standalone
+                else
+                    say 'TCP/80 已被网站占用，不停用 Nginx，不改变站点配置。'
+                    say '采用 certbot webroot 验证；输入的网站目录必须能响应 /.well-known/acme-challenge/。'
+                    method=webroot
+                fi
+                if ! cert_acme "$d" "$method"; then
+                    warn '证书申请失败，原 Nginx 网站不受影响；可检查 DNS/80 端口后重试或选 q 跳过。'
+                    continue
+                fi
+                if ! find_cert_for_domain "$d"; then
+                    warn '申请结束但证书路径无效或私钥不匹配，请检查 certbot certificates。'
+                    continue
+                fi
+                say "证书申请成功：$CERT_FILE"
+                openssl x509 -in "$CERT_FILE" -noout -issuer -dates 2>/dev/null || true
+                break
+                ;;
+            s|S)
+                confirm '自签证书仅适合临时测试，会降低客户端验证安全性，确认使用？' || continue
+                cert_selfsigned "$d" || { warn '生成自签证书失败'; continue; }
+                break
+                ;;
+            q|Q|0)
+                say '跳过 TLS 证书配置。SS 无须证书；HY2 安装时如有需要会再次询问。'
+                return 0
+                ;;
+            *) warn '无效选择，请输入 Y / n / s / q。' ;;
+        esac
+    done
     CERT_DOMAIN="$d"
     set_meta_values --arg d "$d" --arg c "$CERT_FILE" --arg k "$KEY_FILE" \
         --argjson insecure "$CERT_INSECURE" \
         '.cert_domain=$d | .cert_file=$c | .key_file=$k | .hy2_insecure=$insecure'
-    say "Certificate ready for $d; private key path is kept local."
+    say "证书已就绪：$d（私钥仅保存在本机，不对外显示）"
 }
 
 # Reuse a valid certificate already prepared by menu 1, without repeating
@@ -417,8 +513,18 @@ ensure_shared_cert() {
         say "复用菜单 1 中准备的证书：$CERT_DOMAIN"
         return 0
     fi
-    say '共享证书尚未准备或已失效，进入菜单 1 的通用证书处理流程。'
-    prepare_domain_cert
+    say '共享证书尚未准备或已失效，调用菜单 1 的通用证书处理流程。'
+    prepare_domain_cert || return 1
+    d="$(get_meta '.cert_domain')"
+    c="$(get_meta '.cert_file')"
+    k="$(get_meta '.key_file')"
+    if [[ -z "$d" || -z "$c" || -z "$k" ]] || ! cert_valid "$d" "$c" "$k"; then
+        fail '该协议需要有效 TLS 证书；证书配置已跳过或不匹配，无法继续。'
+        return 1
+    fi
+    CERT_DOMAIN="$d"; CERT_FILE="$c"; KEY_FILE="$k"
+    CERT_INSECURE="$(get_meta '.hy2_insecure')"
+    [[ "$CERT_INSECURE" == true ]] || CERT_INSECURE=false
 }
 
 service_setup() {
@@ -598,8 +704,8 @@ add_ss() {
         '{type:"shadowsocks",tag:"ss-in",listen:"::",listen_port:$port,method:$m,password:$password}' > "$node"
     if ! apply_inbound ss-in "$node"; then rm -f "$node"; return 1; fi
     rm -f "$node"
-    select_host || return 1
-    show_links ss
+    ensure_connect_host || return 1
+    protocol_report ss
 }
 
 add_hy2() {
@@ -631,8 +737,8 @@ add_hy2() {
     rm -f "$node"
     set_meta_values --arg sni "$CERT_DOMAIN" --argjson insecure "$CERT_INSECURE" \
         '.hy2={sni:$sni,insecure:$insecure}' || warn 'HY2 元数据写入失败，请核对节点链接。'
-    select_host || return 1
-    show_links hy2
+    ensure_connect_host || return 1
+    protocol_report hy2
 }
 
 check_tls_endpoint() {
@@ -947,8 +1053,8 @@ add_reality() {
     # Keep legacy sb compatibility without exposing private key.
     printf '%s' "$pub" > /etc/sing-box/.reality_pub
     chmod 600 /etc/sing-box/.reality_pub
-    select_host || return 1
-    show_links reality
+    ensure_connect_host || return 1
+    protocol_report reality
 }
 
 show_qr() {
@@ -1006,7 +1112,8 @@ show_links() {
             [[ "$hy2_insecure" == true ]] && query+='&insecure=1'
             uri="hy2://$(urlenc "$password")@$authority_host:$port/?${query}#$(urlenc "hy2${label:+-$label}")"
             printf '\n=== Hysteria2 (UDP/%s) ===\n%s\n' "$port" "$uri"
-            printf '  Address: %s  UDP Port: %s  SNI: %s\n' "$host" "$port" "$sni"
+            printf '  地址/域名：%s\n  UDP 端口：%s\n  HY2 原始密码：%s\n  TLS SNI：%s\n  传输：UDP / QUIC，ALPN h3\n' \
+                "$host" "$port" "$password" "$sni"
             printf '  HTTP/3 masquerade: %s\n' "$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.masquerade][0]//""' "$CONFIG")"
             show_qr "$uri"
         fi
@@ -1024,7 +1131,8 @@ show_links() {
             else
                 uri="vless://$uuid@$authority_host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(urlenc "$sni")&fp=chrome&pbk=$(urlenc "$key")&sid=$sid&type=tcp#$(urlenc "reality${label:+-$label}")"
                 printf '\n=== VLESS REALITY (TCP/%s) ===\n%s\n' "$port" "$uri"
-                printf '  SNI: %s  PublicKey: %s  ShortID: %s\n' "$sni" "$key" "$sid"
+                printf '  地址/域名：%s\n  TCP 端口：%s\n  UUID：%s\n  SNI：%s\n  PublicKey：%s\n  ShortID：%s\n  Flow：xtls-rprx-vision\n  传输：TCP / REALITY\n' \
+                    "$host" "$port" "$uuid" "$sni" "$key" "$sid"
                 printf '  Fallback: %s:%s\n' \
                     "$(jq -r '[.inbounds[]|select(.tag=="vless-in")|.tls.reality.handshake.server][0]//empty' "$CONFIG")" \
                     "$(jq -r '[.inbounds[]|select(.tag=="vless-in")|.tls.reality.handshake.server_port][0]//empty' "$CONFIG")"
@@ -1032,6 +1140,14 @@ show_links() {
             fi
         fi
     fi
+}
+
+# Unified status + connection parameters + node URI + QR for each protocol.
+protocol_report() {
+    local kind="$1"
+    protocol_status "$kind" || return 1
+    protocol_installed "$kind" || return 0
+    show_links "$kind"
 }
 
 # Shared backend for per-protocol uninstall. The sing-box binary/service, TLS
@@ -1133,21 +1249,32 @@ protocol_status() {
         installed=true
         line="$(protocol_inbound "$kind")"
         port="$(jq -r '.listen_port // empty' <<< "$line")"
-        printf '安装状态：已配置\n传输协议：%s\n监听端口：%s\n' "${proto^^}" "$port"
+        local connect_host="$(get_meta '.connect_host')"
+        [[ -n "$connect_host" ]] || connect_host="$(get_public_ip || true)"
+        printf '安装状态：已配置\n连接域名/IP：%s\n传输协议：%s\n监听端口：%s\n' \
+            "${connect_host:-请先在菜单 1 设置}" "${proto^^}" "$port"
         case "$kind" in
             ss)
                 method="$(jq -r '.method // empty' <<< "$line")"
-                printf '加密方式：%s\n' "$method"
+                printf '加密方式：%s\n原始密码：%s\n安全层：无 TLS\n传输方式：Shadowsocks 原生 TCP + UDP（无 WS / Path）\n' \
+                    "$method" "$(jq -r '.password // empty' <<< "$line")"
                 ;;
             hy2)
                 sni="$(get_meta '.hy2.sni')"
                 [[ -n "$sni" ]] || sni="$(get_meta '.cert_domain')"
-                printf 'TLS 域名：%s\nHTTP/3 伪装：%s\n' "${sni:-未记录}" \
+                printf 'TLS 域名/SNI：%s\nHY2 密码：%s\nTLS 证书：%s\nHTTP/3 伪装：%s\n' \
+                    "${sni:-未记录}" "$(jq -r '.users[0].password // empty' <<< "$line")" \
+                    "$(jq -r '.tls.certificate_path // empty' <<< "$line")" \
                     "$(jq -r '.masquerade // "未设置"' <<< "$line")"
+                printf '传输说明：UDP / QUIC / TLS，ALPN h3；出站需支持 Hysteria2\n'
                 ;;
             reality)
                 sni="$(jq -r '.tls.server_name // empty' <<< "$line")"
-                printf 'SNI：%s\nTLS 回落：%s:%s\n' "$sni" \
+                printf 'SNI：%s\nUUID：%s\nPublicKey：%s\nShortID：%s\nFlow：%s\n传输方式：TCP / REALITY（无 WS）\nTLS 回落：%s:%s\n' \
+                    "$sni" "$(jq -r '.users[0].uuid // empty' <<< "$line")" \
+                    "$(get_meta '.reality.public_key')" \
+                    "$(jq -r '.tls.reality.short_id[0] // empty' <<< "$line")" \
+                    "$(jq -r '.users[0].flow // empty' <<< "$line")" \
                     "$(jq -r '.tls.reality.handshake.server // empty' <<< "$line")" \
                     "$(jq -r '.tls.reality.handshake.server_port // empty' <<< "$line")"
                 ;;
@@ -1209,13 +1336,12 @@ protocol_menu() {
         printf '%b║%b  %b%s · 独立管理%b\n' "$UI_CYAN" "$UI_RESET" "$UI_BOLD$UI_GREEN" "$name" "$UI_RESET"
         printf '%b╚══════════════════════════════════════════════╝%b\n' "$UI_CYAN" "$UI_RESET"
         ui_rule
-        ui_item 1 '安装 / 重装协议'
+        ui_item 1 '安装 / 重装协议（安装成功立即输出状态、链接和二维码）'
         ui_item 2 '卸载当前协议（不影响其他协议）' "$UI_RED"
         ui_item 3 '重启当前协议（共用 sing-box 服务）'
-        ui_item 4 '查看协议运行状态和端口'
-        ui_item 5 '输出节点链接与二维码'
+        ui_item 4 '输出节点详细信息、链接与二维码（含运行状态）'
         if [[ "$kind" == hy2 ]]; then
-            ui_item 6 'HY2 TCP/443 HTTPS 伪装站（可选）'
+            ui_item 5 'HY2 TCP/443 HTTPS 伪装站（可选）'
         fi
         ui_item 0 '返回主菜单'
         ui_rule
@@ -1230,9 +1356,8 @@ protocol_menu() {
                 ;;
             2) remove_protocol "$kind" || true ;;
             3) protocol_restart "$kind" || true ;;
-            4) protocol_status "$kind" || true ;;
-            5) if command_ok jq; then show_links "$kind" || true; else warn '先在菜单 1 安装 jq / qrencode。'; fi ;;
-            6) if [[ "$kind" == hy2 ]]; then manage_hy2_tcp443_site || true; else warn '无效选项。'; fi ;;
+            4) protocol_report "$kind" || true ;;
+            5) if [[ "$kind" == hy2 ]]; then manage_hy2_tcp443_site || true; else warn '无效选项。'; fi ;;
             0|q|Q) return 0 ;;
             *) warn '无效选项。' ;;
         esac
@@ -1253,6 +1378,13 @@ status() {
     fi
     printf 'Config: %s\n' "$CONFIG"
     printf 'State:  %s\n' "$META"
+    if [[ -f "$CONFIG" ]] && command_ok jq; then
+        local kind
+        for kind in ss hy2 reality; do
+            if protocol_installed "$kind"; then protocol_status "$kind"; fi
+        done
+        say '在各协议子菜单选择 4 可查看链接与二维码。'
+    fi
 }
 
 # Protect other projects sharing the sing-box binary/service name. Only a
@@ -1623,66 +1755,36 @@ uninstall_singbox_core() {
 set_node_name() {
     ensure_tools && ensure_state || return 1
     local name=''
-    ask name 'Node name suffix (blank clears it): ' "$(get_meta '.node_name')" || return 1
-    [[ "$name" != *$'\n'* && ${#name} -lt 64 ]] || return 1
+    ask name '节点名称后缀（可留空）: ' "$(get_meta '.node_name')" || return 1
+    [[ "$name" != *$'\n'* && ${#name} -lt 64 ]] || { warn '节点名称应少于 64 字符'; return 1; }
     set_meta_values --arg name "$name" '.node_name=$name'
 }
 
-# Shared setup; every protocol reuses the same dependency, address and cert
-# functions. SS does not require TLS; HY2 calls prepare_domain_cert itself.
+# One-step setup wizard; protocol installers reuse tools and shared TLS metadata.
 common_setup_all() {
-    install_deps || return 1
+    printf '\n%b========== 菜单 1：一键准备通用环境（交互安装） ==========%b\n' "$UI_CYAN" "$UI_RESET"
+    say '[1/5] 安装通用依赖（curl / jq / openssl / certbot / qrencode / iproute2）'
+    if ! install_deps; then fail '依赖安装失败，已停止向导。'; return 1; fi
+    say '[2/5] 安装或检查独立 sing-box 内核（不包含 S-UI）'
     ensure_tools && ensure_singbox && ensure_state || return 1
+    if command_ok sing-box; then sing-box version | head -n 2 || true; fi
+    say '[3/5] 设置节点连接 IP / DDNS 域名'
     select_host || return 1
+    say '[4/5] 设置客户端节点名称后缀'
     set_node_name || return 1
-    if confirm '现在申请 / 复用一个 HY2 或 REALITY 本机回落可用的 TLS 域名证书？'; then
-        prepare_domain_cert || {
-            warn 'TLS 证书暂未准备；不影响 SS 安装，可稍后在菜单 1 单独处理。'
-        }
-    fi
-    say '通用环境已准备：sing-box、二维码依赖、连接地址及可选证书。'
+    say '[5/5] 申请或复用 TLS 证书（参照 x.sh 的 Y/n/q 流程）'
+    say '请直接输入证书域名进入 Y/n/q 选择；如果仅用 SS，可在域名提示处留空或在证书选项输入 q。'
+    prepare_domain_cert || warn '证书尚未准备，可在之后重新运行菜单 1 处理；不影响 SS。'
+    printf '\n'
+    say '通用环境完成：独立 sing-box 内核、二维码依赖、节点地址及名称已经准备。'
+    printf '  节点连接地址：%s\n  节点名称：%s\n  证书域名：%s\n' \
+        "$(get_meta '.connect_host')" "$(get_meta '.node_name')" "$(get_meta '.cert_domain')"
 }
-menu_setup() {
-    while true; do
-        printf '\n%s\n' '========== 菜单 1：通用环境、域名与证书 =========='
-        printf '%s\n' '1) 一键准备通用环境（依赖、二维码、内核、地址、可选证书）' \
-            '2) 安装系统及二维码依赖（含 jq、openssl、certbot）' \
-            '3) 安装独立 sing-box 内核（无 S-UI 面板）' \
-            '4) 设置节点连接地址（IP / DDNS）' \
-            '5) 申请或复用域名 TLS 证书（HY2 / REALITY 本机回落）' \
-            '6) 设置节点名称后缀' \
-            '7) 检查通用依赖、域名和证书状态' \
-            '0) 返回主菜单'
-        local n=''
-        ask n '请选择 [0]: ' 0 || return 0
-        case "$n" in
-            1) common_setup_all || true ;;
-            2) install_deps || true ;;
-            3) ensure_tools && ensure_singbox && { sing-box version | head -n 2; } || true ;;
-            4) ensure_tools && ensure_state && select_host || true ;;
-            5) ensure_tools && prepare_domain_cert || true ;;
-            6) set_node_name || true ;;
-            7)
-                printf '\n通用组件状态：\n'
-                for x in sing-box curl jq openssl qrencode certbot ss; do
-                    if command_ok "$x"; then printf '  %-12s %s\n' "$x" '已安装'; else printf '  %-12s %s\n' "$x" '未安装'; fi
-                done
-                if [[ -f "$META" ]]; then
-                    printf '  节点地址：%s\n  证书域名：%s\n  证书路径：%s\n' \
-                        "$(get_meta '.connect_host')" "$(get_meta '.cert_domain')" "$(get_meta '.cert_file')"
-                fi
-                ;;
-            0|q|Q) return 0 ;;
-            *) warn '无效选项。' ;;
-        esac
-    done
-}
-
 show_menu() {
     local active_label='' version=''
     ui_banner
     ui_rule
-    ui_item 1 '通用依赖、二维码、域名和 TLS 证书'
+    ui_item 1 '一键安装通用环境、域名及证书（交互向导）'
     ui_item 2 '手动更新 sing-box 内核'
     ui_item 3 '完整卸载内核 + 所有协议（不可恢复）' "$UI_RED"
     ui_rule
@@ -1725,8 +1827,11 @@ main() {
             return 0 ;;
         --status-hy2) protocol_status hy2; return 0 ;;
         --status-reality) protocol_status reality; return 0 ;;
-        --show) warn '节点链接与二维码现已移至各协议子菜单（主菜单 4/5/6）。'; return 0 ;;
-        --setup) menu_setup; return $? ;;
+        --show) warn '节点链接与二维码请进入对应协议子菜单，选择 4；或执行 --info-ss / --info-hy2 / --info-reality。'; return 0 ;;
+        --info-ss) protocol_report ss; return $? ;;
+        --info-hy2) protocol_report hy2; return $? ;;
+        --info-reality) protocol_report reality; return $? ;;
+        --setup) common_setup_all; return $? ;;
         --ss-menu) protocol_menu ss; return $? ;;
         --hy2-menu) protocol_menu hy2; return $? ;;
         --reality-menu) protocol_menu reality; return $? ;;
@@ -1745,7 +1850,7 @@ main() {
         show_menu
         ask choice '请选择 [0-8]: ' '' || return 0
         case "$choice" in
-            1) menu_setup || true ;;
+            1) common_setup_all || true ;;
             2) update_singbox_core || true ;;
             3) uninstall_singbox_core || true ;;
             4) protocol_menu ss || true ;;
