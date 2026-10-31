@@ -359,7 +359,7 @@ install_packages() {
             -o Dpkg::Options::="--force-confdef" \
             -o Dpkg::Options::="--force-confnew" \
             -o DPkg::Pre-Install-Pkgs::= \
-            curl wget jq bash sudo $install_nginx certbot sqlite3 ufw cron \
+            curl wget jq bash sudo $install_nginx certbot sqlite3 ufw cron unzip \
             netcat-traditional uuid-runtime openssl </dev/null; then
 
                 msg_err "基础依赖安装失败，尝试刷新软件源并自动修复后重试..."
@@ -379,7 +379,7 @@ install_packages() {
                     -o Dpkg::Options::="--force-confdef" \
                     -o Dpkg::Options::="--force-confnew" \
                     -o DPkg::Pre-Install-Pkgs::= \
-                    curl wget jq bash sudo nginx-full certbot sqlite3 ufw cron \
+                    curl wget jq bash sudo nginx-full certbot sqlite3 ufw cron unzip \
                     netcat-traditional uuid-runtime openssl </dev/null || {
                         msg_err "基础依赖安装失败"
                         exit 1
@@ -424,7 +424,7 @@ install_packages() {
             fi
 
         elif command -v yum >/dev/null 2>&1; then
-            if ! yum install -y curl wget jq bash sudo nginx certbot sqlite ufw cronie nc openssl; then
+            if ! yum install -y curl wget jq bash sudo nginx certbot sqlite ufw cronie nc openssl unzip; then
                 msg_err "基础依赖安装失败"
                 exit 1
             fi
@@ -904,7 +904,16 @@ install_panel() {
         chmod +x bin/xray-linux-arm
     fi
 
-    chmod +x x-ui bin/xray-linux-$(arch) 2>/dev/null || true
+    chmod +x x-ui 2>/dev/null || true
+    local installed_core_path
+    installed_core_path="$(xray_panel_core_path)" || return 1
+    [[ -f "$installed_core_path" ]] || { msg_err "面板安装包中找不到 Xray-core：$installed_core_path"; return 1; }
+    chmod +x "$installed_core_path" || return 1
+
+    # Panel archive includes its own Xray binary; replace it with the explicitly
+    # selected version before 3X-UI starts. Never silently keep bundled latest.
+    choose_xray_core_version || return 1
+    xray_install_selected_core || return 1
 
     mv -f /usr/bin/x-ui-temp /usr/bin/x-ui
     chmod +x /usr/bin/x-ui
@@ -919,78 +928,364 @@ install_panel() {
 }
 
 # -----------------------------
-#  Xray 自动更新任务：下载 xray_update.sh 并写入每月 1 日 03:00 cron
-#  参数：y = 写入任务后立即执行一次；n = 只下载并写入任务
+#  Xray-core: independently select and install the actual 3X-UI core.
+#  The panel's own version selection above is intentionally unchanged.
 # -----------------------------
-setup_xray_update_cron() {
-    local run_now="${1:-n}"
-    local RAW_XRAY_UPDATE_URL="https://raw.githubusercontent.com/byilrq/vps/main/xray_update.sh"
-    local LOCAL_XRAY_UPDATE="/root/xray_update.sh"
-    local XRAY_CRON_LOG="/var/log/xray_update.log"
-    local XRAY_CRON_LINE="0 3 1 * * /bin/bash ${LOCAL_XRAY_UPDATE} >>${XRAY_CRON_LOG} 2>&1"
+XRAY_DEFAULT_CORE_VERSION="v26.6.27"
+XRAY_REQUESTED_CORE_VERSION=""
 
-    touch "$XRAY_CRON_LOG" >/dev/null 2>&1 || true
+xray_panel_core_path() {
+    case "$(arch)" in
+        armv5|armv6|armv7) printf '%s\n' '/usr/local/x-ui/bin/xray-linux-arm' ;;
+        *) printf '/usr/local/x-ui/bin/xray-linux-%s\n' "$(arch)" ;;
+    esac
+}
 
-    echo "下载/刷新 xray_update.sh 到 /root（支持扫描 Xray-core 最高版本）..."
-    if command -v curl >/dev/null 2>&1; then
-        curl -fsSL "$RAW_XRAY_UPDATE_URL" -o "$LOCAL_XRAY_UPDATE" || {
-            msg_err "下载 xray_update.sh 失败，Xray 自动更新任务未写入"
+xray_release_asset_name() {
+    case "$(arch)" in
+        amd64) printf 'Xray-linux-64.zip\n' ;;
+        386)   printf 'Xray-linux-32.zip\n' ;;
+        arm64) printf 'Xray-linux-arm64-v8a.zip\n' ;;
+        armv7) printf 'Xray-linux-arm32-v7a.zip\n' ;;
+        armv6) printf 'Xray-linux-arm32-v6.zip\n' ;;
+        armv5) printf 'Xray-linux-arm32-v5.zip\n' ;;
+        s390x) printf 'Xray-linux-s390x.zip\n' ;;
+        *) msg_err "当前架构 $(arch) 尚未配置官方 Xray-core 安装包映射" >&2; return 1 ;;
+    esac
+}
+
+xray_core_installed_version() {
+    local binary="${1:-$(xray_panel_core_path)}"
+    [[ -x "$binary" ]] || return 1
+    "$binary" version 2>/dev/null | head -n1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1
+}
+
+xray_official_latest_tag() {
+    local tag
+    # Official GitHub latest, not a pre-release and not the 'highest' arbitrary tag.
+    tag="$(curl -fsSL --retry 2 --connect-timeout 10 --max-time 25 \
+        'https://api.github.com/repos/XTLS/Xray-core/releases/latest' \
+        | grep -m1 -oE '"tag_name"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+"' \
+        | grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' | head -n1)" || return 1
+    [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    printf '%s\n' "$tag"
+}
+
+choose_xray_core_version() {
+    local input='' latest='' current=''
+    current="$(xray_core_installed_version 2>/dev/null || true)"
+    echo
+    echo -e "${cyan}========== Xray-core 内核版本选择 ==========${none}"
+    echo "3X-UI 面板版本：按前面的面板选择安装（两者相互独立）"
+    echo "当前 / 面板附带 Xray-core：${current:-未检测到}"
+    echo "默认 Xray-core：${XRAY_DEFAULT_CORE_VERSION}（已验证 NekoBox 可连接）"
+    echo '直接回车：安装 v26.6.27'
+    echo '输入 latest：从 XTLS/Xray-core 官方 GitHub 获取最新发布版'
+    echo '也可以输入具体版本，如 v26.9.30（或 26.9.30）'
+    echo -e "${yellow}提示：旧版本可能缺少后续安全修复；最新版本可能与旧 NekoBox 不兼容。${none}"
+    read -erp '请选择 Xray-core 版本 [回车=v26.6.27]: ' input || return 1
+    case "$input" in
+        '' ) XRAY_REQUESTED_CORE_VERSION="$XRAY_DEFAULT_CORE_VERSION" ;;
+        latest|LATEST)
+            echo '查询 Xray-core 官方 latest 版本中...'
+            latest="$(xray_official_latest_tag)" || {
+                msg_err '无法获取官方最新版本。未回退为其他未知版本，请检查 GitHub API 网络。'
+                return 1
+            }
+            XRAY_REQUESTED_CORE_VERSION="$latest"
+            ;;
+        *)
+            [[ "$input" == v* ]] || input="v$input"
+            if [[ ! "$input" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                msg_err '内核版本格式错误（应为 v26.6.27、latest 或其他 vX.Y.Z）。'
+                return 1
+            fi
+            XRAY_REQUESTED_CORE_VERSION="$input"
+            ;;
+    esac
+    echo -e "${green}本次选择 Xray-core：${XRAY_REQUESTED_CORE_VERSION}${none}"
+    if [[ "$XRAY_REQUESTED_CORE_VERSION" == "$XRAY_DEFAULT_CORE_VERSION" ]]; then
+        msg_inf '兼容版本已固定；若开启 Xray 自动更新，未来可能再次出现 NekoBox 不兼容。'
+    fi
+}
+
+# Download/verify before touching the panel's executable; keep old binary for rollback.
+xray_install_selected_core() {
+    local selected="${XRAY_REQUESTED_CORE_VERSION:-}"
+    local dest asset tmpdir='' url checksum_file='' sha='' actual='' current='' backup='' config=''
+    local need_start=n
+    [[ "$selected" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { msg_err '请先选择正确的 Xray-core 版本'; return 1; }
+    local needed
+    for needed in curl unzip sha256sum; do
+        if ! command -v "$needed" >/dev/null 2>&1; then
+            msg_err "缺少依赖：$needed。Debian/Ubuntu 可运行 apt-get install -y curl unzip coreutils。"
             return 1
-        }
-    elif command -v wget >/dev/null 2>&1; then
-        wget -qO "$LOCAL_XRAY_UPDATE" "$RAW_XRAY_UPDATE_URL" || {
-            msg_err "下载 xray_update.sh 失败，Xray 自动更新任务未写入"
-            return 1
-        }
+        fi
+    done
+    dest="$(xray_panel_core_path)" || return 1
+    [[ -x "$dest" ]] || { msg_err "找不到 3X-UI 内核文件：$dest"; return 1; }
+    current="$(xray_core_installed_version "$dest" 2>/dev/null || true)"
+    if [[ "$current" == "${selected#v}" ]]; then
+        msg_ok "面板现有 Xray-core 已是 $selected，无需重复替换。"
+        return 0
+    fi
+    asset="$(xray_release_asset_name)" || return 1
+    url="https://github.com/XTLS/Xray-core/releases/download/${selected}/${asset}"
+    tmpdir="$(mktemp -d /tmp/xray-core-select.XXXXXXXX)" || return 1
+    echo "下载官方 Xray-core $selected：$asset"
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 210 -o "$tmpdir/core.zip" "$url"; then
+        msg_err "下载失败：$url（未修改当前内核）"
+        rm -rf "$tmpdir"; return 1
+    fi
+    if ! unzip -tqq "$tmpdir/core.zip" || ! unzip -p "$tmpdir/core.zip" xray > "$tmpdir/xray" || [[ ! -s "$tmpdir/xray" ]]; then
+        msg_err 'Xray 官方 ZIP 无效或缺少 xray 文件（未修改当前内核）'
+        rm -rf "$tmpdir"; return 1
+    fi
+    # Xray release normally publishes a separate *.dgst file; verify SHA256 if available.
+    if curl -fsSL --connect-timeout 8 --max-time 25 "${url}.dgst" -o "$tmpdir/core.dgst" 2>/dev/null; then
+        sha="$(grep -iE 'SHA2[-_]?256|SHA[-_]?256' "$tmpdir/core.dgst" | head -n1 | grep -Eo '[[:xdigit:]]{64}' | head -n1 || true)"
+        if [[ -n "$sha" ]]; then
+            if ! printf '%s  %s\n' "$sha" "$tmpdir/core.zip" | sha256sum -c - >/dev/null 2>&1; then
+                msg_err 'Xray ZIP SHA256 校验失败，拒绝替换。'
+                rm -rf "$tmpdir"; return 1
+            fi
+            msg_inf '官方 SHA256 校验通过。'
+        else
+            msg_inf '未能解析官方摘要文件的 SHA256 字段；已校验 ZIP 完整性及下载内核版本。'
+        fi
     else
-        msg_err "未检测到 curl/wget，无法下载 xray_update.sh，Xray 自动更新任务未写入"
-        return 1
+        msg_inf '未找到对应的官方摘要文件；已校验 ZIP 完整性及下载内核版本。'
     fi
-
-    [[ -s "$LOCAL_XRAY_UPDATE" ]] || {
-        msg_err "xray_update.sh 文件为空，Xray 自动更新任务未写入"
-        return 1
-    }
-
-    chmod +x "$LOCAL_XRAY_UPDATE" || {
-        msg_err "赋予执行权限失败：$LOCAL_XRAY_UPDATE"
-        return 1
-    }
-
-    echo "写入/刷新 Xray 月度自动更新任务 ..."
-    (
-        crontab -l 2>/dev/null \
-            | grep -Fv "/root/xray_update.sh" \
-            | grep -Fv "/root/xray_fresh.sh" || true
-        echo "$XRAY_CRON_LINE"
-    ) | crontab - || {
-        msg_err "写入 crontab 失败"
-        return 1
-    }
-
-    if [[ "$run_now" =~ ^[Yy]$ ]]; then
-        echo "执行一次本地 xray_update.sh ..."
-        /bin/bash "$LOCAL_XRAY_UPDATE" || {
-            msg_err "xray_update.sh 执行失败，但自动更新任务已写入"
-            return 1
-        }
+    chmod 755 "$tmpdir/xray"
+    actual="$(xray_core_installed_version "$tmpdir/xray" 2>/dev/null || true)"
+    if [[ "$actual" != "${selected#v}" ]]; then
+        msg_err "下载内核版本异常：期望 $selected，检测到 ${actual:-未知}；拒绝替换。"
+        rm -rf "$tmpdir"; return 1
     fi
+    config='/usr/local/x-ui/bin/config.json'
+    if [[ -s "$config" ]]; then
+        if ! XRAY_LOCATION_ASSET=/usr/local/x-ui/bin "$tmpdir/xray" run -test -config "$config"; then
+            msg_err '所选 Xray-core 与当前运行配置不兼容；旧内核和原节点未修改。'
+            rm -rf "$tmpdir"; return 1
+        fi
+    fi
+    mkdir -p /root/xray-core-backups || { rm -rf "$tmpdir"; return 1; }
+    chmod 700 /root/xray-core-backups || true
+    backup="/root/xray-core-backups/xray-before-$(date +%Y%m%d-%H%M%S)-$$"
+    cp -p "$dest" "$backup" || { msg_err '旧内核备份失败，取消更换'; rm -rf "$tmpdir"; return 1; }
+    if systemctl is-active --quiet x-ui; then
+        need_start=y
+        if ! systemctl stop x-ui; then
+            msg_err '未能停止 3X-UI，拒绝替换内核'; rm -rf "$tmpdir"; return 1
+        fi
+    fi
+    if ! install -m 755 "$tmpdir/xray" "$dest"; then
+        msg_err '安装新内核失败，正在恢复旧内核。'
+        install -m 755 "$backup" "$dest" || true
+        [[ "$need_start" == y ]] && systemctl start x-ui || true
+        rm -rf "$tmpdir"; return 1
+    fi
+    if [[ "$need_start" == y ]]; then
+        if ! systemctl start x-ui || ! systemctl is-active --quiet x-ui; then
+            msg_err '新内核启动失败，自动恢复旧内核。'
+            systemctl stop x-ui 2>/dev/null || true
+            install -m 755 "$backup" "$dest" || true
+            systemctl start x-ui 2>/dev/null || true
+            rm -rf "$tmpdir"; return 1
+        fi
+    fi
+    actual="$(xray_core_installed_version "$dest" 2>/dev/null || true)"
+    rm -rf "$tmpdir"
+    msg_ok "已安装 Xray-core v${actual}；3X-UI 面板版本没有变更。"
+    echo "旧内核备份：$backup"
+    if [[ "$selected" != "$XRAY_DEFAULT_CORE_VERSION" ]]; then
+        msg_inf '提示：新内核通过本地配置/启动检查，并不代表旧版 NekoBox 一定兼容。'
+    fi
+}
 
-    msg_ok "已设置 Xray 自动更新：每月 1 日 03:00 执行 /root/xray_update.sh"
-    echo "本地脚本: $LOCAL_XRAY_UPDATE"
-    echo "日志文件: $XRAY_CRON_LOG"
+# After a one-time manual core update, avoid leaving an old monthly updater silently overwriting it.
+xray_disable_legacy_auto_update_if_present() {
+    local old='' choice=''
+    old="$(crontab -l 2>/dev/null | grep -E '/root/xray_(update|fresh)\.sh' || true)"
+    [[ -n "$old" ]] || return 0
+    echo -e "${yellow}[WARN] 检测到旧版每月 Xray 自动更新任务，它会覆盖刚选择的内核版本：${none}"
+    printf '%s\n' "$old"
+    read -erp '是否清除上述自动更新任务以固定当前内核？[Y/n]: ' choice || return 1
+    if [[ ! "$choice" =~ ^[Nn]$ ]]; then
+        (crontab -l 2>/dev/null | grep -Ev '/root/xray_(update|fresh)\.sh' || true) | crontab -
+        msg_ok '已关闭旧版 Xray 月度自动更新任务。'
+    else
+        msg_inf '已保留定时更新：未来可能自动升级 Xray-core。'
+    fi
 }
 
 # -----------------------------
-#  手动更新 Xray + 固定写入每月 1 日 03:00 cron
+#  Xray-core maintenance: manual vs explicitly opted-in scheduled update.
+#  The cron copy runs this same script with --xray-auto-update, never an
+#  external mutable xray_update.sh downloaded on every run.
 # -----------------------------
-xray_updata() {
-    echo "----------------------------------------------------------------"
-    echo "更新 Xray-core（应用到 3x-ui 面板）"
-    echo "----------------------------------------------------------------"
+XRAY_MANAGED_CRON_MARKER='X_SH_MANAGED_XRAY_CORE_UPDATE'
+XRAY_CRON_RUNNER='/root/xray-core-manager/xray-core-maintenance.sh'
+XRAY_CRON_LOG='/var/log/xray-core-auto-update.log'
 
-    setup_xray_update_cron "y" || return 1
-    msg_ok "Xray 手动更新已执行完成，自动更新任务已确认写入。请刷新 3x-ui 面板版本弹窗查看。"
+xray_auto_cron_listing() {
+    crontab -l 2>/dev/null | grep -E 'X_SH_MANAGED_XRAY_CORE_UPDATE|/root/xray_(update|fresh)\.sh' || true
+}
+
+# Keep all unrelated cron entries and clear only this script's old/new updaters.
+xray_clear_managed_cron() {
+    local existing=''
+    existing="$(crontab -l 2>/dev/null || true)"
+    if [[ -z "$existing" ]]; then
+        return 0
+    fi
+    if ! printf '%s\n' "$existing" | grep -Eq 'X_SH_MANAGED_XRAY_CORE_UPDATE|/root/xray_(update|fresh)\.sh'; then
+        return 0
+    fi
+    if ! printf '%s\n' "$existing" \
+        | grep -Ev 'X_SH_MANAGED_XRAY_CORE_UPDATE|/root/xray_(update|fresh)\.sh' \
+        | crontab -; then
+        msg_err '移除旧 Xray 自动更新任务失败；请检查 crontab -l。'
+        return 1
+    fi
+    return 0
+}
+
+# Cron's own invocation is non-interactive and updates only Xray-core.
+xray_auto_update_once() {
+    local latest=''
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] 启动 Xray-core 定时更新检查"
+    latest="$(xray_official_latest_tag)" || {
+        msg_err '自动更新无法查询官方最新版本，本次不修改内核。'
+        return 1
+    }
+    XRAY_REQUESTED_CORE_VERSION="$latest"
+    echo "[INFO] XTLS 官方最新发布版本：$XRAY_REQUESTED_CORE_VERSION"
+    xray_install_selected_core || return 1
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [OK] 本次更新检查完成"
+}
+
+# Menu 3, item 1: one-time manual change. Does not enable cron.
+xray_updata() {
+    echo '----------------------------------------------------------------'
+    echo '手动更新 Xray-core（不会升级 3X-UI 面板或启用定时任务）'
+    echo '----------------------------------------------------------------'
+    choose_xray_core_version || return 1
+    xray_install_selected_core || return 1
+    if [[ -n "$(xray_auto_cron_listing)" ]]; then
+        echo -e "${yellow}[WARN] 检测到仍在生效的 Xray 定时更新任务，未来可能覆盖本次手动选择的内核。${none}"
+        echo '若需固定当前版本，请使用菜单 3 → 子菜单 3 取消定时任务。'
+    else
+        msg_inf '本次手动更新没有创建定时任务。'
+    fi
+}
+
+# Menu 3, item 2: install explicitly opted-in cron schedule.
+xray_setup_auto_update() {
+    local confirm='' hour='' minute='' day='' cron_entry='' script_source='' existing_crontab=''
+    echo
+    echo -e "${yellow}[警告] 自动更新会替换 Xray-core，可能使手机 NekoBox、旧版 sing-box 等客户端的 REALITY 等代理协议失效。${none}"
+    echo -e "${yellow}[警告] 语法/启动检查无法证明每个客户端都兼容新内核；服务可启动也可能存在协议握手不兼容。${none}"
+    echo '自动更新默认关闭；只有主动确认才创建计划任务。'
+    echo '默认计划：每月 1 日 03:00（VPS 本地时间）。'
+    read -erp '每月日期 [1-28，回车默认 1]: ' day || return 1
+    read -erp '执行小时 [0-23，回车默认 3]: ' hour || return 1
+    read -erp '执行分钟 [0-59，回车默认 0]: ' minute || return 1
+    day="${day:-1}"; hour="${hour:-3}"; minute="${minute:-0}"
+    if [[ ! "$day" =~ ^[0-9]+$ || ! "$hour" =~ ^[0-9]+$ || ! "$minute" =~ ^[0-9]+$ ]] \
+       || ((10#$day < 1 || 10#$day > 28 || 10#$hour > 23 || 10#$minute > 59)); then
+        msg_err '计划时间不合法：日期 1-28，小时 0-23，分钟 0-59。'
+        return 1
+    fi
+    day=$((10#$day)); hour=$((10#$hour)); minute=$((10#$minute))
+    echo "计划执行：每月 ${day} 日 ${hour}:$(printf '%02d' "$minute")"
+    echo '升级失败且配置或服务检查未通过时，将尝试恢复旧内核；无法保证自动识别 NekoBox 兼容性。'
+    read -erp '确认接受可能导致代理中断的风险？输入 AUTO 才启用：' confirm || return 1
+    if [[ "$confirm" != 'AUTO' ]]; then
+        msg_inf '未开启定时更新。'
+        return 0
+    fi
+    if ! command -v crontab >/dev/null 2>&1; then
+        msg_err '系统没有 crontab，请先安装 cron/cronie。'
+        return 1
+    fi
+    script_source="$0"
+    if [[ ! -s "$script_source" ]] || ! bash -n "$script_source"; then
+        msg_err '无法读取当前完整的 x.sh，取消定时任务安装。'
+        return 1
+    fi
+    mkdir -p "$(dirname "$XRAY_CRON_RUNNER")" || return 1
+    chmod 700 "$(dirname "$XRAY_CRON_RUNNER")" || true
+    if ! install -m 700 "$script_source" "$XRAY_CRON_RUNNER"; then
+        msg_err '未能生成独立的定时维护脚本。'
+        return 1
+    fi
+    # Copy is self-contained and invokes only the --xray-auto-update dispatch.
+    if ! grep -q -- '--xray-auto-update' "$XRAY_CRON_RUNNER"; then
+        msg_err '生成的定时脚本缺少自动更新入口，已取消。'
+        return 1
+    fi
+    xray_clear_managed_cron || return 1
+    cron_entry="$minute $hour $day * * /bin/bash $XRAY_CRON_RUNNER --xray-auto-update >>$XRAY_CRON_LOG 2>&1 # $XRAY_MANAGED_CRON_MARKER"
+    existing_crontab="$(crontab -l 2>/dev/null || true)"
+    if ! printf '%s\n%s\n' "$existing_crontab" "$cron_entry" | crontab -; then
+        msg_err '计划任务安装失败。'
+        return 1
+    fi
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl list-unit-files cron.service --no-legend 2>/dev/null | grep -q 'cron.service'; then
+            systemctl enable --now cron >/dev/null 2>&1 || msg_inf 'cron 可能未启动，请检查 systemctl status cron。'
+        elif systemctl list-unit-files crond.service --no-legend 2>/dev/null | grep -q 'crond.service'; then
+            systemctl enable --now crond >/dev/null 2>&1 || msg_inf 'crond 可能未启动，请检查 systemctl status crond。'
+        fi
+    fi
+    msg_ok '已启用每月 Xray-core 自动更新。'
+    echo "计划：$cron_entry"
+    echo "日志：$XRAY_CRON_LOG"
+    echo '注意：自动更新前会备份旧内核，但不能自动保证手机 NekoBox 兼容。'
+}
+
+# Menu 3, item 3: show status, then disable with explicit confirmation.
+xray_auto_update_status_or_disable() {
+    local tasks='' choice=''
+    echo '----------------------------------------------------------------'
+    echo 'Xray-core 定时更新任务状态'
+    echo '----------------------------------------------------------------'
+    tasks="$(xray_auto_cron_listing)"
+    if [[ -z "$tasks" ]]; then
+        msg_ok '当前没有本脚本管理的 Xray 自动更新任务。'
+        return 0
+    fi
+    echo "$tasks"
+    echo -e "${yellow}[WARN] 如自动升级内核，旧版客户端可能发生 REALITY 握手失败。${none}"
+    read -erp '是否取消上述 Xray 定时更新任务？(y/N): ' choice || return 1
+    if [[ "$choice" =~ ^[Yy]$ ]]; then
+        xray_clear_managed_cron || return 1
+        msg_ok '已取消 Xray 定时自动更新；不会删除面板或内核。'
+    else
+        msg_inf '已保留当前计划任务。'
+    fi
+}
+
+xray_core_menu() {
+    local choice=''
+    while true; do
+        echo
+        echo -e "${cyan}========== Xray-core 维护 ==========${none}"
+        echo '1) 手动更新 Xray-core（默认 v26.6.27，latest 获取最新版）'
+        echo '2) 设置定时自动更新（默认关闭，需确认风险）'
+        echo '3) 查看 / 取消定时自动更新'
+        echo '0) 返回主菜单'
+        echo -e "${yellow}[WARN] 自动更新后可能导致 NekoBox 等客户端代理协议失效。${none}"
+        read -erp '请选择 [0-3]: ' choice || return 0
+        case "$choice" in
+            1) xray_updata || true; pause ;;
+            2) xray_setup_auto_update || true; pause ;;
+            3) xray_auto_update_status_or_disable || true; pause ;;
+            0) return 0 ;;
+            *) msg_err '输入无效，请重新选择。' ;;
+        esac
+    done
 }
 
 # -----------------------------
@@ -1004,7 +1299,7 @@ if [[ -f $XUIDB ]]; then
         pkill -x xray 2>/dev/null || true
         sleep 2
 
-        XRAY_BIN="/usr/local/x-ui/bin/xray-linux-$(arch)"
+        XRAY_BIN="$(xray_panel_core_path)"
         [[ -x "$XRAY_BIN" ]] || XRAY_BIN="/usr/local/x-ui/bin/xray"
 
         output=$($XRAY_BIN x25519 2>/dev/null || true)
@@ -1614,11 +1909,11 @@ setup_cronjob() {
     fi
 
     echo
-    read -rp "是否设置 Xray 每月自动更新？(y/N): " confirm_xray_cron
-    if [[ "$confirm_xray_cron" =~ ^[Yy]$ ]]; then
-        setup_xray_update_cron "n" || msg_err "Xray 自动更新任务写入失败，请稍后从菜单 3 重试。"
-    else
-        msg_inf "已跳过 Xray 自动更新任务。"
+    msg_inf 'Xray-core 自动更新默认关闭；以后需要定时更新，请在主菜单 3 → 子菜单 2 中手动设置。'
+    if [[ -n "$(xray_auto_cron_listing)" ]]; then
+        echo -e "${yellow}[WARN] 检测到先前的 Xray 自动更新任务，会覆盖本次选定的 ${XRAY_REQUESTED_CORE_VERSION:-v26.6.27}。${none}"
+        echo '为保留本次安装的兼容内核，安装流程将关闭旧 Xray 内核定时更新任务。'
+        xray_clear_managed_cron || msg_err '未能清理旧定时任务，请在主菜单 3 → 子菜单 3 中检查。'
     fi
 }
 
@@ -2668,6 +2963,19 @@ install_xui_pro() {
     clear >/dev/null 2>&1 || true
     show_banner
 
+    # Original menu 1 rebuilds the panel and UPDATE_XUIDB deletes all existing
+    # inbound rows. Do not let a core-only change accidentally reset clients.
+    if [[ -s "$XUIDB" ]]; then
+        local confirm_rebuild=''
+        msg_err '已检测到原有 3X-UI 节点数据库。菜单 1 会重装面板、清空节点并重新生成 UUID/REALITY 密钥。'
+        msg_inf '如果你只是要切换 Xray 内核版本，请使用主菜单 3，原节点不会被重建。'
+        read_tty '确实要清空原节点并重装？请输入 REBUILD 确认：' confirm_rebuild
+        if [[ "$confirm_rebuild" != 'REBUILD' ]]; then
+            msg_inf '已取消重新安装，原面板及节点保持不变。'
+            return 0
+        fi
+    fi
+
     # 检测端口 443 冲突：hysteria 2 也默认监听 443
     if ss -lntp 2>/dev/null | grep -q ':443 '; then
         local proc_443
@@ -2728,9 +3036,12 @@ install_xui_pro() {
     echo "如果系统未检测到 x-ui，将自动下载安装并初始化配置。"
 
     if systemctl is-active --quiet x-ui; then
+        # Usually unreachable due to cleanup_services above; keep behavior for compatibility.
         x-ui restart
+        choose_xray_core_version || return 1
+        xray_install_selected_core || return 1
     else
-        install_panel
+        install_panel || { msg_err '面板或所选 Xray-core 安装失败，停止后续节点重建。'; return 1; }
     fi
 
     UPDATE_XUIDB
@@ -2761,7 +3072,7 @@ menu() {
         echo -e " ${blue}${bold}1)${none} ${blue}安装${none}"
         echo -e " ${red}${bold}2)${none} ${red}卸载${none}"
         echo -e "${gray}--------------------------------------------------${none}"
-        echo -e " ${yellow}${bold}3)${none} ${yellow}更新 Xray-core${none}"
+        echo -e " ${yellow}${bold}3)${none} ${yellow}Xray-core 更新管理（手动 / 定时）${none}"
         echo -e " ${yellow}${bold}4)${none} ${yellow}查看状态${none}"
         echo -e " ${yellow}${bold}5)${none} ${yellow}打印节点信息${none}"
         echo -e " ${yellow}${bold}6)${none} ${yellow}目标网站检测${none}"
@@ -2783,7 +3094,7 @@ menu() {
         case "${choice}" in
             1) INSTALL="y"; UNINSTALL="n"; install_xui_pro ;;
             2) uninstall_xui_menu ;;
-            3) xray_updata ;;
+            3) xray_core_menu ;;
             4) view_status ;;
             5) print_node_info ;;
             6) detect_target_site ;;
@@ -2802,6 +3113,10 @@ menu() {
 #  程序入口
 # -----------------------------
 main() {
+    if [[ "${1:-}" == '--xray-auto-update' ]]; then
+        xray_auto_update_once
+        return $?
+    fi
     parse_args "$@"
 
     if [[ ${UNINSTALL} == *"y"* ]]; then
