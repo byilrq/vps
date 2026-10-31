@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s.sh - standalone sing-box deployment/management (no S-UI, no web panel).
+# s.sh v4 - standalone sing-box deployment/management (no S-UI, no web panel).
 # Revised from the user's s(9).sh: SS, HY2, VLESS REALITY; independent protocol submenus.
 # Protocol removal edits only the named sing-box inbound, not other services.
 # Kernel updates preserve configs; full uninstall removes ALL protocols and credentials.
@@ -13,9 +13,27 @@ META=/etc/sing-box/.s-script-meta.json
 BACKUPS=/etc/sing-box/backups
 OWN_BRIDGE_MARKER='# S_SH_MANAGED_TLS_BRIDGE_V2'
 
-say() { printf '\033[1;34m[INFO]\033[0m %s\n' "$*"; }
-warn() { printf '\033[1;33m[WARN]\033[0m %s\n' "$*" >&2; }
-fail() { printf '\033[1;31m[ERROR]\033[0m %s\n' "$*" >&2; return 1; }
+# Terminal-aware colors. Display plain text when redirected or TERM=dumb.
+if [[ -t 1 && "${TERM:-dumb}" != dumb && "${NO_COLOR:-}" == '' ]]; then
+    UI_RESET=$'\033[0m'; UI_CYAN=$'\033[1;36m'; UI_BLUE=$'\033[1;34m'
+    UI_GREEN=$'\033[1;32m'; UI_YELLOW=$'\033[1;33m'; UI_RED=$'\033[1;31m'
+    UI_BOLD=$'\033[1m'; UI_DIM=$'\033[2m'
+else
+    UI_RESET=''; UI_CYAN=''; UI_BLUE=''; UI_GREEN=''; UI_YELLOW=''; UI_RED=''
+    UI_BOLD=''; UI_DIM=''
+fi
+say() { printf '%b[INFO]%b %s\n' "$UI_BLUE" "$UI_RESET" "$*"; }
+warn() { printf '%b[WARN]%b %s\n' "$UI_YELLOW" "$UI_RESET" "$*" >&2; }
+fail() { printf '%b[ERROR]%b %s\n' "$UI_RED" "$UI_RESET" "$*" >&2; return 1; }
+ui_rule() { printf '%b--------------------------------------------------%b\n' "$UI_DIM" "$UI_RESET"; }
+ui_item() { local num="$1" desc="$2" shade="${3:-$UI_GREEN}"; printf ' %b%2s)%b %s\n' "$shade" "$num" "$UI_RESET" "$desc"; }
+ui_banner() {
+    printf '\n%b╔══════════════════════════════════════════════╗%b\n' "$UI_CYAN" "$UI_RESET"
+    printf '%b║%b          %bs.sh  |  sing-box 管理界面%b          %b║%b\n' \
+        "$UI_CYAN" "$UI_RESET" "$UI_BOLD$UI_GREEN" "$UI_RESET" "$UI_CYAN" "$UI_RESET"
+    printf '%b╚══════════════════════════════════════════════╝%b\n' "$UI_CYAN" "$UI_RESET"
+}
+
 require_root() { [[ $EUID -eq 0 ]] || { fail 'Run as root: sudo bash s.sh'; exit 1; }; }
 command_ok() { command -v "$1" >/dev/null 2>&1; }
 
@@ -56,7 +74,7 @@ os_kind() {
     esac
 }
 service_active() {
-    if command_ok systemctl; then systemctl is-active --quiet sing-box
+    if command_ok systemctl; then systemctl is-active --quiet sing-box >/dev/null 2>&1
     elif command_ok rc-service; then rc-service sing-box status >/dev/null 2>&1
     else return 1; fi
 }
@@ -194,13 +212,73 @@ select_host() {
 
 listener_lines() {
     local proto="$1" port="$2"
-    if ! command_ok ss; then fail 'ss command unavailable (install iproute2)'; return 2; fi
+    if ! command_ok ss; then fail '未安装 ss（请在菜单 1 安装 iproute2）'; return 2; fi
     if [[ "$proto" == tcp ]]; then
         ss -H -ltnp "( sport = :${port} )" 2>/dev/null || true
     else
         ss -H -lunp "( sport = :${port} )" 2>/dev/null || true
     fi
 }
+
+# `ss -p` sometimes omits users/PID metadata even for root. The actual
+# listening socket is authoritative; owner metadata is corroborating evidence.
+# Still reject a listener that *explicitly* belongs to another process.
+port_ready() {
+    local proto="$1" port="$2" lines='' pid=''
+    lines="$(listener_lines "$proto" "$port")" || return 1
+    [[ -n "$lines" ]] || return 1
+    if [[ "$lines" == *'users:'* && "$lines" != *'sing-box'* ]]; then
+        if command_ok systemctl; then
+            pid="$(systemctl show sing-box -p MainPID --value 2>/dev/null || true)"
+        fi
+        if [[ "$pid" =~ ^[1-9][0-9]*$ && "$lines" == *"pid=$pid,"* ]]; then
+            return 0
+        fi
+        return 1
+    fi
+    return 0
+}
+
+# Verify the sockets after the daemon has actually initialized. Single-user SS
+# serves TCP and UDP; REALITY serves TCP; HY2 serves UDP.
+wait_for_inbound_ready() {
+    local proto="$1" port="$2" i=0 max_wait="${S_SH_READY_WAIT_SECONDS:-12}"
+    [[ "$max_wait" =~ ^[0-9]+$ ]] || max_wait=12
+    (( max_wait >= 1 && max_wait <= 40 )) || max_wait=12
+    while (( i < max_wait )); do
+        if service_active; then
+            case "$proto" in
+                tcp+udp)
+                    if port_ready tcp "$port" && port_ready udp "$port"; then return 0; fi
+                    ;;
+                tcp|udp)
+                    if port_ready "$proto" "$port"; then return 0; fi
+                    ;;
+            esac
+        fi
+        (( i += 1 ))
+        sleep 1
+    done
+    return 1
+}
+
+# Print actionable, secret-free diagnostics before reverting a failed install.
+service_diagnostics() {
+    local proto="$1" port="$2"
+    warn "诊断：预期 ${proto}/${port}；sing-box 配置路径 $CONFIG"
+    if command_ok systemctl; then
+        printf '%s\n' '--- systemd service ExecStart / MainPID ---' >&2
+        systemctl show sing-box -p MainPID -p ExecStart -p ActiveState -p SubState --no-pager 2>/dev/null | head -n 8 >&2 || true
+        printf '%s\n' '--- recent sing-box log (max 18 lines) ---' >&2
+        journalctl -u sing-box -n 18 --no-pager --output=cat 2>/dev/null >&2 || true
+    fi
+    if command_ok ss; then
+        printf '%s\n' '--- matching TCP / UDP listeners ---' >&2
+        listener_lines tcp "$port" >&2 || true
+        listener_lines udp "$port" >&2 || true
+    fi
+}
+
 # Disjoint transports can share the number 443: HY2 UDP and Reality TCP.
 check_port_available() {
     local proto="$1" port="$2" skip_tag="$3" collisions='' lines=''
@@ -344,20 +422,50 @@ ensure_shared_cert() {
 }
 
 service_setup() {
-    # Reuse already-installed system service when possible. Never overwrite an unrelated unit.
+    local bin unit override_dir override_file
     if service_exists; then
-        # Refuse to manage a different sing-box instance bound to another config.
+        # Only manage a unit that already targets /etc/sing-box. Do not hijack
+        # another instance using a different config directory.
         if command_ok systemctl; then
-            local unit
             unit="$(systemctl cat sing-box 2>/dev/null || true)"
             if [[ "$unit" != *'/etc/sing-box'* && "$unit" != *"$CONFIG"* ]]; then
-                fail 'Existing sing-box service does not reference /etc/sing-box. It is not managed by s.sh.'
+                fail '已有 sing-box 服务不使用 /etc/sing-box，拒绝接管。'
                 return 1
             fi
+            # Official package units commonly use -C /etc/sing-box (load
+            # directory). Our installer writes one explicit config.json.
+            # A managed drop-in ensures systemd runs this exact file.
+            override_dir='/etc/systemd/system/sing-box.service.d'
+            override_file="$override_dir/90-s-sh-config.conf"
+            if [[ -e "$override_file" ]] && ! grep -Fqx '# S_SH_MANAGED_CONFIG_OVERRIDE_V4' "$override_file"; then
+                fail "已有用户自定义 drop-in，拒绝覆盖：$override_file"
+                return 1
+            fi
+            bin="$(command -v sing-box)" || return 1
+            case "$bin" in
+                /*) ;;
+                *) fail 'sing-box 绝对路径无法确认'; return 1 ;;
+            esac
+            mkdir -p "$override_dir"
+            local temp_override
+            temp_override="$(mktemp "$override_dir/.s-sh-config.XXXXXX")" || return 1
+            cat > "$temp_override" <<EOF
+# S_SH_MANAGED_CONFIG_OVERRIDE_V4
+[Service]
+ExecStart=
+ExecStart=$bin -D /var/lib/sing-box run -c $CONFIG
+EOF
+            chmod 644 "$temp_override"
+            if [[ -f "$override_file" ]] && cmp -s "$temp_override" "$override_file"; then
+                rm -f "$temp_override"
+            else
+                mv -f "$temp_override" "$override_file"
+                systemctl daemon-reload || return 1
+            fi
+            say '已确保 systemd 明确加载 /etc/sing-box/config.json（不再依赖整个配置目录的自动扫描）。'
         fi
         return 0
     fi
-    local bin
     bin="$(command -v sing-box)" || return 1
     if command_ok systemctl; then
         cat > /etc/systemd/system/sing-box.service <<EOF
@@ -369,7 +477,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-ExecStart=$bin run -c $CONFIG
+ExecStart=$bin -D /var/lib/sing-box run -c $CONFIG
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -383,7 +491,7 @@ EOF
 # S_SH_MANAGED_SINGBOX_SERVICE_V2
 name="sing-box"
 command="$bin"
-command_args="run -c $CONFIG"
+command_args="-D /var/lib/sing-box run -c $CONFIG"
 command_background="yes"
 pidfile="/run/sing-box.pid"
 supervisor=supervise-daemon
@@ -399,46 +507,49 @@ EOF
 # Build candidate with one named inbound replaced; all other inbounds are preserved.
 apply_inbound() {
     local tag="$1" newfile="$2" temp='' snap='' meta_snap='' active_before=false
+    local expected_port expected_proto when='' extra=''
     ensure_state || return 1
     temp="$(mktemp /etc/sing-box/.candidate.XXXXXX.json)" || return 1
-    snap="$(mktemp "$BACKUPS"/.config.pre.XXXXXX)" || return 1
-    meta_snap="$(mktemp "$BACKUPS"/.meta.pre.XXXXXX)" || return 1
-    cp -a "$CONFIG" "$snap"; cp -a "$META" "$meta_snap"
+    snap="$(mktemp "$BACKUPS"/.config.pre.XXXXXX)" || { rm -f "$temp"; return 1; }
+    meta_snap="$(mktemp "$BACKUPS"/.meta.pre.XXXXXX)" || { rm -f "$temp" "$snap"; return 1; }
+    cp -a "$CONFIG" "$snap" || return 1
+    cp -a "$META" "$meta_snap" || return 1
     service_active && active_before=true
     if ! jq --arg tag "$tag" --slurpfile node "$newfile" '
         .inbounds = ([.inbounds[] | select(.tag != $tag)] + [$node[0]])
       ' "$CONFIG" > "$temp"; then
-        rm -f "$temp"; return 1
+        rm -f "$temp" "$snap" "$meta_snap"; return 1
     fi
     if ! sing-box check -c "$temp"; then
-        fail 'sing-box rejected candidate config. Original config and active service are unchanged.' || true
-        rm -f "$temp"; return 1
+        warn '候选配置未通过 sing-box check，原服务和配置均未改变。'
+        rm -f "$temp" "$snap" "$meta_snap"; return 1
     fi
     chmod 600 "$temp"
     mv -f "$temp" "$CONFIG"
-    if ! service_setup || ! service_enable || ! service_restart || ! service_active; then
-        warn 'Service failed; restoring the previous config and metadata.'
+    if ! service_setup || ! service_enable || ! service_restart; then
+        warn 'sing-box 服务重启失败，将恢复安装前配置。'
+        service_diagnostics "unknown" "$(jq -r '.listen_port // 0' "$newfile" 2>/dev/null)"
         cp -a "$snap" "$CONFIG"; cp -a "$meta_snap" "$META"
         if $active_before; then service_restart || true; else service_stop || true; fi
+        rm -f "$snap" "$meta_snap"
         return 1
     fi
-    # Verify that the live daemon actually owns the newly installed listener.
-    local expected_port expected_proto listeners
     expected_port="$(jq -r '.listen_port' "$newfile")"
-    expected_proto="$(jq -r 'if .type=="hysteria2" or .type=="tuic" then "udp" else "tcp" end' "$newfile")"
-    listeners="$(listener_lines "$expected_proto" "$expected_port" 2>/dev/null || true)"
-    if [[ -z "$listeners" || "$listeners" != *'sing-box'* ]]; then
-        warn "The sing-box service started, but $expected_proto/$expected_port is not owned by sing-box. Rolling back."
+    expected_proto="$(jq -r 'if .type=="hysteria2" or .type=="tuic" then "udp" elif .type=="shadowsocks" then "tcp+udp" else "tcp" end' "$newfile")"
+    say "等待实际监听就绪：${expected_proto}/${expected_port}（最多约 ${S_SH_READY_WAIT_SECONDS:-12} 秒）..."
+    if ! wait_for_inbound_ready "$expected_proto" "$expected_port"; then
+        warn "sing-box 未按预期监听 ${expected_proto}/${expected_port}，先输出诊断，再恢复旧配置。"
+        service_diagnostics "$expected_proto" "$expected_port"
         cp -a "$snap" "$CONFIG"; cp -a "$meta_snap" "$META"
         if $active_before; then service_restart || true; else service_stop || true; fi
+        rm -f "$snap" "$meta_snap"
         return 1
     fi
-    # Keep timestamped safety backup for manual restore, without storing secrets in /tmp.
-    local when; when="$(date +%Y%m%d_%H%M%S)"
+    when="$(date +%Y%m%d_%H%M%S)"
     cp -a "$snap" "$BACKUPS/config.before-${tag}-${when}.json"
     cp -a "$meta_snap" "$BACKUPS/meta.before-${tag}-${when}.json"
     rm -f "$snap" "$meta_snap"
-    say 'Configuration checked, saved atomically and service restarted.'
+    say "${tag} 已启动，${expected_proto}/${expected_port} 真实监听就绪。"
 }
 
 make_node_file() { mktemp /etc/sing-box/.inbound.XXXXXXXX; }
@@ -462,7 +573,7 @@ add_ss() {
     local port='' method='' key='' node='' default_port='' method_choice=''
     default_port="$(jq -r '[.inbounds[] | select(.tag=="ss-in") | .listen_port][0] // empty' "$CONFIG")"
     [[ -n "$default_port" ]] || default_port="$(random_port)" || return 1
-    say 'Shadowsocks: single-user TCP+UDP inbound.'
+    say 'Shadowsocks 单用户模式（TCP + UDP）。'
     printf '%s\n' '1) 2022-blake3-aes-128-gcm（推荐）' '2) aes-128-gcm（传统兼容）'
     ask method_choice '请选择加密方式 [1]: ' 1 || return 1
     case "$method_choice" in
@@ -850,6 +961,10 @@ show_qr() {
 show_links() {
     local only="${1:-all}" host='' port='' method='' password='' uri='' sni='' key='' sid='' uuid='' name=''
     ensure_state || return 1
+    if [[ "$only" != all ]] && ! protocol_installed "$only"; then
+        warn "$(protocol_name "$only") 尚未成功安装（或上次安装已经回滚），请先在本协议菜单选择 1 安装。"
+        return 1
+    fi
     host="$(get_meta '.connect_host')"
     if [[ -z "$host" && -f /etc/sing-box/.config_cache ]]; then
         host="$(sed -n 's/^CUSTOM_IP=//p' /etc/sing-box/.config_cache | head -n 1)"
@@ -1045,7 +1160,7 @@ protocol_status() {
     if $installed && port_valid "$port" && command_ok ss; then
         if [[ "$proto" == *tcp* ]]; then
             lines_tcp="$(listener_lines tcp "$port" 2>/dev/null || true)"
-            if [[ "$lines_tcp" == *sing-box* ]]; then
+            if port_ready tcp "$port"; then
                 printf 'TCP/%s：sing-box 正在监听\n' "$port"
             else
                 printf 'TCP/%s：未发现 sing-box 监听\n' "$port"
@@ -1054,7 +1169,7 @@ protocol_status() {
         fi
         if [[ "$proto" == *udp* ]]; then
             lines_udp="$(listener_lines udp "$port" 2>/dev/null || true)"
-            if [[ "$lines_udp" == *sing-box* ]]; then
+            if port_ready udp "$port"; then
                 printf 'UDP/%s：sing-box 正在监听\n' "$port"
             else
                 printf 'UDP/%s：未发现 sing-box 监听\n' "$port"
@@ -1090,18 +1205,20 @@ protocol_menu() {
     local kind="$1" choice='' name=''
     name="$(protocol_name "$kind")" || return 1
     while true; do
-        printf '\n%s\n' '-------------------------------------------'
-        printf '  %s 独立管理\n' "$name"
-        printf '%s\n' '-------------------------------------------' \
-            '1) 安装 / 重装协议' \
-            '2) 卸载协议（只删除当前入站）' \
-            '3) 重启协议（共享 sing-box 服务）' \
-            '4) 查看协议运行状态' \
-            '5) 输出节点链接与二维码'
+        printf '\n%b╔══════════════════════════════════════════════╗%b\n' "$UI_CYAN" "$UI_RESET"
+        printf '%b║%b  %b%s · 独立管理%b\n' "$UI_CYAN" "$UI_RESET" "$UI_BOLD$UI_GREEN" "$name" "$UI_RESET"
+        printf '%b╚══════════════════════════════════════════════╝%b\n' "$UI_CYAN" "$UI_RESET"
+        ui_rule
+        ui_item 1 '安装 / 重装协议'
+        ui_item 2 '卸载当前协议（不影响其他协议）' "$UI_RED"
+        ui_item 3 '重启当前协议（共用 sing-box 服务）'
+        ui_item 4 '查看协议运行状态和端口'
+        ui_item 5 '输出节点链接与二维码'
         if [[ "$kind" == hy2 ]]; then
-            printf '%s\n' '6) HY2 TCP/443 HTTPS 伪装站（可选，默认关闭）'
+            ui_item 6 'HY2 TCP/443 HTTPS 伪装站（可选）'
         fi
-        printf '%s\n' '0) 返回主菜单'
+        ui_item 0 '返回主菜单'
+        ui_rule
         ask choice '请选择 [0]: ' 0 || return 0
         case "$choice" in
             1)
@@ -1145,8 +1262,10 @@ core_service_is_ours() {
     service_exists || return 1
     if command_ok systemctl; then
         unit="$(systemctl cat sing-box 2>/dev/null || true)"
-        [[ "$unit" == *'run -c /etc/sing-box/config.json'* || "$unit" == *'run -c /etc/sing-box/'* ||
-           "$unit" == *'run -D /etc/sing-box'* || "$unit" == *'S_SH_MANAGED_SINGBOX_SERVICE_V2'* ]]
+        [[ "$unit" == *'S_SH_MANAGED_CONFIG_OVERRIDE_V4'* ||
+           "$unit" == *'S_SH_MANAGED_SINGBOX_SERVICE_V2'* ||
+           "$unit" == *'/etc/sing-box/config.json'* ||
+           ( "$unit" == *'-C /etc/sing-box'* && "$unit" == *'sing-box'* && "$unit" == *'run'* ) ]]
     elif command_ok rc-service; then
         [[ -r /etc/init.d/sing-box ]] || return 1
         grep -Eq 'S_SH_MANAGED_SINGBOX_SERVICE_V2|/etc/sing-box/config.json' /etc/init.d/sing-box
@@ -1466,6 +1585,12 @@ uninstall_singbox_core() {
             return 1
         fi
     fi
+    # Remove only the explicit service override installed by this s.sh.
+    local our_dropin='/etc/systemd/system/sing-box.service.d/90-s-sh-config.conf'
+    if [[ -f "$our_dropin" ]] && grep -Fqx '# S_SH_MANAGED_CONFIG_OVERRIDE_V4' "$our_dropin"; then
+        rm -f -- "$our_dropin"
+        if command_ok systemctl; then systemctl daemon-reload >/dev/null 2>&1 || true; fi
+    fi
     # Remove a local s.sh/legacy-s(9).sh unit, not a user-authored service.
     if command_ok systemctl && [[ -f /etc/systemd/system/sing-box.service ]] &&
        { grep -Fqx '# S_SH_MANAGED_SINGBOX_SERVICE_V2' /etc/systemd/system/sing-box.service ||
@@ -1554,20 +1679,34 @@ menu_setup() {
 }
 
 show_menu() {
-    printf '\n%s\n' '===========================================' \
-      '   s.sh | 独立 sing-box 协议管理（不含 S-UI）' \
-      '===========================================' \
-      '1) 通用依赖、二维码、域名和 TLS 证书' \
-      '2) 手动更新 sing-box 内核' \
-      '3) 完整卸载 sing-box 内核及全部协议（不可恢复）' \
-      '4) Shadowsocks (SS) 管理' \
-      '5) Hysteria2 (HY2) 管理（默认 UDP 443）' \
-      '6) VLESS REALITY 管理（默认 TCP 443）' \
-      '7) sing-box 总体运行状态' \
-      '8) 重启 sing-box 服务（含全部入站）' \
-      '0) 退出' \
-      '-------------------------------------------'
+    local active_label='' version=''
+    ui_banner
+    ui_rule
+    ui_item 1 '通用依赖、二维码、域名和 TLS 证书'
+    ui_item 2 '手动更新 sing-box 内核'
+    ui_item 3 '完整卸载内核 + 所有协议（不可恢复）' "$UI_RED"
+    ui_rule
+    ui_item 4 'Shadowsocks (SS) 管理'
+    ui_item 5 'Hysteria2 (HY2) 管理 · UDP 443'
+    ui_item 6 'VLESS REALITY 管理 · TCP 443'
+    ui_rule
+    ui_item 7 '查看 sing-box 总体运行状态'
+    ui_item 8 '重启 sing-box 内核及所有协议'
+    ui_item 0 '退出'
+    ui_rule
+    if service_active; then
+        active_label="${UI_GREEN}运行中${UI_RESET}"
+    else
+        active_label="${UI_YELLOW}未运行${UI_RESET}"
+    fi
+    printf ' %b服务状态：%b%b\n' "$UI_DIM" "$active_label" "$UI_RESET"
+    if command_ok sing-box; then
+        version="$(sing-box version 2>/dev/null | head -n1 || true)"
+        [[ -n "$version" ]] && printf ' %b内核：%s%b\n' "$UI_DIM" "$version" "$UI_RESET"
+    fi
+    ui_rule
 }
+
 main() {
     require_root
     local arg="${1:-}" choice=''
@@ -1575,6 +1714,15 @@ main() {
         --help|-h) show_menu; return 0 ;;
         --status) status; return 0 ;;
         --status-ss) protocol_status ss; return 0 ;;
+        --diag-ss)
+            if [[ -f "$CONFIG" ]] && command_ok jq; then
+                local ssport
+                ssport="$(jq -r '[.inbounds[]|select(.tag=="ss-in")|.listen_port][0]//empty' "$CONFIG")"
+                if [[ -n "$ssport" ]]; then service_diagnostics 'tcp+udp' "$ssport"; else warn '尚未配置 SS 入站。'; fi
+            else
+                warn '缺少配置文件或 jq。'
+            fi
+            return 0 ;;
         --status-hy2) protocol_status hy2; return 0 ;;
         --status-reality) protocol_status reality; return 0 ;;
         --show) warn '节点链接与二维码现已移至各协议子菜单（主菜单 4/5/6）。'; return 0 ;;
