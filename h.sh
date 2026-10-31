@@ -388,13 +388,102 @@ remove_hy2_input_chain() {
 }
 
 # -----------------------------
+# 函数：判断 Hy2 是否启用了独立的 TCP 443 HTTPS 伪装/回落监听
+# 注意：主监听 listen: :PORT 是 UDP，与此开关相互独立。
+# -----------------------------
+get_hy2_tcp443_mode() {
+  local config_file="${1:-/etc/hysteria/config.yaml}"
+  if [[ -f "$config_file" ]] && grep -Eq '^[[:space:]]*listenHTTPS:[[:space:]]*:443([[:space:]]*(#.*)?)?$' "$config_file"; then
+    printf 'true'
+  else
+    printf 'false'
+  fi
+}
+
+# -----------------------------
+# 函数：检测 TCP 443 是否被其他服务监听
+# -----------------------------
+hy2_tcp443_occupied() {
+  command -v ss >/dev/null 2>&1 || return 1
+  ss -H -ltn 'sport = :443' 2>/dev/null | grep -q .
+}
+
+# -----------------------------
+# 函数：交互选择 TCP 443 HTTPS 伪装/回落监听模式
+# 参数：当前模式 (true/false)；初装时不传。
+# -----------------------------
+select_hy2_tcp443_mode() {
+  local current_mode="${1:-false}"
+  local select_context="${2:-install}"
+  local default_choice="1"
+  local choice listener_info
+  if [[ "$select_context" == "change" && "$current_mode" == "false" ]]; then
+    default_choice="2"
+  fi
+
+  echo ""
+  green "是否启用 HTTPS 回落监听（TCP 443）？"
+  echo -e " ${GREEN}1.${PLAIN} 启用（监听 TCP 443）"
+  echo -e " ${GREEN}2.${PLAIN} 关闭（不监听 TCP 443）"
+  yellow "提示：仅控制 HTTPS 回落；Hy2 的 UDP 主监听仍可设为 443 或其他端口。"
+  echo ""
+
+  while true; do
+    read_confirmed choice "请选择 [1-2]（默认 $default_choice）: " "$default_choice" || return 1
+    case "$choice" in
+      1)
+        if [[ "$current_mode" != "true" ]] && hy2_tcp443_occupied; then
+          listener_info=$(ss -H -ltnp 'sport = :443' 2>/dev/null | head -n 2)
+          red "TCP 443 已被其他服务监听，Hy2 不能再次绑定此端口。"
+          [[ -n "$listener_info" ]] && yellow "$listener_info"
+          yellow "请选择 2（不监听 TCP 443），无需卸载已有的 Xray/Nginx。"
+          continue
+        fi
+        tcp443_enabled="true"
+        green "已选择：Hy2 启用 TCP 443 HTTPS 回落监听"
+        return 0
+        ;;
+      2)
+        tcp443_enabled="false"
+        green "已选择：Hy2 不监听 TCP 443，UDP 主监听保持独立"
+        return 0
+        ;;
+      *) red "选项无效，请输入 1 或 2。" ;;
+    esac
+  done
+}
+
+# -----------------------------
+# 函数：修改服务端配置的 TCP 443 回落开关
+# -----------------------------
+set_hy2_tcp443_mode() {
+  local mode="$1"
+  local config_file="${2:-/etc/hysteria/config.yaml}"
+  [[ -f "$config_file" && "$mode" =~ ^(true|false)$ ]] || return 1
+
+  if [[ "$mode" == "true" ]]; then
+    grep -qE '^masquerade:[[:space:]]*$' "$config_file" || return 1
+    if grep -qE '^[[:space:]]*listenHTTPS:[[:space:]]*' "$config_file"; then
+      sed -i -E 's#^[[:space:]]*listenHTTPS:[[:space:]]*.*$#  listenHTTPS: :443#' "$config_file"
+    else
+      sed -i '/^masquerade:[[:space:]]*$/a\  listenHTTPS: :443' "$config_file"
+    fi
+  else
+    sed -i -E '/^[[:space:]]*listenHTTPS:[[:space:]]*/d' "$config_file"
+  fi
+}
+
+# -----------------------------
 # 函数：应用 Hy2 防火墙规则
 # -----------------------------
 apply_hy2_firewall_rules() {
   local listen_port="$1"
   local range_start="$2"
   local range_end="$3"
+  local tcp443_mode="${4:-}"
 
+  # 安装时配置尚未写入，以参数传入；平时从实际 config.yaml 判断。
+  [[ -n "$tcp443_mode" ]] || tcp443_mode=$(get_hy2_tcp443_mode)
   [[ -n "$listen_port" ]] || return 1
 
   ensure_hy2_input_chain
@@ -402,12 +491,16 @@ apply_hy2_firewall_rules() {
   clear_hy2_jump_rules
 
   iptables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
-  iptables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+  if [[ "$tcp443_mode" == "true" ]]; then
+    iptables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+  fi
   iptables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
 
   if command -v ip6tables >/dev/null 2>&1; then
     ip6tables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
-    ip6tables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+    if [[ "$tcp443_mode" == "true" ]]; then
+      ip6tables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+    fi
     ip6tables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
   fi
 
@@ -444,12 +537,15 @@ save_hy2_state() {
   local state_cert_mode="${5:-}"
   local state_service
   local state_masquerade
+  local state_tcp443
 
   [[ -n "$state_port" ]] || state_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
   [[ -n "$state_domain" ]] || state_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
   [[ -n "$state_cert_mode" ]] || state_cert_mode="unknown"
   state_service=$(get_hysteria_service_name)
   state_masquerade=$(grep -E '^\s*url:\s*https?://' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
+  [[ -n "$state_masquerade" ]] || state_masquerade="builtin"
+  state_tcp443=$(get_hy2_tcp443_mode /etc/hysteria/config.yaml)
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
 
@@ -461,6 +557,7 @@ HY2_DOMAIN=${state_domain:-}
 HY2_CERT_MODE=${state_cert_mode:-}
 HY2_SERVICE=${state_service:-}
 HY2_MASQUERADE=${state_masquerade:-}
+HY2_TCP443_ENABLED=${state_tcp443:-false}
 EOF
 
   chmod 600 "$HY2_STATE_FILE" >/dev/null 2>&1 || true
@@ -681,6 +778,15 @@ range_start="${HY2_FIRST_PORT:-}"
 range_end="${HY2_END_PORT:-}"
 service_name="${HY2_SERVICE:-hysteria-server}"
 
+# 每次开机都以实际配置为准，避免已关闭的 TCP 443 回落被误开启。
+tcp443_enabled="${HY2_TCP443_ENABLED:-false}"
+if [[ -f "$CONFIG_FILE" ]]; then
+  tcp443_enabled="false"
+  if grep -Eq '^[[:space:]]*listenHTTPS:[[:space:]]*:443([[:space:]]*(#.*)?)?$' "$CONFIG_FILE"; then
+    tcp443_enabled="true"
+  fi
+fi
+
 if [[ -z "$listen_port" && -f "$CONFIG_FILE" ]]; then
   listen_port=$(sed -nE 's/^[[:space:]]*listen:[[:space:]]*:([0-9]+)[[:space:]]*$/\1/p' "$CONFIG_FILE" 2>/dev/null | head -n1 | tr -d '\r')
 fi
@@ -690,7 +796,9 @@ iptables -N HY2_INPUT >/dev/null 2>&1 || true
 iptables -F HY2_INPUT >/dev/null 2>&1 || true
 iptables -C INPUT -j HY2_INPUT >/dev/null 2>&1 || iptables -I INPUT 1 -j HY2_INPUT >/dev/null 2>&1 || true
 iptables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
-iptables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+if [[ "$tcp443_enabled" == "true" ]]; then
+  iptables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+fi
 iptables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
 
 if command -v ip6tables >/dev/null 2>&1; then
@@ -698,7 +806,9 @@ if command -v ip6tables >/dev/null 2>&1; then
   ip6tables -F HY2_INPUT >/dev/null 2>&1 || true
   ip6tables -C INPUT -j HY2_INPUT >/dev/null 2>&1 || ip6tables -I INPUT 1 -j HY2_INPUT >/dev/null 2>&1 || true
   ip6tables -A HY2_INPUT -p tcp --dport 80 -j ACCEPT >/dev/null 2>&1 || true
-  ip6tables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+  if [[ "$tcp443_enabled" == "true" ]]; then
+    ip6tables -A HY2_INPUT -p tcp --dport 443 -j ACCEPT >/dev/null 2>&1 || true
+  fi
   ip6tables -A HY2_INPUT -p udp --dport "$listen_port" -j ACCEPT >/dev/null 2>&1 || true
 fi
 
@@ -1188,14 +1298,14 @@ inst_jump() {
       red "范围无效：端口必须为 1-65535，且起始端口必须小于末尾端口"
     done
 
-    apply_hy2_firewall_rules "$port" "$firstport" "$endport"
+    apply_hy2_firewall_rules "$port" "$firstport" "$endport" "${tcp443_enabled:-}"
     save_firewall_rules
     green "已启用端口跳跃：$firstport-$endport -> $port"
   else
     yellow "将继续使用单端口模式"
     firstport=""
     endport=""
-    apply_hy2_firewall_rules "$port" "" ""
+    apply_hy2_firewall_rules "$port" "" "" "${tcp443_enabled:-}"
     save_firewall_rules
   fi
 }
@@ -1212,7 +1322,7 @@ inst_port() {
   clear_hy2_input_rules
 
   while true; do
-    read_confirmed port "设置 Hysteria 2 监听端口 [1-65535]（回车默认 443）: " "443" || return 1
+    read_confirmed port "设置 Hysteria 2 UDP 主监听端口 [1-65535]（回车默认 443）: " "443" || return 1
 
     [[ "$port" =~ ^[0-9]+$ ]] || { red "端口必须是数字"; continue; }
     ((port >= 1 && port <= 65535)) || { red "端口必须在 1-65535 之间"; continue; }
@@ -1225,7 +1335,7 @@ inst_port() {
     break
   done
 
-  yellow "Hysteria 2 使用端口：$port"
+  yellow "Hysteria 2 UDP 主监听端口：$port（与 TCP 443 回落开关相互独立）"
   inst_jump
 }
 
@@ -1238,46 +1348,74 @@ inst_pwd() {
 }
 
 # -----------------------------
-# 函数：配置伪装站点
+# 函数：配置 HY2 的 HTTP/3 伪装响应（不再要求外部网站域名）
+# 注意：masquerade 仅控制普通网页请求的响应，不改变 TLS SNI。
 # -----------------------------
 inst_site() {
+  local siteInput local_wow_port
   echo ""
-  green "Hysteria 2 伪装站点模式如下："
-  echo -e " ${GREEN}1.${PLAIN} 外部伪装站${YELLOW}（默认，例如 video.unext.jp）${PLAIN}"
-  echo -e " ${GREEN}2.${PLAIN} 本机 WoW 注册站${YELLOW}（http://127.0.0.1:8080，需要先安装 wow.py local_proxy 模式）${PLAIN}"
+  green "Hysteria 2 网页伪装响应："
+  echo -e " ${GREEN}1.${PLAIN} 内置静态响应${YELLOW}（默认，不需要其他网站域名）${PLAIN}"
+  echo -e " ${GREEN}2.${PLAIN} 本机 WoW 注册站${YELLOW}（http://127.0.0.1:8080）${PLAIN}"
   echo ""
 
   while true; do
-    read_confirmed siteInput "请选择伪装站模式 [1-2]（回车默认 1）: " "1" || return 1
+    read_confirmed siteInput "请选择 [1-2]（回车默认 1）: " "1" || return 1
     [[ "$siteInput" =~ ^[1-2]$ ]] && break
     red "选项无效，请输入 1 或 2。"
   done
 
   if [[ "$siteInput" == "2" ]]; then
-    read_confirmed local_wow_port "请输入本机 WoW 注册站端口（回车默认 8080）: " "8080" || return 1
-    if [[ ! "$local_wow_port" =~ ^[0-9]+$ ]]; then
-      red "端口必须是数字"
-      return 1
-    fi
-    proxysite="127.0.0.1:$local_wow_port"
+    while true; do
+      read_confirmed local_wow_port "请输入本机 WoW 注册站端口（回车默认 8080）: " "8080" || return 1
+      if [[ "$local_wow_port" =~ ^[0-9]+$ ]] &&
+          (( 10#$local_wow_port >= 1 && 10#$local_wow_port <= 65535 )); then
+        break
+      fi
+      red "端口必须是 1-65535 的数字。"
+    done
+    masquerade_mode="local"
     masquerade_url="http://127.0.0.1:$local_wow_port"
-    masquerade_rewrite_host="false"
-    yellow "伪装站点：本机 WoW 注册站 $masquerade_url"
-    yellow "提示：请确认本机测试 curl -I http://127.0.0.1:$local_wow_port 可以返回 200/301/302。"
+    yellow "已选择本机网站伪装：$masquerade_url（与 SNI 无关）"
+    yellow "请确认本机网站可通过 curl -I $masquerade_url 访问。"
     return 0
   fi
 
-  while true; do
-    read_confirmed proxysite "请输入外部伪装网站地址（去除 https://） [回车默认：video.unext.jp]: " "video.unext.jp" || return 1
-    proxysite="$(normalize_host_input "$proxysite")"
-    if is_valid_domain "$proxysite"; then
-      masquerade_url="https://$proxysite"
-      masquerade_rewrite_host="true"
-      yellow "伪装站点：$masquerade_url"
-      return 0
-    fi
-    red "伪装网站域名格式无效：$proxysite"
-  done
+  masquerade_mode="builtin"
+  masquerade_url=""
+  green "已选择内置 HTTP/3/HTTPS 响应，不使用第三方网站域名。"
+}
+
+# 共用的伪装配置输出：供安装与修改菜单复用。
+# HTTPS 回落开关仅影响 TCP 443，HY2 UDP 主端口保持独立。
+render_hy2_masquerade_block() {
+  local mode="${1:-builtin}" url="${2:-}" https_enabled="${3:-false}"
+  if [[ "$mode" == "local" ]]; then
+    [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || { red "本机伪装地址无效。"; return 1; }
+    cat <<EOF
+masquerade:
+  type: proxy
+  proxy:
+    url: $url
+    rewriteHost: false
+EOF
+  elif [[ "$mode" == "builtin" ]]; then
+    cat <<'EOF'
+masquerade:
+  type: string
+  string:
+    content: "Welcome"
+    headers:
+      content-type: text/plain
+    statusCode: 200
+EOF
+  else
+    red "不支持的网页伪装模式：$mode"
+    return 1
+  fi
+  if [[ "$https_enabled" == "true" ]]; then
+    printf '  listenHTTPS: :443\n'
+  fi
 }
 
 # -----------------------------
@@ -1536,19 +1674,11 @@ install_hy_core() {
 # 函数：安装并初始化 Hysteria 2
 # -----------------------------
 insthysteria() {
-  # 检测端口 443 冲突：x-ui 也默认监听 443
-  if ss -lntp 2>/dev/null | grep -q ':443 '; then
-    local proc_443
-    proc_443=$(ss -lntp 2>/dev/null | grep ':443 ' | head -1)
-    if echo "$proc_443" | grep -qi "x-ui\|xray"; then
-      red "检测到 x-ui/xray 正在占用端口 443。h.sh 和 x.sh 不能同时安装（均默认监听 443）。"
-      red "请先卸载 x.sh（x-ui）后再安装 h.sh。"
-      read -erp "回车返回菜单..." _
-      return 1
-    fi
-  fi
+  # 这是额外的 HTTPS/TCP 443 回落开关；UDP 主监听始终在 inst_port 内独立设置。
+  local tcp443_enabled=""
 
   green "开始安装 Hysteria 2"
+  select_hy2_tcp443_mode || return 1
 
   realip || return 1
 
@@ -1585,7 +1715,7 @@ insthysteria() {
     return 1
   fi
 
-  green "步骤 3/4：配置证书、端口、密码、伪装站点"
+  green "步骤 3/4：配置证书、端口、密码、网页伪装响应"
   inst_cert || return 1
   inst_port || return 1
   inst_pwd || return 1
@@ -1634,14 +1764,8 @@ auth:
   password: $auth_pwd
 
 speedTest: true
-
-masquerade:
-  type: proxy
-  proxy:
-    url: ${masquerade_url:-https://$proxysite}
-    rewriteHost: ${masquerade_rewrite_host:-true}
-  listenHTTPS: :443
 EOF
+  render_hy2_masquerade_block "$masquerade_mode" "$masquerade_url" "$tcp443_enabled" >> /etc/hysteria/config.yaml || return 1
 
   cat > /root/hy/hy-client.yaml <<EOF
 server: $share_host:$port
@@ -1673,7 +1797,7 @@ transport:
 EOF
 
 
-  apply_hy2_firewall_rules "$port" "$firstport" "$endport"
+  apply_hy2_firewall_rules "$port" "$firstport" "$endport" "$tcp443_enabled"
   save_hy2_state "$port" "$firstport" "$endport" "$hy_domain" "$cert_mode"
   install_hy2_boot_fix_service
   install_hy2_core_update_job
@@ -1712,6 +1836,19 @@ EOF
 
   red "======================================================================================"
   green "Hysteria 2 代理服务安装完成"
+  green "UDP 主监听端口：$port（可在菜单 4 -> 1 修改）"
+  if [[ "$tcp443_enabled" == "true" ]]; then
+    green "TCP 443 HTTPS 回落：已启用"
+  else
+    green "TCP 443 HTTPS 回落：已关闭（不占用 TCP 443）"
+  fi
+  if command -v ss >/dev/null 2>&1; then
+    if ss -H -lun "sport = :$port" 2>/dev/null | grep -q .; then
+      green "UDP $port 实际监听检查：通过"
+    else
+      yellow "UDP $port 监听检查未检测到端口，请检查服务日志与监听地址。"
+    fi
+  fi
   yellow "服务端配置 /etc/hysteria/config.yaml："
   green "$(cat /etc/hysteria/config.yaml)"
   yellow "客户端配置 /root/hy/hy-client.yaml："
@@ -1730,7 +1867,11 @@ EOF
   fi
 
   yellow "伪装站验证："
-  green "1) 普通浏览器访问: https://$hy_domain"
+  if [[ "$tcp443_enabled" == "true" ]]; then
+    green "1) 普通浏览器访问: https://$hy_domain（需域名解析到当前 VPS）"
+  else
+    yellow "1) TCP 443 回落已关闭，普通浏览器直接访问 HTTPS 443 不由 Hy2 提供服务。"
+  fi
   green "2) 查看日志: journalctl -u $hy_service -f"
 
   yellow "内核自动更新任务："
@@ -2073,50 +2214,139 @@ change_cert() {
 }
 
 # -----------------------------
-# 函数：修改伪装站点
+# 函数：修改 HY2 网页伪装响应（无外部网站域名）
+# 仅替换 masquerade 节，保留其它顶级配置；重启失败自动恢复。
 # -----------------------------
 changeproxysite() {
-  local current_port current_domain current_cert_mode hy_service target_url target_rewrite
-  load_hy2_state >/dev/null 2>&1 || true
+  local config_file="/etc/hysteria/config.yaml"
+  local current_port current_domain current_cert_mode hy_service current_tcp443
+  local new_block tmp_backup tmp_config
+  [[ -s "$config_file" ]] || { red "请先安装 Hysteria 2。"; return 1; }
+  command -v python3 >/dev/null 2>&1 || { red "缺少 python3，无法安全编辑 YAML。"; return 1; }
 
   inst_site || return 1
-  target_url="${masquerade_url:-https://$proxysite}"
-  target_rewrite="${masquerade_rewrite_host:-true}"
+  current_tcp443=$(get_hy2_tcp443_mode "$config_file")
+  new_block=$(render_hy2_masquerade_block "$masquerade_mode" "$masquerade_url" "$current_tcp443") || return 1
 
-  python3 - "$target_url" "$target_rewrite" <<'PYC'
-from pathlib import Path
+  tmp_backup=$(mktemp /etc/hysteria/.hpro-masq-backup.XXXXXXXX) || return 1
+  tmp_config=$(mktemp /etc/hysteria/.hpro-masq-config.XXXXXXXX) || { rm -f "$tmp_backup"; return 1; }
+  if ! cp -p "$config_file" "$tmp_backup" ||
+     ! python3 - "$config_file" "$tmp_config" "$new_block" <<'PYC'
+import re
 import sys
-p = Path('/etc/hysteria/config.yaml')
-s = p.read_text()
-url = sys.argv[1]
-rewrite = sys.argv[2]
-start = s.find('masquerade:')
-block = f"""masquerade:
-  type: proxy
-  proxy:
-    url: {url}
-    rewriteHost: {rewrite}
-  listenHTTPS: :443
-"""
-if start >= 0:
-    before = s[:start].rstrip() + '\n\n'
+from pathlib import Path
+source, output, block = sys.argv[1:]
+s = Path(source).read_text(encoding='utf-8')
+match = re.search(r'(?m)^masquerade:[ \t]*(?:#.*)?$', s)
+if match:
+    tail = s[match.end():]
+    next_top = re.search(r'(?m)^[A-Za-z_][A-Za-z0-9_-]*:[ \t]*', tail)
+    end = match.end() + next_top.start() if next_top else len(s)
+    new_s = s[:match.start()].rstrip() + '\n\n' + block.rstrip() + '\n'
+    if next_top:
+        new_s += '\n' + s[end:].lstrip('\n')
 else:
-    before = s.rstrip() + '\n\n'
-p.write_text(before + block)
+    new_s = s.rstrip() + '\n\n' + block.rstrip() + '\n'
+Path(output).write_text(new_s, encoding='utf-8')
 PYC
+  then
+    rm -f "$tmp_backup" "$tmp_config"
+    red "编辑伪装配置失败，原有服务不受影响。"
+    return 1
+  fi
 
-  current_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
+  cp "$tmp_config" "$config_file" || { cp -p "$tmp_backup" "$config_file"; rm -f "$tmp_backup" "$tmp_config"; red "写入配置失败，已恢复原配置。"; return 1; }
+  rm -f "$tmp_config"
+  fix_hysteria_file_perms
+  hy_service=$(get_hysteria_service_name)
+  if ! systemctl restart "$hy_service" || ! systemctl is-active --quiet "$hy_service"; then
+    cp -p "$tmp_backup" "$config_file"
+    fix_hysteria_file_perms
+    systemctl restart "$hy_service" >/dev/null 2>&1 || true
+    rm -f "$tmp_backup"
+    red "新伪装配置启动失败，已恢复原配置。"
+    journalctl -u "$hy_service" -n 15 --no-pager 2>/dev/null || true
+    return 1
+  fi
+  rm -f "$tmp_backup"
+
+  load_hy2_state >/dev/null 2>&1 || true
+  current_port=$(get_hy2_listen_port "$config_file")
   current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
   current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
   save_hy2_state "$current_port" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$current_domain" "$current_cert_mode"
-  fix_hysteria_file_perms
   save_firewall_rules
-  hy_service=$(get_hysteria_service_name)
-  systemctl restart "$hy_service" >/dev/null 2>&1 || true
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
-  green "伪装网站已修改为：$target_url"
+  if [[ "$masquerade_mode" == "local" ]]; then
+    green "网页伪装已改为：本机网站 $masquerade_url"
+  else
+    green "网页伪装已改为：内置静态响应（不再访问第三方域名）。"
+  fi
   showconf
+}
+
+# -----------------------------
+# 函数：修改 TCP 443 HTTPS 回落监听模式（不影响 UDP 主监听）
+# -----------------------------
+change_tcp443_mode() {
+  local config_file="/etc/hysteria/config.yaml"
+  local old_mode tcp443_enabled backup current_port hy_service
+  local current_domain current_cert_mode current_first current_end
+  [[ -f "$config_file" ]] || { red "请先安装 Hysteria 2。"; return 1; }
+
+  old_mode=$(get_hy2_tcp443_mode "$config_file")
+  if [[ "$old_mode" == "true" ]]; then
+    yellow "当前模式：Hy2 正在配置为监听 TCP 443 HTTPS 回落"
+  else
+    yellow "当前模式：Hy2 不监听 TCP 443 HTTPS 回落"
+  fi
+  select_hy2_tcp443_mode "$old_mode" change || return 1
+  if [[ "$tcp443_enabled" == "$old_mode" ]]; then
+    green "模式未变化，无需重启服务。"
+    read -erp "回车返回菜单..." _
+    return 0
+  fi
+
+  backup=$(mktemp /etc/hysteria/config.yaml.XXXXXX) || return 1
+  cp -p "$config_file" "$backup" || { rm -f "$backup"; return 1; }
+  if ! set_hy2_tcp443_mode "$tcp443_enabled" "$config_file"; then
+    cp -p "$backup" "$config_file"
+    rm -f "$backup"
+    red "修改 TCP 443 回落配置失败。"
+    return 1
+  fi
+
+  load_hy2_state >/dev/null 2>&1 || true
+  current_port=$(get_hy2_listen_port "$config_file")
+  current_first="${HY2_FIRST_PORT:-}"
+  current_end="${HY2_END_PORT:-}"
+  current_domain="${HY2_DOMAIN:-}"
+  current_cert_mode="${HY2_CERT_MODE:-unknown}"
+  hy_service=$(get_hysteria_service_name)
+
+  fix_hysteria_file_perms
+  if ! systemctl restart "$hy_service" >/dev/null 2>&1 || ! systemctl is-active --quiet "$hy_service"; then
+    red "新配置启动失败，正在恢复原有配置。"
+    cp -p "$backup" "$config_file" || true
+    fix_hysteria_file_perms
+    systemctl restart "$hy_service" >/dev/null 2>&1 || true
+    rm -f "$backup"
+    return 1
+  fi
+  rm -f "$backup"
+
+  apply_hy2_firewall_rules "$current_port" "$current_first" "$current_end" "$tcp443_enabled"
+  save_hy2_state "$current_port" "$current_first" "$current_end" "$current_domain" "$current_cert_mode"
+  save_firewall_rules
+  systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
+  [[ "$tcp443_enabled" == "true" ]] && green "TCP 443 HTTPS 回落已开启。" || green "TCP 443 HTTPS 回落已关闭。"
+  if [[ "$tcp443_enabled" == "false" ]]; then
+    green "已关闭 Hy2 TCP 443，UDP $current_port 主监听不受影响。"
+  else
+    green "已开启 Hy2 TCP 443，UDP $current_port 主监听不受影响。"
+  fi
+  read -erp "回车返回菜单..." _
 }
 
 # -----------------------------
@@ -2130,11 +2360,12 @@ menu_hy_conf() {
     echo -e " ${GREEN}2.${tianlan} 修改跳变端口"
     echo -e " ${GREEN}3.${tianlan} 修改密码"
     echo -e " ${GREEN}4.${tianlan} 修改证书类型/路径"
-    echo -e " ${GREEN}5.${tianlan} 修改伪装网站"
+    echo -e " ${GREEN}5.${tianlan} 修改网页伪装响应（内置/本机）"
+    echo -e " ${GREEN}6.${tianlan} 设置 TCP 443 HTTPS 回落监听"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回"
     echo ""
-    read -erp "请选择 [0-5]: " confAnswer
+    read -erp "请选择 [0-6]: " confAnswer
 
     case $confAnswer in
       1) changeport ;;
@@ -2142,6 +2373,7 @@ menu_hy_conf() {
       3) changepasswd ;;
       4) change_cert ;;
       5) changeproxysite ;;
+      6) change_tcp443_mode ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
