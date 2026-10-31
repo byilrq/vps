@@ -971,8 +971,67 @@ xray_official_latest_tag() {
     printf '%s\n' "$tag"
 }
 
+# Find the highest published vMAJOR.MINOR.PATCH of a series (e.g. v26.6.x).
+# Xray's GitHub releases sometimes flag numbered versions as "Pre-release":
+# v26.6.27 is one such release. Therefore accept draft=false releases with
+# strictly numeric vX.Y.Z tags, regardless of prerelease flag. Exclude drafts,
+# rc/nightly suffixes and releases without an asset for this CPU architecture.
+# Pagination must complete; never silently treat a partial GitHub API result
+# as the series' latest version.
+xray_official_latest_series_tag() {
+    local series="${1:-}" asset='' page count='' tag='' tmpdir=''
+    [[ "$series" =~ ^[0-9]+\.[0-9]+$ ]] || {
+        msg_err '版本系列格式错误，应为 26.6 或 26.9。' >&2
+        return 1
+    }
+    command -v jq >/dev/null 2>&1 || {
+        msg_err '缺少 jq，无法从官方发布列表识别版本系列。' >&2
+        return 1
+    }
+    asset="$(xray_release_asset_name)" || return 1
+    tmpdir="$(mktemp -d /tmp/xray-series-search.XXXXXXXX)" || return 1
+    : > "$tmpdir/tags"
+    for ((page=1; page<=10; page++)); do
+        if ! curl -fsSL --retry 2 --connect-timeout 10 --max-time 35 \
+          -H 'Accept: application/vnd.github+json' \
+          -H 'User-Agent: x-sh-xray-core-manager' \
+          "https://api.github.com/repos/XTLS/Xray-core/releases?per_page=100&page=${page}" \
+          -o "$tmpdir/releases.json"; then
+            msg_err "官方版本列表获取失败（第 ${page} 页）；不使用可能遗漏版本的部分结果。" >&2
+            rm -rf "$tmpdir"; return 1
+        fi
+        if ! jq -e 'type == "array"' "$tmpdir/releases.json" >/dev/null 2>&1; then
+            msg_err 'GitHub API 返回异常数据（可能触发访问频率限制）。' >&2
+            rm -rf "$tmpdir"; return 1
+        fi
+        if ! jq -r --arg series "$series" --arg asset "$asset" '
+          .[] | select(.draft == false)
+          | select((.assets // []) | any(.name == $asset))
+          | .tag_name | select(type == "string")
+          | select(startswith("v" + $series + "."))
+          | select((ltrimstr("v" + $series + ".")) | test("^[0-9]+$"))
+        ' "$tmpdir/releases.json" >> "$tmpdir/tags"; then
+            msg_err '解析官方版本列表失败。' >&2
+            rm -rf "$tmpdir"; return 1
+        fi
+        count="$(jq -r 'length' "$tmpdir/releases.json")"
+        if ((count < 100)); then break; fi
+    done
+    if ((page > 10)); then
+        msg_err '官方发布列表超过扫描页数上限，无法确定此系列的最新版本。' >&2
+        rm -rf "$tmpdir"; return 1
+    fi
+    tag="$(sort -Vu "$tmpdir/tags" | tail -n1)"
+    rm -rf "$tmpdir"
+    if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        msg_err "未找到 ${series}.x 系列中可用于 $(arch) 的官方发布包。" >&2
+        return 1
+    fi
+    printf '%s\n' "$tag"
+}
+
 choose_xray_core_version() {
-    local input='' latest='' current=''
+    local input='' latest='' current='' series='' found='' action='' confirm=''
     current="$(xray_core_installed_version 2>/dev/null || true)"
     echo
     echo -e "${cyan}========== Xray-core 内核版本选择 ==========${none}"
@@ -980,32 +1039,61 @@ choose_xray_core_version() {
     echo "当前 / 面板附带 Xray-core：${current:-未检测到}"
     echo "默认 Xray-core：${XRAY_DEFAULT_CORE_VERSION}（已验证 NekoBox 可连接）"
     echo '直接回车：安装 v26.6.27'
-    echo '输入 latest：从 XTLS/Xray-core 官方 GitHub 获取最新发布版'
-    echo '也可以输入具体版本，如 v26.9.30（或 26.9.30）'
-    echo -e "${yellow}提示：旧版本可能缺少后续安全修复；最新版本可能与旧 NekoBox 不兼容。${none}"
+    echo '输入 latest：查询 Xray-core 官方最新发布版本'
+    echo '输入 v26.6 / V26.6：自动查找 26.6.x 系列的最高补丁版本'
+    echo '输入 v26.9.30：精确安装指定版本（也支持不带 v）'
+    echo -e "${yellow}提示：升级或回退都只更换 Xray 内核，不升级 3X-UI 面板。${none}"
+    echo -e "${yellow}警告：旧版内核可能缺少安全修复；新版可能与旧 NekoBox 不兼容。${none}"
     read -erp '请选择 Xray-core 版本 [回车=v26.6.27]: ' input || return 1
+    input="${input,,}"  # Accept V26.6, v26.6, 26.6 and uppercase LATEST.
     case "$input" in
-        '' ) XRAY_REQUESTED_CORE_VERSION="$XRAY_DEFAULT_CORE_VERSION" ;;
-        latest|LATEST)
-            echo '查询 Xray-core 官方 latest 版本中...'
+        '') XRAY_REQUESTED_CORE_VERSION="$XRAY_DEFAULT_CORE_VERSION" ;;
+        latest)
+            echo '查询 Xray-core 官方最新版本中...'
             latest="$(xray_official_latest_tag)" || {
-                msg_err '无法获取官方最新版本。未回退为其他未知版本，请检查 GitHub API 网络。'
+                msg_err '无法获取官方最新版本。原有内核保持不变。'
                 return 1
             }
             XRAY_REQUESTED_CORE_VERSION="$latest"
             ;;
         *)
             [[ "$input" == v* ]] || input="v$input"
-            if [[ ! "$input" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-                msg_err '内核版本格式错误（应为 v26.6.27、latest 或其他 vX.Y.Z）。'
+            if [[ "$input" =~ ^v([0-9]+\.[0-9]+)$ ]]; then
+                series="${BASH_REMATCH[1]}"
+                echo "正在查询 XTLS/Xray-core 官方 ${series}.x 系列的最高已发布版本..."
+                found="$(xray_official_latest_series_tag "$series")" || {
+                    msg_err "${series}.x 系列查询失败；没有修改现有内核。"
+                    return 1
+                }
+                XRAY_REQUESTED_CORE_VERSION="$found"
+                if [[ "$current" == "${found#v}" ]]; then
+                    action='当前版本已经是目标版本'
+                elif [[ -n "$current" && "$(printf '%s\n' "$current" "${found#v}" | sort -V | head -n1)" == "${found#v}" ]]; then
+                    action='回退/降级'
+                else
+                    action='安装/升级'
+                fi
+                echo -e "${green}查询结果：${series}.x 系列最高版本是 ${found}${none}"
+                echo "当前版本：${current:-未检测到}"
+                echo -e "${yellow}即将执行：${action} → ${found}${none}"
+                if [[ "$current" != "${found#v}" ]]; then
+                    read -erp "确认${action}至 ${found} 吗？[y/N]: " confirm || return 1
+                    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+                        msg_inf '已取消，本次未修改内核。'
+                        return 1
+                    fi
+                fi
+            elif [[ "$input" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+                XRAY_REQUESTED_CORE_VERSION="$input"
+            else
+                msg_err '版本格式无效：可用 v26.6、V26.6、v26.6.27 或 latest。'
                 return 1
             fi
-            XRAY_REQUESTED_CORE_VERSION="$input"
             ;;
     esac
     echo -e "${green}本次选择 Xray-core：${XRAY_REQUESTED_CORE_VERSION}${none}"
     if [[ "$XRAY_REQUESTED_CORE_VERSION" == "$XRAY_DEFAULT_CORE_VERSION" ]]; then
-        msg_inf '兼容版本已固定；若开启 Xray 自动更新，未来可能再次出现 NekoBox 不兼容。'
+        msg_inf '已选择兼容版本；如启用自动更新，未来仍可能出现 NekoBox 不兼容。'
     fi
 }
 
@@ -1272,7 +1360,7 @@ xray_core_menu() {
     while true; do
         echo
         echo -e "${cyan}========== Xray-core 维护 ==========${none}"
-        echo '1) 手动更新 Xray-core（默认 v26.6.27，latest 获取最新版）'
+        echo '1) 手动升级/回退 Xray-core（v26.6 自动查找系列最新，latest 最新版）'
         echo '2) 设置定时自动更新（默认关闭，需确认风险）'
         echo '3) 查看 / 取消定时自动更新'
         echo '0) 返回主菜单'
