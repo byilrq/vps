@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s.sh v5 - standalone sing-box deployment/management (no S-UI, no web panel).
+# s.sh v6 - standalone sing-box deployment/management (no S-UI, no web panel).
 # Revised from the user's s(9).sh: SS, HY2, VLESS REALITY; independent protocol submenus.
 # Protocol removal edits only the named sing-box inbound, not other services.
 # Kernel updates preserve configs; full uninstall removes ALL protocols and credentials.
@@ -679,7 +679,7 @@ add_ss() {
     local port='' method='' key='' node='' default_port='' method_choice=''
     default_port="$(jq -r '[.inbounds[] | select(.tag=="ss-in") | .listen_port][0] // empty' "$CONFIG")"
     [[ -n "$default_port" ]] || default_port="$(random_port)" || return 1
-    say 'Shadowsocks 单用户模式（TCP + UDP）。'
+    say 'Shadowsocks (SS) 落地节点：单用户加密配置。'
     printf '%s\n' '1) 2022-blake3-aes-128-gcm（推荐）' '2) aes-128-gcm（传统兼容）'
     ask method_choice '请选择加密方式 [1]: ' 1 || return 1
     case "$method_choice" in
@@ -687,7 +687,7 @@ add_ss() {
         2) method='aes-128-gcm' ;;
         *) fail 'Invalid method'; return 1 ;;
     esac
-    ask port "SS TCP+UDP 监听端口 [$default_port]: " "$default_port" || return 1
+    ask port "SS 落地监听端口 [$default_port]: " "$default_port" || return 1
     check_port_available tcp "$port" ss-in || return 1
     port=$((10#$port))
     check_port_available udp "$port" ss-in || return 1
@@ -1057,13 +1057,43 @@ add_reality() {
     protocol_report reality
 }
 
+# QR output is compact-height UTF-8, with a two-cell quiet zone. Extra
+# blank lines and a visible caption keep its upper border separate from the
+# credentials/URI and prevent the following menu from visually merging into it.
 show_qr() {
+    printf '\n\n%b────────── 节点二维码（扫描导入） ──────────%b\n\n' "$UI_CYAN" "$UI_RESET"
     if command_ok qrencode; then
-        qrencode -t ANSIUTF8 -m 1 "$1" || warn 'QR display failed'
+        qrencode -t UTF8 -m 2 "$1" || warn '二维码绘制失败，请使用上方节点链接导入。'
     else
-        warn 'qrencode not installed. Run menu 1 to install QR dependency.'
+        warn '未安装 qrencode。请先在主菜单 1 安装二维码依赖。'
+    fi
+    printf '\n%b──────────────────────────────────────────%b\n\n' "$UI_DIM" "$UI_RESET"
+}
+
+# Shared SS landing-node presentation for both installation/link output and
+# overall status.  The labels describe the X-UI outbound fields, not a claim
+# that the sing-box inbound has disabled UDP.
+print_ss_landing_params() {
+    local host="$1" port="$2" method="$3" password="$4"
+    printf '\n%b%s%b\n\n' "$UI_BOLD$UI_GREEN" 'Shadowsocks (SS) 落地节点：' "$UI_RESET"
+    printf '%b服务器地址：%b%s\n' "$UI_CYAN" "$UI_RESET" "$host"
+    printf '%b服务器端口：%b%s\n' "$UI_CYAN" "$UI_RESET" "$port"
+    printf '%b加密方式：%b%s\n' "$UI_CYAN" "$UI_RESET" "$method"
+    printf '%b密码：%b%s\n' "$UI_CYAN" "$UI_RESET" "$password"
+    printf '\n%b传输类型：%bTCP (RAW)\n' "$UI_CYAN" "$UI_RESET"
+    printf '%b传输安全：%bNone\n' "$UI_CYAN" "$UI_RESET"
+    printf '%bTLS：%b关闭\n' "$UI_CYAN" "$UI_RESET"
+    printf '%b插件：%b无\n' "$UI_CYAN" "$UI_RESET"
+}
+
+# Keep the QR visible until the operator chooses to return to the menu.
+pause_after_node_output() {
+    if [[ -t 0 ]]; then
+        local ignored=''
+        ask ignored '按回车返回协议菜单（可先扫描上方二维码）: ' '' || true
     fi
 }
+
 show_links() {
     local only="${1:-all}" host='' port='' method='' password='' uri='' sni='' key='' sid='' uuid='' name=''
     ensure_state || return 1
@@ -1089,13 +1119,9 @@ show_links() {
             password="$(jq -r '[.inbounds[]|select(.tag=="ss-in")|.password][0]//empty' "$CONFIG")"
             name="$(urlenc "ss${label:+-$label}")"
             uri="ss://$(base64one "$method:$password")@$authority_host:$port#$name"
-            printf '\n=== Shadowsocks (SS) ===\n%s\n' "$uri"
-            say 'Base64 仅为链接编码；在 3X-UI 出站中填写下方原始密码。'
-            printf '  Address:    %s\n  Port:       %s\n  Method:     %s\n  Password:   %s\n  Network:    TCP + UDP\n  TLS:        None\n  Transport:  Shadowsocks native; no WS/path/flow\n' \
-                "$host" "$port" "$method" "$password"
-            printf '%s\n' '  3X-UI/Xray 出站配置示例：'
-            jq -n --arg h "$host" --argjson p "$port" --arg m "$method" --arg pw "$password" \
-                '{tag:"landing-ss",protocol:"shadowsocks",settings:{servers:[{address:$h,port:$p,method:$m,password:$pw}]}}'
+            say 'Base64 仅为链接编码；在 X-UI 出站中填写下方落地参数，保存后重启生效。'
+            print_ss_landing_params "$host" "$port" "$method" "$password"
+            printf '\n%b节点链接（Base64）：%b\n%s\n' "$UI_CYAN" "$UI_RESET" "$uri"
             show_qr "$uri"
         fi
     fi
@@ -1145,7 +1171,13 @@ show_links() {
 # Unified status + connection parameters + node URI + QR for each protocol.
 protocol_report() {
     local kind="$1"
-    protocol_status "$kind" || return 1
+    # For SS, display the full landing-node parameter block exactly once in
+    # show_links, while keeping service/port health information above it.
+    if [[ "$kind" == ss ]]; then
+        protocol_status "$kind" compact || return 1
+    else
+        protocol_status "$kind" || return 1
+    fi
     protocol_installed "$kind" || return 0
     show_links "$kind"
 }
@@ -1232,7 +1264,7 @@ remove_protocol() {
 }
 
 protocol_status() {
-    local kind="$1" tag='' proto='' line='' port='' sni='' method='' lines_tcp='' lines_udp=''
+    local kind="$1" detail_mode="${2:-full}" tag='' proto='' line='' port='' sni='' method='' lines_tcp='' lines_udp=''
     local installed=false running=false valid=false listening=false
     tag="$(protocol_tag "$kind")" || return 1
     proto="$(protocol_transport "$kind")"
@@ -1251,13 +1283,19 @@ protocol_status() {
         port="$(jq -r '.listen_port // empty' <<< "$line")"
         local connect_host="$(get_meta '.connect_host')"
         [[ -n "$connect_host" ]] || connect_host="$(get_public_ip || true)"
-        printf '安装状态：已配置\n连接域名/IP：%s\n传输协议：%s\n监听端口：%s\n' \
-            "${connect_host:-请先在菜单 1 设置}" "${proto^^}" "$port"
+        if [[ "$kind" == ss ]]; then
+            printf '安装状态：已配置\n'
+        else
+            printf '安装状态：已配置\n连接域名/IP：%s\n传输协议：%s\n监听端口：%s\n' \
+                "${connect_host:-请先在菜单 1 设置}" "${proto^^}" "$port"
+        fi
         case "$kind" in
             ss)
-                method="$(jq -r '.method // empty' <<< "$line")"
-                printf '加密方式：%s\n原始密码：%s\n安全层：无 TLS\n传输方式：Shadowsocks 原生 TCP + UDP（无 WS / Path）\n' \
-                    "$method" "$(jq -r '.password // empty' <<< "$line")"
+                if [[ "$detail_mode" != compact ]]; then
+                    method="$(jq -r '.method // empty' <<< "$line")"
+                    print_ss_landing_params "${connect_host:-请先在菜单 1 设置}" "$port" "$method" \
+                        "$(jq -r '.password // empty' <<< "$line")"
+                fi
                 ;;
             hy2)
                 sni="$(get_meta '.hy2.sni')"
@@ -1353,10 +1391,11 @@ protocol_menu() {
                     hy2) add_hy2 || true ;;
                     reality) add_reality || true ;;
                 esac
+                pause_after_node_output
                 ;;
             2) remove_protocol "$kind" || true ;;
             3) protocol_restart "$kind" || true ;;
-            4) protocol_report "$kind" || true ;;
+            4) protocol_report "$kind" || true; pause_after_node_output ;;
             5) if [[ "$kind" == hy2 ]]; then manage_hy2_tcp443_site || true; else warn '无效选项。'; fi ;;
             0|q|Q) return 0 ;;
             *) warn '无效选项。' ;;
