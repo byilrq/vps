@@ -1755,66 +1755,112 @@ ssh_settings() {
 }
 
 # ============================================
-# 函数：修改 Debian 系统主机名
-# 用法：change_hostname <新主机名>
-# 示例：change_hostname minibox
+# 函数：修改 Debian/Ubuntu 系统主机名
+# 菜单模式：change_hostname（交互式输入）
+# 直接调用：change_hostname <新主机名>
 # ============================================
 change_hostname() {
-    local new_hostname="$1"
-    
-    # 参数检查
+    local current_hostname new_hostname="${1:-}"
+    local hosts_backup="" temp_hosts=""
+
+    if [[ $EUID -ne 0 ]]; then
+        red "请使用 root 权限修改主机名"
+        return 1
+    fi
+
+    current_hostname="$(hostname 2>/dev/null)" || {
+        red "无法读取当前主机名"
+        return 1
+    }
+    echo "当前主机名：${current_hostname}"
+
+    # 菜单选择 10 时没有传参，先询问新主机名；带参数调用时直接使用。
     if [[ -z "$new_hostname" ]]; then
-        echo "❌ 错误：请提供新的主机名"
-        echo "用法：change_hostname <新主机名>"
+        printf "请输入新的主机名（留空取消）: "
+        if ! read -er new_hostname; then
+            yellow "已取消修改主机名"
+            return 0
+        fi
+        if [[ -z "$new_hostname" ]]; then
+            yellow "已取消修改主机名"
+            return 0
+        fi
+    fi
+
+    # Linux 主机名标签：1-63 个字符，字母/数字/连字符，不能以连字符开头或结尾。
+    if (( ${#new_hostname} > 63 )) ||
+       [[ ! "$new_hostname" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$ ]]; then
+        red "主机名格式无效：仅允许 1-63 位英文字母、数字和连字符，且不能以连字符开头或结尾"
         return 1
     fi
-    
-    # 检查是否包含非法字符（只允许 a-z, 0-9, -）
-    if [[ ! "$new_hostname" =~ ^[a-zA-Z0-9-]+$ ]]; then
-        echo "❌ 错误：主机名只能包含字母、数字和连字符 (-)"
-        return 1
-    fi
-    
-    # 获取当前主机名
-    local current_hostname=$(hostname)
-    
-    # 如果新主机名和当前一样，无需操作
+
     if [[ "$new_hostname" == "$current_hostname" ]]; then
-        echo "ℹ️  主机名已经是 '$new_hostname'，无需修改"
+        green "主机名已经是 ${new_hostname}，无需修改"
         return 0
     fi
-    
-    echo "📝 正在修改主机名：$current_hostname → $new_hostname"
-    
-    # 1. 使用 hostnamectl 修改静态主机名
-    sudo hostnamectl set-hostname "$new_hostname"
-    if [[ $? -ne 0 ]]; then
-        echo "❌ 修改静态主机名失败"
+
+    if ! command -v hostnamectl >/dev/null 2>&1; then
+        red "系统未找到 hostnamectl，无法安全修改静态主机名"
         return 1
     fi
-    
-    # 2. 立即更新内核主机名（让当前会话生效）
-    sudo hostname "$new_hostname"
-    
-    # 3. 更新 /etc/hosts 文件
+
+    # 先备份并准备 /etc/hosts 的内容，再修改主机名。
+    # 仅替换 hosts 中精确匹配的旧主机名，保留其它主机和域名记录。
     if [[ -f /etc/hosts ]]; then
-        # 备份原文件
-        sudo cp /etc/hosts /etc/hosts.bak.$(date +%Y%m%d_%H%M%S)
-        
-        # 替换 hosts 文件中的旧主机名
-        sudo sed -i "s/127\.0\.1\.1\s*${current_hostname}/127.0.1.1 ${new_hostname}/g" /etc/hosts
-        sudo sed -i "s/::1\s*${current_hostname}/::1 ${new_hostname}/g" /etc/hosts
-        
-        echo "✅ /etc/hosts 已更新"
+        hosts_backup="/etc/hosts.bak.$(date +%Y%m%d_%H%M%S)"
+        cp -a /etc/hosts "$hosts_backup" || {
+            red "备份 /etc/hosts 失败，未执行修改"
+            return 1
+        }
+        temp_hosts="$(mktemp)" || {
+            red "创建 /etc/hosts 临时文件失败"
+            return 1
+        }
+        if ! awk -v old="$current_hostname" -v new="$new_hostname" '
+            BEGIN { mapped = 0 }
+            {
+                if ($0 !~ /^[[:space:]]*#/ && NF >= 2) {
+                    for (i = 2; i <= NF; ++i) {
+                        if ($i ~ /^#/) break
+                        if ($i == old) {
+                            $i = new
+                            mapped = 1
+                        } else if ($i == new) {
+                            mapped = 1
+                        }
+                    }
+                }
+                print
+            }
+            END { if (!mapped) print "127.0.1.1 " new }
+        ' /etc/hosts > "$temp_hosts"; then
+            rm -f "$temp_hosts"
+            red "生成新的 /etc/hosts 内容失败，未执行修改"
+            return 1
+        fi
     fi
-    
-    # 4. 重启 systemd-hostnamed 服务（确保所有服务识别新主机名）
-    sudo systemctl restart systemd-hostnamed 2>/dev/null
-    
-    echo "✅ 主机名修改完成！"
-    echo "📌 当前主机名：$(hostname)"
-    echo "💡 提示：如果提示符未更新，请重新登录或执行 'exec bash'"
-    
+
+    echo "正在修改主机名：${current_hostname} -> ${new_hostname}"
+    if ! hostnamectl set-hostname "$new_hostname"; then
+        [[ -n "$temp_hosts" ]] && rm -f "$temp_hosts"
+        red "修改系统主机名失败"
+        return 1
+    fi
+
+    if [[ -n "$temp_hosts" ]]; then
+        if ! cat "$temp_hosts" > /etc/hosts; then
+            cp -a "$hosts_backup" /etc/hosts >/dev/null 2>&1 || true
+            hostnamectl set-hostname "$current_hostname" >/dev/null 2>&1 || true
+            rm -f "$temp_hosts"
+            red "更新 /etc/hosts 失败，已尝试恢复原来的主机名和 hosts 文件"
+            return 1
+        fi
+        rm -f "$temp_hosts"
+        green "/etc/hosts 已更新（原文件备份：${hosts_backup}）"
+    fi
+
+    green "主机名修改完成！当前主机名：$(hostname)"
+    yellow "如果 SSH 提示符未更新，重新登录即可"
     return 0
 }
 
@@ -1967,7 +2013,7 @@ menu_sys_conf() {
       7) sys_cle ;;
       8) set_ip_priority ;;
       9) cron_reboot ;;
-      10) change_hostname ;;
+      10) change_hostname; read -rp "回车返回菜单..." _ ;;
       11) fix_nginx_site ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
