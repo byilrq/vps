@@ -86,6 +86,80 @@ install_monitor() {
     read -p "按回车键继续..."
 }
 
+# 固定 KiwiVM API 接口地址，并移除 push.sh 里不必要的 Endpoint 输入项。
+# push.sh 由菜单 2 安装/调用；这里仅对其 BWH 相关行做最小修改。
+fix_push_bwh_endpoint() {
+    local target="$WORK_DIR/push.sh"
+    local fixed_url="https://api.64clouds.com/v1/getServiceInfo"
+    local tmp cfg cfg_tmp backup
+
+    if [ ! -f "$target" ]; then
+        echo -e "${RED}未找到 $target，无法修复 KiwiVM API 配置。${NC}"
+        return 1
+    fi
+    if ! grep -q '^BWH_API_ENDPOINT_DEFAULT=' "$target"; then
+        echo -e "${RED}push.sh 结构与预期不符（缺少 BWH_API_ENDPOINT_DEFAULT），未修改。${NC}"
+        return 1
+    fi
+
+    tmp=$(mktemp "$WORK_DIR/.push.bwh.XXXXXX") || return 1
+    # 1) 固定地址；2) 老配置中的错误地址不再生效；3) 取消 Endpoint 输入；
+    # 4) 配置文件不再记录 Endpoint，免得误当成需要填写的 API_KEY。
+    if ! sed -E \
+        -e 's@^BWH_API_ENDPOINT_DEFAULT=.*$@BWH_API_ENDPOINT_DEFAULT="https://api.64clouds.com/v1/getServiceInfo"@' \
+        -e 's@^([[:space:]]*)BWH_API_ENDPOINT=\$\{BWH_API_ENDPOINT:-\$BWH_API_ENDPOINT_DEFAULT\}[[:space:]]*$@\1BWH_API_ENDPOINT="$BWH_API_ENDPOINT_DEFAULT"@' \
+        -e '/^[[:space:]]*BWH_API_ENDPOINT="\$BWH_API_ENDPOINT"[[:space:]]*$/d' \
+        -e '/^[[:space:]]*echo "API Endpoint \[当前: /d' \
+        -e '/^[[:space:]]*read_input new_ep[[:space:]]*$/d' \
+        -e '/^[[:space:]]*\[\[ -z "\$new_ep" \]\] && new_ep="\$BWH_API_ENDPOINT"[[:space:]]*$/d' \
+        -e 's@^([[:space:]]*)BWH_API_ENDPOINT="\$new_ep"[[:space:]]*$@\1BWH_API_ENDPOINT="$BWH_API_ENDPOINT_DEFAULT"@' \
+        -e 's@curl -sS -G "\$BWH_API_ENDPOINT"@curl -sS -G "$BWH_API_ENDPOINT_DEFAULT"@' \
+        "$target" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! bash -n "$tmp" \
+        || ! grep -Fq "BWH_API_ENDPOINT_DEFAULT=\"$fixed_url\"" "$tmp" \
+        || grep -Fq 'read_input new_ep' "$tmp" \
+        || grep -Fq 'API Endpoint [当前:' "$tmp" \
+        || grep -Fq 'BWH_API_ENDPOINT="$new_ep"' "$tmp" \
+        || grep -Fq 'BWH_API_ENDPOINT=${BWH_API_ENDPOINT:-$BWH_API_ENDPOINT_DEFAULT}' "$tmp"; then
+        echo -e "${RED}push.sh 修复后校验失败；原文件未修改。${NC}"
+        rm -f "$tmp"
+        return 1
+    fi
+
+    if ! cmp -s "$tmp" "$target"; then
+        backup="${target}.bak.before-bwh-endpoint"
+        if [ ! -e "$backup" ]; then
+            cp -p "$target" "$backup" || { rm -f "$tmp"; return 1; }
+        fi
+        chmod --reference="$target" "$tmp" || { rm -f "$tmp"; return 1; }
+        mv -f "$tmp" "$target" || { rm -f "$tmp"; return 1; }
+        echo -e "${GREEN}✓ 已取消 push.sh 的 API Endpoint 输入，接口固定为官方地址。${NC}"
+    else
+        rm -f "$tmp"
+        echo -e "${GREEN}✓ push.sh 的 KiwiVM Endpoint 已是固定地址。${NC}"
+    fi
+
+    # 旧配置如果保存了错误 Endpoint，移除这行；VEID、API_KEY 和其它设置保留。
+    cfg="$WORK_DIR/push_config.txt"
+    if [ -f "$cfg" ] && grep -q '^BWH_API_ENDPOINT=' "$cfg"; then
+        cfg_tmp=$(mktemp "$WORK_DIR/.push.cfg.XXXXXX") || return 1
+        if sed '/^BWH_API_ENDPOINT=/d' "$cfg" > "$cfg_tmp" \
+            && chmod --reference="$cfg" "$cfg_tmp" \
+            && chown --reference="$cfg" "$cfg_tmp" \
+            && mv -f "$cfg_tmp" "$cfg"; then
+            echo -e "${GREEN}✓ 已清除旧配置中的 BWH_API_ENDPOINT，其它配置不变。${NC}"
+        else
+            rm -f "$cfg_tmp"
+            echo -e "${YELLOW}旧配置 Endpoint 行未清理，但新脚本会强制使用官方地址。${NC}"
+        fi
+    fi
+    return 0
+}
+
 # 安装/管理推送（合并版 push.sh：TG / PushPlus / ntfy）
 install_push_manager() {
     echo -e "${CYAN}正在安装/管理 推送功能（push.sh：TG / PushPlus / ntfy 合并版，按配置时间写入 cron）...${NC}"
@@ -95,6 +169,13 @@ install_push_manager() {
         install_script "push.sh" || { read -p "按回车键继续..."; return; }
     else
         echo -e "${GREEN}检测到本地 push.sh，直接运行本地版本，避免从远程下载旧版覆盖。${NC}"
+    fi
+
+    # 本地 push.sh 可能仍有旧 Endpoint 输入；启动前修复。
+    if ! fix_push_bwh_endpoint; then
+        echo -e "${RED}KiwiVM API Endpoint 修复失败，已停止运行，避免继续使用错误配置。${NC}"
+        read -p "按回车键继续..."
+        return 1
     fi
 
     run_script "$WORK_DIR/push.sh"
@@ -257,14 +338,14 @@ Traffic_all() {
 
     # 1) 先看 push_config 的流量来源（缺失则默认 vnstat）
     local TRAFFIC_SOURCE="vnstat"
-    local BWH_VEID="" BWH_API_KEY="" BWH_API_ENDPOINT=""
+    local BWH_VEID="" BWH_API_KEY=""
     local BWH_API_ENDPOINT_DEFAULT="https://api.64clouds.com/v1/getServiceInfo"
 
     if _read_push_config_kv; then
         TRAFFIC_SOURCE=${TRAFFIC_SOURCE:-vnstat}
         BWH_VEID=${BWH_VEID:-}
         BWH_API_KEY=${BWH_API_KEY:-}
-        BWH_API_ENDPOINT=${BWH_API_ENDPOINT:-$BWH_API_ENDPOINT_DEFAULT}
+        # 旧配置中的 BWH_API_ENDPOINT 无论为何值，都不予使用。
     else
         TRAFFIC_SOURCE="vnstat"
     fi
@@ -278,8 +359,8 @@ Traffic_all() {
         fi
 
         local info used_bytes plan_bytes next_reset
-        info=$(_get_bwh_info_bytes "$BWH_API_ENDPOINT" "$BWH_VEID" "$BWH_API_KEY") || {
-            echo -e "${RED}KiwiVM API 调用失败：请检查网络、VEID/API_KEY、Endpoint。${NC}"
+        info=$(_get_bwh_info_bytes "$BWH_API_ENDPOINT_DEFAULT" "$BWH_VEID" "$BWH_API_KEY") || {
+            echo -e "${RED}KiwiVM API 调用失败：请检查网络、VEID/API_KEY。${NC}"
             return 1
         }
 
