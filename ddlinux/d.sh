@@ -34,89 +34,32 @@ show_help() {
     cat <<'HELP'
 用法: bash d.sh [选项]
   无参数   进入 Debian 12/13、Ubuntu 22.04/24.04 的安装管理菜单
-  --check  离线检查全部本地文件的 SHA256、脚本语法及依赖文件，不写盘、不联网
-  --sync   主动从 github.com/byilrq/vps/main/ddlinux 下载完整最新版并校验
+  --check  仅检查必需文件是否存在、非空且可读取；不联网、不做哈希校验
+  --sync   从 github.com/byilrq/vps/main/ddlinux 下载完整文件并更新
   -h, --help  显示本说明
 
 首次只有 d.sh、缺少其它文件时，将自动下载整套文件。已安装的完整文件
-优先离线使用，不会每次联网；若校验不通过则阻止安装，使用 --sync 修复。
+优先离线使用，不会每次联网；如有缺失可通过 --sync 补齐。
 请先将本压缩包内的整套文件更新到你的 GitHub 仓库，才能启用在线补齐。
 警告：确认并重启进入重装环境后，目标磁盘全部数据将被覆盖。
 HELP
 }
 
-have_sha256sum() {
-    command -v sha256sum >/dev/null 2>&1 || {
-        printf '[ERROR] 缺少 sha256sum，无法验证文件完整性。\n' >&2
-        return 1
-    }
-}
-
-# SHA256SUMS 的文件列表必须与我们定义的发行包完全一致，不接受路径穿越、重复项或额外文件。
-validate_manifest() {
-    local manifest="$1" line hash name expected found count=0
-    local -A seen=()
-    [[ -s "$manifest" && -r "$manifest" ]] || {
-        printf '[ERROR] 缺少校验清单: %s\n' "$manifest" >&2
-        return 1
-    }
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        [[ ${#line} -ge 67 && "${line:64:2}" == '  ' ]] || {
-            printf '[ERROR] SHA256SUMS 格式异常。\n' >&2; return 1;
-        }
-        hash="${line:0:64}"
-        name="${line:66}"
-        [[ "$hash" =~ ^[0-9a-f]{64}$ ]] || {
-            printf '[ERROR] SHA256SUMS 包含无效哈希。\n' >&2; return 1;
-        }
-        found=0
-        for expected in "${PACKAGE_FILES[@]}"; do
-            [[ "$expected" == "$name" ]] && { found=1; break; }
-        done
-        [[ "$found" -eq 1 && -z "${seen[$name]+x}" ]] || {
-            printf '[ERROR] SHA256SUMS 包含意外或重复路径: %s\n' "$name" >&2
-            return 1
-        }
-        seen["$name"]=1
-        count=$((count + 1))
-    done < "$manifest"
-    if [[ "$count" -ne "${#PACKAGE_FILES[@]}" ]]; then
-        printf '[ERROR] SHA256SUMS 条目数量不匹配: %s/%s\n' "$count" "${#PACKAGE_FILES[@]}" >&2
-        return 1
-    fi
-    return 0
-}
-
-# 只检查；不会写文件或联网。
+# 只检查固定清单中所有文件是否存在、非空且可读取；不进行 SHA256 或其他内容哈希检查。
 verify_bundle() {
     local dir="$1" f
-    have_sha256sum || return 1
-    validate_manifest "$dir/SHA256SUMS" || return 1
     for f in "${PACKAGE_FILES[@]}"; do
-        [[ -s "$dir/$f" && -r "$dir/$f" ]] || {
-            printf '[ERROR] 缺少本地文件: %s\n' "$dir/$f" >&2
+        if [[ ! -f "$dir/$f" || ! -s "$dir/$f" || ! -r "$dir/$f" ]]; then
+            printf '[ERROR] 缺少、为空或无法读取的必需文件: %s\n' "$dir/$f" >&2
             return 1
-        }
+        fi
     done
-    (cd "$dir" && sha256sum -c --status SHA256SUMS) || {
-        printf '[ERROR] 文件 SHA256 校验不一致: %s\n' "$dir" >&2
-        return 1
-    }
-    for f in d.sh engine.sh ubuntuInit.sh; do
-        bash -n "$dir/$f" || return 1
-    done
-    bash "$dir/engine.sh" --check || return 1
     return 0
 }
 
-# 仅用于判断缺件：只有缺少文件、清单时才自动下载；内容篡改不静默覆盖。
+# 本地文件缺失才需要自动补齐；已有文件即使经过手工修改，也不会触发校验或覆盖。
 bundle_is_missing() {
-    local f
-    [[ -s "$SCRIPT_DIR/SHA256SUMS" ]] || return 0
-    for f in "${PACKAGE_FILES[@]}"; do
-        [[ -s "$SCRIPT_DIR/$f" ]] || return 0
-    done
-    return 1
+    ! verify_bundle "$SCRIPT_DIR" >/dev/null 2>&1
 }
 
 # 固定下载源；不使用第三方脚本回退，不禁用 TLS 证书验证。
@@ -135,14 +78,13 @@ fetch_file() {
     fi
 }
 
-# 所有文件先下载至临时目录并完成校验，失败时不替换原有文件。
+# 所有文件先下载至临时目录；检查齐全且非空后再部署，失败时不替换原有文件。
 # 替换失败时根据事前备份回滚；通过检查才清理旧版 dd.sh / ddlinux.sh。
 sync_bundle() {
     local stage backup f target temp failed=0
-    have_sha256sum || return 1
     stage="$(mktemp -d "$SCRIPT_DIR/.d-stage.XXXXXXXX")" || return 1
     printf '[INFO] 正在从个人 GitHub 仓库下载完整 ddlinux 项目文件...\n'
-    for f in SHA256SUMS "${PACKAGE_FILES[@]}"; do
+    for f in "${PACKAGE_FILES[@]}"; do
         mkdir -p "$stage/$(dirname -- "$f")" || { failed=1; break; }
         printf '  获取 %s\n' "$f"
         if ! fetch_file "$f" "$stage/$f"; then
@@ -152,13 +94,13 @@ sync_bundle() {
         fi
     done
     if [[ "$failed" -ne 0 ]] || ! verify_bundle "$stage"; then
-        printf '[ERROR] 远程文件不完整、版本未同步或校验失败，已取消更新。\n' >&2
+        printf '[ERROR] 必需文件未下载齐全或存在空文件，已取消更新。\n' >&2
         rm -rf -- "$stage"
         return 1
     fi
 
     backup="$(mktemp -d "$SCRIPT_DIR/.d-backup.XXXXXXXX")" || { rm -rf -- "$stage"; return 1; }
-    for f in "${PACKAGE_FILES[@]}" SHA256SUMS; do
+    for f in "${PACKAGE_FILES[@]}"; do
         target="$SCRIPT_DIR/$f"
         if [[ -e "$target" ]]; then
             mkdir -p "$backup/$(dirname -- "$f")" && cp -p -- "$target" "$backup/$f" || {
@@ -168,7 +110,7 @@ sync_bundle() {
             }
         fi
     done
-    for f in "${PACKAGE_FILES[@]}" SHA256SUMS; do
+    for f in "${PACKAGE_FILES[@]}"; do
         target="$SCRIPT_DIR/$f"
         temp="$target.d-new.$$"
         if ! mkdir -p "$(dirname -- "$target")" || \
@@ -183,7 +125,7 @@ sync_bundle() {
     done
     if [[ "$failed" -ne 0 ]] || ! verify_bundle "$SCRIPT_DIR"; then
         printf '[ERROR] 部署失败，正在恢复原文件。\n' >&2
-        for f in "${PACKAGE_FILES[@]}" SHA256SUMS; do
+        for f in "${PACKAGE_FILES[@]}"; do
             target="$SCRIPT_DIR/$f"
             if [[ -e "$backup/$f" ]]; then
                 cp -p -- "$backup/$f" "$target" || {
@@ -198,9 +140,9 @@ sync_bundle() {
     fi
 
     # 仅清理本项目目录中旧的、已停用的入口和专用初始化文件。
-    rm -f -- "$SCRIPT_DIR/dd.sh" "$SCRIPT_DIR/ddlinux.sh"
+    rm -f -- "$SCRIPT_DIR/dd.sh" "$SCRIPT_DIR/ddlinux.sh" "$SCRIPT_DIR/SHA256SUMS"
     rm -rf -- "$stage" "$backup"
-    printf '[OK] 已下载并校验完整发行包。旧版 dd.sh / ddlinux.sh 已从本地项目目录清理。\n'
+    printf '[OK] 已下载完整项目文件（不做 SHA256 校验）。旧入口与旧校验清单已清理。\n'
     return 0
 }
 
@@ -208,7 +150,7 @@ case "${1:-}" in
     --check)
         [[ $# -eq 1 ]] || { printf '[ERROR] --check 不接受其它参数。\n' >&2; exit 2; }
         verify_bundle "$SCRIPT_DIR" || exit 1
-        printf '[OK] d.sh、engine.sh、ubuntuInit.sh、README 与 6 个网络模板校验及语法均通过。\n'
+        printf '[OK] 全部 10 个必需文件存在、非空且可读取；未进行 SHA256 校验。\n'
         exit 0 ;;
     --sync)
         [[ $# -eq 1 ]] || { printf '[ERROR] --sync 不接受其它参数。\n' >&2; exit 2; }
@@ -236,7 +178,7 @@ if bundle_is_missing; then
     }
 fi
 if ! verify_bundle "$SCRIPT_DIR"; then
-    printf '[ERROR] 已阻止安装。请检查本地改动，或运行 bash d.sh --sync 重新同步。\n' >&2
+    printf '[ERROR] 必需文件不齐全。请运行 bash d.sh --sync 重新补齐。\n' >&2
     exit 1
 fi
 
@@ -264,7 +206,7 @@ check_architecture() {
 }
 
 # ============================================================================
-# 重装前再次校验本地引擎和初始化文件，防止启动菜单后发生文件变更。
+# 重装前再确认必需文件齐全且非空，不验证哈希。
 # ============================================================================
 load_local_engine() {
     verify_bundle "$SCRIPT_DIR"
