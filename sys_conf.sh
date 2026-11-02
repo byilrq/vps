@@ -924,19 +924,23 @@ firewall() {
           pkg_install ufw || { red "安装 ufw 失败"; read -rp "回车返回..." _; continue; }
         fi
 
-        local sshp ports base_ports all_ports
+        local sshp ports base_ports all_ports p
         sshp="$(get_ssh_port)"
-        base_ports="2222 443 80"
+        # 默认业务端口开放 TCP；另行放行 UDP/443（HTTP/3/QUIC），SSH 保留 TCP/UDP。
+        base_ports="2222 443 80 8443 2053 8183 8196 8168"
         yellow "当前 SSH 端口：$sshp，将自动放行 tcp/udp 防止失联。"
-        yellow "默认额外放行端口：2222、443、80"
+        yellow "默认放行 TCP 端口：${base_ports// /、}"
+        yellow "默认放行 UDP 端口：443（HTTP/3/QUIC）"
         read -rp "请输入需要额外放行的端口（例如：51000-52000，可留空）: " ports
 
-        ufw --force enable
+        # 在启用 UFW 前先放行 SSH，避免远程管理端口被暂时封锁。
         ufw allow "${sshp}/tcp"
         ufw allow "${sshp}/udp"
-        ufw allow "2222/tcp"
-        ufw allow "443/tcp"
-        ufw allow "80/tcp"
+        for p in $base_ports; do
+          ufw allow "${p}/tcp"
+        done
+        ufw allow "443/udp"
+        ufw --force enable
 
         ports="${ports//,/ }"
         ports="${ports//，/ }"
