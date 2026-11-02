@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import base64
+import os
 import re
 import sys
 import urllib.error
@@ -13,7 +14,7 @@ try:
 except ImportError:  # Python < 3.9 fallback
     ZoneInfo = None
 
-WORK_DIR = Path("/root/node")
+WORK_DIR = Path(os.environ.get("NODE_WORK_DIR", "/root/node"))
 CONFIG_FILE = WORK_DIR / "node_config.txt"
 
 try:
@@ -23,14 +24,20 @@ except Exception:
     SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
+def server_local_now() -> datetime:
+    """自动读取系统当前本地时区和时间。"""
+    return datetime.now().astimezone()
+
+
 def shanghai_now() -> datetime:
-    """始终返回上海时间，不受 VPS 本机时区影响。"""
-    return datetime.now(SHANGHAI_TZ)
+    return server_local_now().astimezone(SHANGHAI_TZ)
 
 
-def is_shanghai_quiet_hours() -> bool:
-    """上海时间 00:00 <= time < 08:00 时强制静默。"""
-    return 0 <= shanghai_now().hour < 8
+def is_shanghai_quiet_hours(at=None) -> bool:
+    """上海时间 [22:30, 次日08:00) 自动降为 ntfy Priority=1。"""
+    current = shanghai_now() if at is None else at.astimezone(SHANGHAI_TZ)
+    minute_of_day = current.hour * 60 + current.minute
+    return minute_of_day >= (22 * 60 + 30) or minute_of_day < 8 * 60
 
 
 def parse_config(path: Path) -> dict:
@@ -65,8 +72,7 @@ def ntfy_send(content: str, priority=None) -> bool:
         priority = (cfg.get("NTFY_PRIORITY", "3") or "3").strip()
     if priority not in {"1", "2", "3", "4", "5"}:
         priority = "3"
-    # 夜间静默规则放在最终发送层：无论调用方传入什么优先级，
-    # 上海时间 00:00-08:00 都强制使用 ntfy Priority=1。
+    # 22:30-次日08:00 上海时间统一优先级1，其他时段使用用户设定值。
     if is_shanghai_quiet_hours():
         priority = "1"
     if not url or not topic:

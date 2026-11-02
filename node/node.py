@@ -52,7 +52,788 @@ WEB_RESTART_FILE = WORK_DIR / ".node_web_restart"
 KEYWORDS_FILE = WORK_DIR / "keywords.json"
 KEYWORDS_BACKUP_FILE = WORK_DIR / "keywords.json.bak"
 KEYWORDS_AUDIT_LOG = WORK_DIR / "keywords_audit.log"
-SKIN_FILE = Path(os.environ.get("NODE_SKIN_FILE", str(WORK_DIR / "node_skin.css")))
+# 皮肤和主程序合并：HTML 直接内联本 CSS，不需要额外部署静态文件。
+INLINE_SKIN_CSS = r"""
+:root {
+  --bg: #0b0b12;
+  --bg-deep: #07070b;
+  --panel: #171522;
+  --panel2: #201b2e;
+  --field: #0d0c14;
+  --text: #f7f2e8;
+  --muted: #b7ad9f;
+  --gold: #f4b54a;
+  --gold-soft: #ffe09a;
+  --gold-deep: #d8911b;
+  --red: #c83e3e;
+  --red-soft: #ff9c9c;
+  --green: #37b26c;
+  --green-soft: #7cf0a9;
+  --border: rgba(255,255,255,.10);
+  --border-gold: rgba(244,181,74,.24);
+  --shadow: 0 18px 60px rgba(0,0,0,.24);
+  --shadow-deep: 0 24px 90px rgba(0,0,0,.35);
+  --radius-card: 24px;
+  --radius-control: 14px;
+}
+
+* {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html,
+body {
+  margin: 0;
+  padding: 0;
+  min-height: 100%;
+}
+
+body {
+  min-height: 100vh;
+  font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  color: var(--text);
+  background:
+    radial-gradient(circle at top, #251b36, var(--bg) 46%, var(--bg-deep));
+  background-attachment: fixed;
+  padding: 24px 14px 36px;
+  overflow-x: hidden;
+}
+
+body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(circle at 12% 5%, rgba(244,181,74,.045), transparent 26%),
+    radial-gradient(circle at 90% 16%, rgba(112,76,164,.08), transparent 32%);
+}
+
+button,
+textarea,
+input {
+  font: inherit;
+}
+
+button,
+a,
+textarea,
+input,
+label {
+  -webkit-tap-highlight-color: transparent;
+}
+
+button:focus-visible,
+a:focus-visible,
+textarea:focus-visible,
+input:focus-visible {
+  outline: 2px solid var(--gold);
+  outline-offset: 3px;
+}
+
+.wrap {
+  position: relative;
+  z-index: 1;
+  width: min(1120px, 92vw);
+  margin: 0 auto;
+}
+
+.hero {
+  position: relative;
+  overflow: hidden;
+  padding: 28px 30px;
+  margin: 0 0 20px;
+  border: 1px solid var(--border);
+  border-radius: 30px;
+  background:
+    radial-gradient(ellipse at 8% 8%, rgba(244,181,74,.048), transparent 48%),
+    linear-gradient(125deg, rgba(32,27,46,.96), rgba(18,16,27,.94));
+  box-shadow: var(--shadow-deep);
+}
+
+.hero::before {
+  content: "";
+  position: absolute;
+  left: 30px;
+  right: 30px;
+  bottom: 0;
+  height: 1px;
+  background: linear-gradient(90deg, rgba(244,181,74,.72), rgba(244,181,74,.08), transparent);
+  pointer-events: none;
+}
+
+.hero::after {
+  content: "WRATH OF THE LICH KING";
+  position: absolute;
+  right: 30px;
+  bottom: 13px;
+  color: rgba(244,181,74,.18);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .20em;
+  pointer-events: none;
+}
+
+.hero-line {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 22px;
+}
+
+h1 {
+  margin: 0;
+  color: var(--gold);
+  font-size: clamp(30px, 5vw, 46px);
+  line-height: 1.05;
+  letter-spacing: .08em;
+  font-weight: 900;
+  text-shadow: 0 3px 20px rgba(216,145,27,.12);
+  white-space: nowrap;
+}
+
+
+.brand-title {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.brand-shark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.32em;
+  height: 1.40em;
+  flex: 0 0 1.32em;
+  transform: translateY(1px);
+}
+
+.brand-shark svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+  overflow: visible;
+}
+
+.hero-sub {
+  margin-top: 8px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+.card {
+  width: 100%;
+  min-width: 0;
+  margin: 0 auto 20px;
+  padding: 24px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background:
+    radial-gradient(circle at 100% 0%, rgba(112,76,164,.05), transparent 34%),
+    rgba(23,21,34,.88);
+  box-shadow: var(--shadow);
+}
+
+.keyword-card {
+  position: relative;
+}
+
+.keyword-card::before,
+.log-card::before {
+  content: "";
+  display: block;
+  height: 1px;
+  margin: -24px -8px 22px;
+  background: linear-gradient(90deg, transparent, rgba(244,181,74,.16), transparent);
+}
+
+.keyword-header,
+.log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: 14px;
+}
+
+.silent-header {
+  margin-top: 20px;
+}
+
+h2,
+.keyword-title {
+  margin: 0;
+  color: var(--gold);
+  font-size: 18px;
+  font-weight: 800;
+  letter-spacing: .02em;
+}
+
+.title-rule,
+.log-meta {
+  color: var(--muted);
+  font-size: 11px;
+  font-weight: 500;
+  line-height: 1.55;
+}
+
+textarea {
+  width: 100%;
+  min-height: 104px;
+  resize: vertical;
+  appearance: none;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 13px 14px;
+  outline: none;
+  background: var(--field);
+  color: var(--text);
+  font-size: 15px;
+  line-height: 1.6;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.025);
+  transition: border-color .15s ease, box-shadow .15s ease, background .15s ease;
+}
+
+textarea::placeholder {
+  color: var(--muted);
+  opacity: .67;
+}
+
+textarea[readonly] {
+  color: rgba(247,242,232,.82);
+  background: rgba(13,12,20,.70);
+  cursor: default;
+  caret-color: transparent;
+  pointer-events: none;
+  user-select: none;
+}
+
+textarea:focus {
+  border-color: rgba(244,181,74,.65);
+  box-shadow: 0 0 0 3px rgba(244,181,74,.08);
+}
+
+button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  min-height: 40px;
+  min-width: 78px;
+  padding: 9px 16px;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(255,255,255,.06);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.3;
+  font-weight: 800;
+  letter-spacing: .02em;
+  cursor: pointer;
+  box-shadow: none;
+  transition: background .15s ease, transform .15s ease, border-color .15s ease, filter .15s ease;
+}
+
+button:hover {
+  transform: translateY(-1px);
+  filter: brightness(1.08);
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+button:not(.secondary):not(.danger):not(.active) {
+  border: 0;
+  color: #160f07;
+  background: linear-gradient(135deg, #ffcc62, var(--gold-deep));
+  box-shadow: 0 4px 16px rgba(216,145,27,.12);
+}
+
+button.secondary {
+  color: var(--text);
+  background: rgba(255,255,255,.055);
+  border-color: var(--border);
+}
+
+button.active {
+  color: #160f07;
+  background: linear-gradient(135deg, #ffcc62, var(--gold-deep));
+  border-color: transparent;
+  box-shadow: 0 4px 16px rgba(216,145,27,.12);
+}
+
+button.danger {
+  color: var(--red-soft);
+  background: rgba(200,62,62,.14);
+  border-color: rgba(200,62,62,.38);
+}
+
+button.danger:hover {
+  background: rgba(200,62,62,.24);
+}
+
+.msg {
+  min-height: 22px;
+  padding-top: 10px;
+  text-align: center;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.msg.ok {
+  color: var(--green-soft);
+}
+
+.msg.err {
+  color: var(--red-soft);
+}
+
+.hint-line {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin-top: 10px;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.log-card {
+  display: block;
+}
+
+.log-body {
+  display: none;
+}
+
+.log-body.show {
+  display: block;
+}
+
+.log-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 12px 0 14px;
+}
+
+.log-left {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+}
+
+.switch-group {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+
+.switch-wrap {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--muted);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.switch-label {
+  color: var(--muted);
+  transition: color .2s ease, text-shadow .2s ease;
+}
+
+.switch-wrap.on .switch-label {
+  color: var(--green-soft);
+  text-shadow: 0 0 16px rgba(55,178,108,.18);
+}
+
+.switch {
+  position: relative;
+  display: inline-block;
+  width: 48px;
+  height: 27px;
+}
+
+.switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: rgba(255,255,255,.06);
+  transition: .2s;
+}
+
+.slider::before {
+  content: "";
+  position: absolute;
+  width: 21px;
+  height: 21px;
+  left: 3px;
+  top: 2px;
+  border-radius: 50%;
+  background: #d9d3c8;
+  box-shadow: 0 2px 8px rgba(0,0,0,.35);
+  transition: .2s;
+}
+
+.switch input:checked + .slider {
+  border-color: rgba(55,178,108,.34);
+  background: rgba(55,178,108,.16);
+}
+
+.switch input:checked + .slider::before {
+  transform: translateX(21px);
+  background: var(--green-soft);
+}
+
+.table-wrap {
+  overflow-x: auto;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: rgba(13,12,20,.58);
+}
+
+table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 13px;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+th {
+  color: var(--gold);
+  background: rgba(244,181,74,.035);
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: .03em;
+}
+
+tr:last-child td {
+  border-bottom: none;
+}
+
+tr:hover td {
+  background: rgba(255,255,255,.018);
+}
+
+.time {
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.title {
+  color: var(--text);
+  font-weight: 700;
+  word-break: break-all;
+}
+
+.title-link {
+  color: var(--text);
+  text-decoration: none;
+  cursor: pointer;
+}
+
+.title-link:hover {
+  color: var(--gold-soft);
+  text-decoration: underline;
+}
+
+.url a {
+  color: var(--gold);
+  text-decoration: none;
+  font-weight: 800;
+}
+
+.url a:hover {
+  text-decoration: underline;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  border-radius: 999px;
+  padding: 4px 9px;
+  font-size: 11px;
+  font-weight: 900;
+  white-space: nowrap;
+}
+
+.tag.hit {
+  color: var(--green-soft);
+  background: rgba(55,178,108,.14);
+  border: 1px solid rgba(55,178,108,.25);
+}
+
+.tag.miss {
+  color: var(--muted);
+  background: rgba(255,255,255,.055);
+  border: 1px solid var(--border);
+}
+
+.tag.pending {
+  color: var(--gold-soft);
+  background: rgba(244,181,74,.08);
+  border: 1px solid rgba(244,181,74,.22);
+}
+
+.tag.fail {
+  color: var(--red-soft);
+  background: rgba(200,62,62,.14);
+  border: 1px solid rgba(200,62,62,.34);
+}
+
+.empty {
+  padding: 30px 12px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 9999;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 16px;
+  background: rgba(4,4,8,.72);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: modalFadeIn .18s ease;
+}
+
+.modal-overlay.hidden {
+  display: none;
+}
+
+@keyframes modalFadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes modalScaleIn {
+  from { opacity: 0; transform: scale(.94) translateY(8px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+.modal-box {
+  width: min(470px, calc(100vw - 32px));
+  max-height: calc(100dvh - 48px);
+  overflow: auto;
+  padding: 24px;
+  border: 1px solid rgba(244,181,74,.23);
+  border-radius: 20px;
+  background:
+    radial-gradient(circle at 100% 0%, rgba(112,76,164,.09), transparent 36%),
+    var(--panel);
+  color: var(--text);
+  box-shadow: 0 28px 120px rgba(0,0,0,.55);
+  animation: modalScaleIn .20s ease;
+}
+
+.modal-title {
+  margin-bottom: 10px;
+  color: var(--gold);
+  font-size: 18px;
+  font-weight: 850;
+}
+
+.modal-body {
+  margin-bottom: 16px;
+  color: var(--muted);
+  font-size: 14px;
+  line-height: 1.7;
+}
+
+.pin-input {
+  width: 100%;
+  height: 48px;
+  margin: 2px 0 8px;
+  padding: 0 14px;
+  outline: none;
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  background: var(--field);
+  color: var(--text);
+  font-size: 20px;
+  letter-spacing: 8px;
+  text-align: center;
+  transition: border-color .15s ease, box-shadow .15s ease;
+}
+
+.pin-input:focus {
+  border-color: rgba(244,181,74,.65);
+  box-shadow: 0 0 0 3px rgba(244,181,74,.08);
+}
+
+.modal-error {
+  min-height: 22px;
+  margin-bottom: 12px;
+  color: var(--red-soft);
+  font-size: 13px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.modal-actions button {
+  min-width: 86px;
+}
+
+@media (max-width: 760px) {
+  body {
+    padding: 14px 10px 26px;
+  }
+
+  .wrap {
+    width: min(100%, 680px);
+  }
+
+  .hero {
+    padding: 22px 18px 24px;
+    border-radius: 22px;
+  }
+
+  .hero::before {
+    left: 18px;
+    right: 18px;
+  }
+
+  .hero::after {
+    right: 18px;
+    bottom: 10px;
+    font-size: 8px;
+  }
+
+  .hero-line {
+    align-items: flex-start;
+  }
+
+  h1 {
+    font-size: 30px;
+  }
+
+  .switch-group {
+    flex-direction: column;
+    align-items: flex-end;
+    gap: 10px;
+  }
+
+  .card {
+    padding: 18px;
+    border-radius: 18px;
+  }
+
+  .keyword-card::before,
+  .log-card::before {
+    margin: -18px -4px 18px;
+  }
+
+  .keyword-header,
+  .log-head {
+    align-items: flex-start;
+  }
+
+  .title-rule {
+    display: block;
+    margin-top: 4px;
+  }
+
+  textarea {
+    min-height: 92px;
+    font-size: 14px;
+  }
+
+  .log-actions {
+    gap: 8px;
+  }
+
+  .log-left {
+    gap: 7px;
+  }
+
+  .log-actions button,
+  .log-left button {
+    min-width: 0;
+    min-height: 34px;
+    padding: 7px 10px;
+    border-radius: 10px;
+    font-size: 11px;
+  }
+
+  .modal-box {
+    padding: 20px;
+    border-radius: 17px;
+  }
+}
+
+@media (max-width: 430px) {
+  .hero-line {
+    gap: 12px;
+  }
+
+  h1 {
+    font-size: 27px;
+    letter-spacing: .05em;
+  }
+
+  .switch-wrap {
+    gap: 7px;
+    font-size: 12px;
+  }
+
+  .keyword-header {
+    display: grid;
+    grid-template-columns: minmax(0,1fr) auto;
+    align-items: start;
+  }
+
+  .keyword-title {
+    font-size: 17px;
+  }
+
+  .modal-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+  }
+
+  .modal-actions button {
+    width: 100%;
+    min-width: 0;
+  }
+}
+"""
 
 _RSS_LOG_WRITE_LOCK = threading.Lock()
 _STATE_WRITE_LOCK = threading.Lock()
@@ -60,7 +841,7 @@ _KEYWORDS_WRITE_LOCK = threading.Lock()
 
 DEFAULT_URL = "https://rss.nodeseek.com/?sortBy=postTime"
 DEFAULT_WEB_HOST = os.environ.get("NODE_WEB_HOST", "0.0.0.0")
-DEFAULT_WEB_PORT = int(os.environ.get("NODE_WEB_PORT", "8068"))
+DEFAULT_WEB_PORT = int(os.environ.get("NODE_WEB_PORT", "8168"))
 DEFAULT_WEB_PIN = "0819"
 MAX_REQUEST_SIZE = 1024 * 1024
 REQUEST_TIMEOUT = 30
@@ -82,14 +863,32 @@ except Exception:
     SHANGHAI_TZ = timezone(timedelta(hours=8), name="Asia/Shanghai")
 
 
+def server_local_now() -> datetime:
+    """读取操作系统当前本地时区及系统时钟（无需强制修改服务器 TZ）。"""
+    return datetime.now().astimezone()
+
+
 def shanghai_now() -> datetime:
-    """始终返回上海时间，不受 VPS 本机时区影响。"""
-    return datetime.now(SHANGHAI_TZ)
+    """将服务器当前时间转换为上海时间，兼容 UTC/日本/欧洲等 VPS 时区。"""
+    return server_local_now().astimezone(SHANGHAI_TZ)
 
 
-def is_shanghai_quiet_hours() -> bool:
-    """上海时间 00:00 <= time < 08:00 时强制静默。"""
-    return 0 <= shanghai_now().hour < 8
+def is_shanghai_quiet_hours(at: Optional[datetime] = None) -> bool:
+    """上海时间 [22:30, 次日08:00) 强制 ntfy Priority=1。"""
+    current = shanghai_now() if at is None else at.astimezone(SHANGHAI_TZ)
+    minute_of_day = current.hour * 60 + current.minute
+    return minute_of_day >= (22 * 60 + 30) or minute_of_day < 8 * 60
+
+
+def server_clock_info() -> Dict[str, object]:
+    local = server_local_now()
+    shanghai = local.astimezone(SHANGHAI_TZ)
+    return {
+        "server_local_time": local.isoformat(timespec="seconds"),
+        "server_timezone": local.tzname() or local.strftime("%z"),
+        "shanghai_time": shanghai.isoformat(timespec="seconds"),
+        "quiet_hours": is_shanghai_quiet_hours(shanghai),
+    }
 
 
 def ensure_workdir() -> None:
@@ -680,8 +1479,8 @@ class NodeMonitor:
             priority = (self.config.get("NTFY_PRIORITY", "3") or "3").strip()
         if priority not in {"1", "2", "3", "4", "5"}:
             priority = "3"
-        # 夜间静默规则放在最终发送层：覆盖普通、手动、测试以及显式高优先级推送。
-        # 上海时间 00:00-08:00 强制 Priority=1；08:00 后恢复调用方/配置原有优先级。
+        # 最终发送层统一执行上海时间 22:30-次日08:00 静默规则；
+        # 其余时间使用用户设定的优先级（包括补充/原静默关键词推送）。
         if is_shanghai_quiet_hours():
             priority = "1"
         if not url or not topic:
@@ -1017,7 +1816,7 @@ class NodeMonitor:
 
     def _collect_silent_matches(self, window: int, mark_sent: bool) -> Tuple[str, List[str]]:
         self.reload_config()
-        return self._collect_matches_for(self.config.get("SILENT_KEYWORDS", ""), window, mark_sent, tag="node🔕")
+        return self._collect_matches_for(self.config.get("SILENT_KEYWORDS", ""), window, mark_sent, tag="node补充")
 
     def _mark_sent(self, ids: List[str]) -> None:
         changed = False
@@ -1048,7 +1847,7 @@ class NodeMonitor:
                 self._update_rss_push_status(ids_to_mark, "推送失败")
                 failed += 1
         if silent_text and silent_ids:
-            if self.ntfy_send(silent_text, priority="1"):
+            if self.ntfy_send(silent_text):
                 self._mark_sent(silent_ids)
                 self._update_rss_push_status(silent_ids, "已推送")
                 self.logger.event(f"[node] 静默关键词推送成功 {len(silent_ids)} 条")
@@ -1070,7 +1869,7 @@ class NodeMonitor:
         total = 0
         if text and ids_to_mark and self.send_message(text):
             total += len(ids_to_mark)
-        if silent_text and silent_ids and self.ntfy_send(silent_text, priority="1"):
+        if silent_text and silent_ids and self.ntfy_send(silent_text):
             total += len(silent_ids)
         return total if total else -1
 
@@ -1240,14 +2039,8 @@ def build_keyword_handler(cfg: Dict[str, str]):
             self.wfile.write(body)
 
         def _send_skin(self) -> None:
-            try:
-                body = SKIN_FILE.read_bytes()
-            except FileNotFoundError:
-                self.send_error(404, "Skin file not found")
-                return
-            except Exception as exc:
-                self.send_error(500, f"Skin file read failed: {exc}")
-                return
+            # 仅兼容旧浏览器缓存的 /node_skin.css 请求，实际页面不再引用它。
+            body = INLINE_SKIN_CSS.encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/css; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
@@ -1273,7 +2066,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
                     self._send_skin()
                     return
                 if parsed.path == "/api/runtime-status":
-                    self._send_json({"ok": True, "enabled": is_run_enabled(), "server_time": now_str()})
+                    self._send_json({"ok": True, "enabled": is_run_enabled(), "server_time": now_str(), **server_clock_info()})
                     return
                 if parsed.path == "/api/rss-logs":
                     query = parse_qs(parsed.query, keep_blank_values=True)
@@ -1420,7 +2213,9 @@ def build_keyword_handler(cfg: Dict[str, str]):
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <title>node捕鲨</title>
-  <link rel="stylesheet" href="/node_skin.css?v=20261006_shark_inline">
+  <style id="node-inline-skin">
+__INLINE_SKIN_CSS__
+  </style>
 </head>
 <body>
   <div class="wrap">
@@ -1446,7 +2241,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
         </div>
           <textarea id="keywords" name="keywords" spellcheck="false" __READONLY__ placeholder="例如：抽奖 甲&乙 amd&7950x&盒装&国行">__SAFE_KEYWORDS__</textarea>
         <div class="keyword-header silent-header">
-          <h2 class="keyword-title">静默关键词 <span class="title-rule">采用空格间隔，&amp;表示与关系</span></h2>
+          <h2 class="keyword-title">补充关键词 <span class="title-rule">采用空格间隔，&amp;表示与关系；推送优先级按时段执行</span></h2>
         </div>
           <textarea id="silent_keywords" name="silent_keywords" spellcheck="false" __READONLY__ placeholder="例如：开机 测速&结果">__SAFE_SILENT_KEYWORDS__</textarea>
         <div id="keywordMessage" class="__MSG_CLASS__">__SAFE_MESSAGE__</div>
@@ -1840,6 +2635,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
 </body>
 </html>'''
             html_doc = (html_doc
+                .replace("__INLINE_SKIN_CSS__", INLINE_SKIN_CSS)
                 .replace("__SAFE_KEYWORDS__", safe_keywords)
                 .replace("__SAFE_SILENT_KEYWORDS__", safe_silent_keywords)
                 .replace("__SAFE_MESSAGE__", safe_message)
@@ -1849,6 +2645,7 @@ def build_keyword_handler(cfg: Dict[str, str]):
             payload = html_doc.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.send_header("Content-Length", str(len(payload)))
             self.end_headers()
             self.wfile.write(payload)
@@ -1954,6 +2751,9 @@ def cmd_test() -> int:
 
 
 def cmd_status() -> int:
+    clock = server_clock_info()
+    print(f"服务器本地时间: {clock['server_local_time']} ({clock['server_timezone']})")
+    print(f"上海时间: {clock['shanghai_time']} | 静默优先级: {'1' if clock['quiet_hours'] else '使用配置值'}")
     pid = read_pid(PID_FILE)
     if pid and (is_target_process(pid, ["node.py", "run"]) or is_target_process(pid, ["node.py", "run-all"])):
         print(f"RUNNING pid={pid}")
@@ -2060,7 +2860,7 @@ def cmd_run_all() -> int:
                 cfg = load_runtime_config()
                 server = build_keyword_web_server(cfg)
                 settings = keyword_web_settings(cfg)
-                print(f"node run-all started; monitor interval={max(15, safe_int(cfg.get('INTERVAL_SEC', '15'), 15))}s; keyword web={settings['url']}", flush=True)
+                print(f"node run-all started; monitor interval={max(15, safe_int(cfg.get('INTERVAL_SEC', '15'), 15))}s; keyword web={settings['url']}; server-clock={server_clock_info()}", flush=True)
                 web_startup_retries = 0
 
                 def watch_restart(svr):
