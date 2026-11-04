@@ -1,20 +1,10 @@
-# TcpQuality · 上海三网 IPv4 专用版
+# 上海三网 IPv4 专用版
 
 修改自 [ibsgss/TcpQuality](https://github.com/ibsgss/TcpQuality)（GPL-3.0-only）。
-此目录仅包含运行必需的脚本、测速辅助源码、GPL 许可证及本使用说明；不包含 CI、beta、无关项目文件。
 
 ## 启动方式
-
-上传本目录到 `https://github.com/byilrq/vps/tree/main/tcpquality` 后，在 Linux VPS 执行：
-
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/byilrq/vps/main/tcpquality/runTcpQuality.sh)
-```
-
-若无法使用 bash 进程替换，也可以先克隆或下载本目录，然后执行：
-
-```bash
-bash runTcpQuality.sh
 ```
 
 启动菜单只问三项，各自 `y/n`，**直接回车为 `y`**：
@@ -28,11 +18,6 @@ bash runTcpQuality.sh
 
 ## 说明
 
-- 默认使用临时 Debian rootfs 环境，需 Linux root。首次运行将下载运行环境、自动准备依赖及 nexttrace-tiny；运行完自动清理。预构建 rootfs 来源为原项目，不属于本目录代码文件。
-- 测试进程共享宿主网络命名空间，探测的是运行脚本 VPS 的网络回程，不会改变业务路由。
-- 默认不上传在线报告或参与排行榜；结果直接显示并保存为 VPS `/tmp/zstatic_nping_*.csv`。
-- 使用 `--no-rootfs` 可直接在宿主运行（需自行满足 `curl`、`nmap/nping`、`traceroute` 等依赖及大包测试 `nexttrace-tiny`）；可能因缺依赖触发程序自动安装。
-- 使用 `--debug` 可保留调试数据。
 - 单线程测速可能产生较大数据流量；实际测速节点和链路可用性依赖上游服务。
 
 ## 文件
