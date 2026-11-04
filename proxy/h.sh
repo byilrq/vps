@@ -544,7 +544,6 @@ save_hy2_state() {
   [[ -n "$state_cert_mode" ]] || state_cert_mode="unknown"
   state_service=$(get_hysteria_service_name)
   state_masquerade=$(grep -E '^\s*url:\s*https?://' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
-  [[ -n "$state_masquerade" ]] || state_masquerade="builtin"
   state_tcp443=$(get_hy2_tcp443_mode /etc/hysteria/config.yaml)
 
   mkdir -p /etc/hysteria >/dev/null 2>&1 || true
@@ -1348,74 +1347,46 @@ inst_pwd() {
 }
 
 # -----------------------------
-# 函数：配置 HY2 的 HTTP/3 伪装响应（不再要求外部网站域名）
-# 注意：masquerade 仅控制普通网页请求的响应，不改变 TLS SNI。
+# 函数：配置伪装站点
 # -----------------------------
 inst_site() {
-  local siteInput local_wow_port
   echo ""
-  green "Hysteria 2 网页伪装响应："
-  echo -e " ${GREEN}1.${PLAIN} 内置静态响应${YELLOW}（默认，不需要其他网站域名）${PLAIN}"
-  echo -e " ${GREEN}2.${PLAIN} 本机 WoW 注册站${YELLOW}（http://127.0.0.1:8080）${PLAIN}"
+  green "Hysteria 2 伪装站点模式如下："
+  echo -e " ${GREEN}1.${PLAIN} 外部伪装站${YELLOW}（默认，例如 video.unext.jp）${PLAIN}"
+  echo -e " ${GREEN}2.${PLAIN} 本机 WoW 注册站${YELLOW}（http://127.0.0.1:8080，需要先安装 wow.py local_proxy 模式）${PLAIN}"
   echo ""
 
   while true; do
-    read_confirmed siteInput "请选择 [1-2]（回车默认 1）: " "1" || return 1
+    read_confirmed siteInput "请选择伪装站模式 [1-2]（回车默认 1）: " "1" || return 1
     [[ "$siteInput" =~ ^[1-2]$ ]] && break
     red "选项无效，请输入 1 或 2。"
   done
 
   if [[ "$siteInput" == "2" ]]; then
-    while true; do
-      read_confirmed local_wow_port "请输入本机 WoW 注册站端口（回车默认 8080）: " "8080" || return 1
-      if [[ "$local_wow_port" =~ ^[0-9]+$ ]] &&
-          (( 10#$local_wow_port >= 1 && 10#$local_wow_port <= 65535 )); then
-        break
-      fi
-      red "端口必须是 1-65535 的数字。"
-    done
-    masquerade_mode="local"
+    read_confirmed local_wow_port "请输入本机 WoW 注册站端口（回车默认 8080）: " "8080" || return 1
+    if [[ ! "$local_wow_port" =~ ^[0-9]+$ ]]; then
+      red "端口必须是数字"
+      return 1
+    fi
+    proxysite="127.0.0.1:$local_wow_port"
     masquerade_url="http://127.0.0.1:$local_wow_port"
-    yellow "已选择本机网站伪装：$masquerade_url（与 SNI 无关）"
-    yellow "请确认本机网站可通过 curl -I $masquerade_url 访问。"
+    masquerade_rewrite_host="false"
+    yellow "伪装站点：本机 WoW 注册站 $masquerade_url"
+    yellow "提示：请确认本机测试 curl -I http://127.0.0.1:$local_wow_port 可以返回 200/301/302。"
     return 0
   fi
 
-  masquerade_mode="builtin"
-  masquerade_url=""
-  green "已选择内置 HTTP/3/HTTPS 响应，不使用第三方网站域名。"
-}
-
-# 共用的伪装配置输出：供安装与修改菜单复用。
-# HTTPS 回落开关仅影响 TCP 443，HY2 UDP 主端口保持独立。
-render_hy2_masquerade_block() {
-  local mode="${1:-builtin}" url="${2:-}" https_enabled="${3:-false}"
-  if [[ "$mode" == "local" ]]; then
-    [[ "$url" =~ ^http://127\.0\.0\.1:[0-9]+$ ]] || { red "本机伪装地址无效。"; return 1; }
-    cat <<EOF
-masquerade:
-  type: proxy
-  proxy:
-    url: $url
-    rewriteHost: false
-EOF
-  elif [[ "$mode" == "builtin" ]]; then
-    cat <<'EOF'
-masquerade:
-  type: string
-  string:
-    content: "Welcome"
-    headers:
-      content-type: text/plain
-    statusCode: 200
-EOF
-  else
-    red "不支持的网页伪装模式：$mode"
-    return 1
-  fi
-  if [[ "$https_enabled" == "true" ]]; then
-    printf '  listenHTTPS: :443\n'
-  fi
+  while true; do
+    read_confirmed proxysite "请输入外部伪装网站地址（去除 https://） [回车默认：video.unext.jp]: " "video.unext.jp" || return 1
+    proxysite="$(normalize_host_input "$proxysite")"
+    if is_valid_domain "$proxysite"; then
+      masquerade_url="https://$proxysite"
+      masquerade_rewrite_host="true"
+      yellow "伪装站点：$masquerade_url"
+      return 0
+    fi
+    red "伪装网站域名格式无效：$proxysite"
+  done
 }
 
 # -----------------------------
@@ -1715,7 +1686,7 @@ insthysteria() {
     return 1
   fi
 
-  green "步骤 3/4：配置证书、端口、密码、网页伪装响应"
+  green "步骤 3/4：配置证书、端口、密码、伪装站点"
   inst_cert || return 1
   inst_port || return 1
   inst_pwd || return 1
@@ -1764,8 +1735,16 @@ auth:
   password: $auth_pwd
 
 speedTest: true
+
+masquerade:
+  type: proxy
+  proxy:
+    url: ${masquerade_url:-https://$proxysite}
+    rewriteHost: ${masquerade_rewrite_host:-true}
 EOF
-  render_hy2_masquerade_block "$masquerade_mode" "$masquerade_url" "$tcp443_enabled" >> /etc/hysteria/config.yaml || return 1
+  if [[ "$tcp443_enabled" == "true" ]]; then
+    echo '  listenHTTPS: :443' >> /etc/hysteria/config.yaml
+  fi
 
   cat > /root/hy/hy-client.yaml <<EOF
 server: $share_host:$port
@@ -2214,75 +2193,52 @@ change_cert() {
 }
 
 # -----------------------------
-# 函数：修改 HY2 网页伪装响应（无外部网站域名）
-# 仅替换 masquerade 节，保留其它顶级配置；重启失败自动恢复。
+# 函数：修改伪装站点
 # -----------------------------
 changeproxysite() {
-  local config_file="/etc/hysteria/config.yaml"
-  local current_port current_domain current_cert_mode hy_service current_tcp443
-  local new_block tmp_backup tmp_config
-  [[ -s "$config_file" ]] || { red "请先安装 Hysteria 2。"; return 1; }
-  command -v python3 >/dev/null 2>&1 || { red "缺少 python3，无法安全编辑 YAML。"; return 1; }
+  local current_port current_domain current_cert_mode hy_service target_url target_rewrite
+  load_hy2_state >/dev/null 2>&1 || true
 
   inst_site || return 1
-  current_tcp443=$(get_hy2_tcp443_mode "$config_file")
-  new_block=$(render_hy2_masquerade_block "$masquerade_mode" "$masquerade_url" "$current_tcp443") || return 1
+  target_url="${masquerade_url:-https://$proxysite}"
+  target_rewrite="${masquerade_rewrite_host:-true}"
 
-  tmp_backup=$(mktemp /etc/hysteria/.hpro-masq-backup.XXXXXXXX) || return 1
-  tmp_config=$(mktemp /etc/hysteria/.hpro-masq-config.XXXXXXXX) || { rm -f "$tmp_backup"; return 1; }
-  if ! cp -p "$config_file" "$tmp_backup" ||
-     ! python3 - "$config_file" "$tmp_config" "$new_block" <<'PYC'
-import re
-import sys
+  python3 - "$target_url" "$target_rewrite" <<'PYC'
 from pathlib import Path
-source, output, block = sys.argv[1:]
-s = Path(source).read_text(encoding='utf-8')
-match = re.search(r'(?m)^masquerade:[ \t]*(?:#.*)?$', s)
-if match:
-    tail = s[match.end():]
-    next_top = re.search(r'(?m)^[A-Za-z_][A-Za-z0-9_-]*:[ \t]*', tail)
-    end = match.end() + next_top.start() if next_top else len(s)
-    new_s = s[:match.start()].rstrip() + '\n\n' + block.rstrip() + '\n'
-    if next_top:
-        new_s += '\n' + s[end:].lstrip('\n')
+import sys
+p = Path('/etc/hysteria/config.yaml')
+s = p.read_text()
+url = sys.argv[1]
+rewrite = sys.argv[2]
+start = s.find('masquerade:')
+# 只替换回落目标，保留用户原有的 TCP 443 开关状态。
+https_line = '  listenHTTPS: :443\n' if any(
+    line.strip() == 'listenHTTPS: :443' for line in s.splitlines()
+) else ''
+block = f"""masquerade:
+  type: proxy
+  proxy:
+    url: {url}
+    rewriteHost: {rewrite}
+{https_line}"""
+if start >= 0:
+    before = s[:start].rstrip() + '\n\n'
 else:
-    new_s = s.rstrip() + '\n\n' + block.rstrip() + '\n'
-Path(output).write_text(new_s, encoding='utf-8')
+    before = s.rstrip() + '\n\n'
+p.write_text(before + block)
 PYC
-  then
-    rm -f "$tmp_backup" "$tmp_config"
-    red "编辑伪装配置失败，原有服务不受影响。"
-    return 1
-  fi
 
-  cp "$tmp_config" "$config_file" || { cp -p "$tmp_backup" "$config_file"; rm -f "$tmp_backup" "$tmp_config"; red "写入配置失败，已恢复原配置。"; return 1; }
-  rm -f "$tmp_config"
-  fix_hysteria_file_perms
-  hy_service=$(get_hysteria_service_name)
-  if ! systemctl restart "$hy_service" || ! systemctl is-active --quiet "$hy_service"; then
-    cp -p "$tmp_backup" "$config_file"
-    fix_hysteria_file_perms
-    systemctl restart "$hy_service" >/dev/null 2>&1 || true
-    rm -f "$tmp_backup"
-    red "新伪装配置启动失败，已恢复原配置。"
-    journalctl -u "$hy_service" -n 15 --no-pager 2>/dev/null || true
-    return 1
-  fi
-  rm -f "$tmp_backup"
-
-  load_hy2_state >/dev/null 2>&1 || true
-  current_port=$(get_hy2_listen_port "$config_file")
+  current_port=$(get_hy2_listen_port /etc/hysteria/config.yaml)
   current_domain=$(grep -E '^\s*sni:' /root/hy/hy-client.yaml 2>/dev/null | awk '{print $2}' | tr -d '\r')
   current_cert_mode=$(grep -E '^HY2_CERT_MODE=' "$HY2_STATE_FILE" 2>/dev/null | cut -d= -f2-)
   save_hy2_state "$current_port" "${HY2_FIRST_PORT:-}" "${HY2_END_PORT:-}" "$current_domain" "$current_cert_mode"
+  fix_hysteria_file_perms
   save_firewall_rules
+  hy_service=$(get_hysteria_service_name)
+  systemctl restart "$hy_service" >/dev/null 2>&1 || true
   systemctl restart hysteria-boot-fix.service >/dev/null 2>&1 || true
 
-  if [[ "$masquerade_mode" == "local" ]]; then
-    green "网页伪装已改为：本机网站 $masquerade_url"
-  else
-    green "网页伪装已改为：内置静态响应（不再访问第三方域名）。"
-  fi
+  green "伪装网站已修改为：$target_url"
   showconf
 }
 
@@ -2360,7 +2316,7 @@ menu_hy_conf() {
     echo -e " ${GREEN}2.${tianlan} 修改跳变端口"
     echo -e " ${GREEN}3.${tianlan} 修改密码"
     echo -e " ${GREEN}4.${tianlan} 修改证书类型/路径"
-    echo -e " ${GREEN}5.${tianlan} 修改网页伪装响应（内置/本机）"
+    echo -e " ${GREEN}5.${tianlan} 修改伪装网站"
     echo -e " ${GREEN}6.${tianlan} 设置 TCP 443 HTTPS 回落监听"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回"
