@@ -198,69 +198,254 @@ EOF
 }
 
 # -----------------------------
-# 3) Swap cache - keep only /swapfile
+# 3) Swap - set an absolute target, never increment existing swap
 # -----------------------------
-swap_cache() {
-  need_root
-  local size_mb confirm fs_type keep="/swapfile"
+swap_cache() (
+  need_root || exit 1
 
-  echo "当前 Swap："
+  local keep="/swapfile" size_mb confirm cur_file_mb
+  local used_kb used_mb available_mb bridge_mb free_mb need_mb
+  local stage="" old_backup="" fstab_backup="" fstab_temp=""
+  local stage_active=0 new_active=0 new_created=0 old_saved=0 fstab_changed=0 committed=0
+  local fs_type stamp sw i is_active rc
+  local -a old_swaps=()
+
+  # The function runs in a subshell: traps and transient state cannot leak into other menus.
+  swap_make_file() {
+    local path="$1" mb="$2" kind
+    kind="$(stat -f -c %T "$(dirname "$path")" 2>/dev/null)" || return 1
+    (umask 077; : > "$path") || return 1
+    chmod 600 "$path" || return 1
+    if [[ "$kind" == "btrfs" ]]; then
+      if ! command -v chattr >/dev/null 2>&1 || ! chattr +C "$path" >/dev/null 2>&1; then
+        red "Btrfs 文件无法设置 NOCOW，已中止以免创建不可用的 SWAP。"
+        return 1
+      fi
+    fi
+    if ! command -v fallocate >/dev/null 2>&1 || ! fallocate -l "${mb}M" "$path" 2>/dev/null; then
+      yellow "fallocate 不可用，改用 dd 创建 ${mb} MiB 文件。"
+      dd if=/dev/zero of="$path" bs=1M count="$mb" conv=fsync status=none || return 1
+    fi
+    [[ "$(stat -c %s "$path" 2>/dev/null)" == "$((mb * 1048576))" ]] || return 1
+    mkswap "$path" >/dev/null 2>&1 || return 1
+  }
+
+  swap_is_active() {
+    awk -v name="$1" 'NR>1 && $1==name {found=1} END {exit !found}' /proc/swaps
+  }
+
+  # Report total active swap usage, including partitions and files.
+  # /proc/swaps uses KiB; keep percentages accurate for multi-swap systems.
+  swap_show_usage() {
+    local label="$1" summary
+    if [[ ! -r /proc/swaps ]]; then
+      yellow "${label} SWAP：无法读取占用率（/proc/swaps 不可用）"
+      return 0
+    fi
+    summary="$(awk '
+      NR > 1 {total += $3; used += $4}
+      END {
+        pct = (total > 0 ? 100 * used / total : 0)
+        printf "总量 %.1f MiB，已用 %.1f MiB，占用率 %.2f%%", total / 1024, used / 1024, pct
+      }
+    ' /proc/swaps)" || return 0
+    green "${label} SWAP：${summary}"
+  }
+
+  swap_rollback() {
+    rc="$1"
+    trap - EXIT HUP INT TERM
+    (( committed == 1 )) && return 0
+    yellow "SWAP 设置未完成，正在尽可能恢复原状态..."
+
+    if (( fstab_changed == 1 )) && [[ -f "$fstab_backup" ]]; then
+      cp -p "$fstab_backup" /etc/fstab || red "无法自动恢复 /etc/fstab，请检查备份 $fstab_backup"
+    fi
+    if (( new_active == 1 )); then
+      if ! swapoff "$keep" 2>/dev/null; then
+        red "新的 $keep 无法停用，保留文件和原备份；请人工检查 swapon --show。"
+        return 0
+      fi
+    fi
+    if (( new_created == 1 )); then
+      rm -f -- "$keep"
+    fi
+    if (( old_saved == 1 )) && [[ -f "$old_backup" ]]; then
+      mv -f -- "$old_backup" "$keep" || red "无法还原旧 SWAP 文件：$old_backup"
+    fi
+    for sw in "${old_swaps[@]}"; do
+      if ! swap_is_active "$sw"; then
+        swapon "$sw" 2>/dev/null || red "无法重新启用旧 SWAP：$sw"
+      fi
+    done
+    if (( stage_active == 1 )); then
+      if ! swapoff "$stage" 2>/dev/null; then
+        red "临时 SWAP 无法停用，请检查：$stage"
+      else
+        stage_active=0
+      fi
+    fi
+    if (( stage_active == 0 )) && [[ -n "$stage" ]]; then
+      rm -f -- "$stage"
+    fi
+    [[ -n "$fstab_temp" ]] && rm -f -- "$fstab_temp"
+    red "未完成目标设置。请通过 swapon --show 检查当前 SWAP。"
+    swap_show_usage "失败回滚后"
+    return 0
+  }
+
+  echo "当前 SWAP："
+  swapon --show 2>/dev/null || true
   free -h | awk 'NR==1 || /Swap:/ {print}'
+  swap_show_usage "修改前"
   echo ""
+  echo "输入的是最终目标容量，不是在现有 SWAP 上增加。"
+  echo "单位：MiB（通常简称 MB），最小 512；例如 512 / 1024 / 1536 / 2048。"
+  echo "输入 q 可取消。"
+  while true; do
+    read -rp "请输入最终 SWAP 容量（MB，最小 512）: " size_mb || return 0
+    case "$size_mb" in
+      q|Q) yellow "已取消"; return 0 ;;
+    esac
+    if [[ ! "$size_mb" =~ ^[0-9]{1,7}$ ]]; then
+      red "请输入不小于 512 的整数 MB。"
+      continue
+    fi
+    size_mb=$((10#$size_mb))
+    if (( size_mb < 512 )); then
+      red "最小允许 512 MB，不能输入 $size_mb MB。"
+      continue
+    fi
+    break
+  done
 
-  read -rp "请输入 Swap 大小（MB，建议 >=512）: " size_mb
-  [[ "$size_mb" =~ ^[0-9]+$ ]] || { red "请输入有效数字"; return 1; }
+  [[ -r /proc/swaps ]] || { red "无法读取 /proc/swaps，无法安全设置。"; return 1; }
+  [[ ! -L "$keep" ]] || { red "$keep 是符号链接，拒绝覆盖。"; return 1; }
+  [[ ! -e "$keep" || -f "$keep" ]] || { red "$keep 不是普通文件，拒绝覆盖。"; return 1; }
+  [[ -f /etc/fstab ]] || { red "未找到 /etc/fstab，拒绝修改。"; return 1; }
+  for sw in swapon swapoff mkswap awk stat df cp mv mktemp; do
+    command -v "$sw" >/dev/null 2>&1 || { red "缺少必需命令：$sw"; return 1; }
+  done
 
-  read -rp "确认创建/重建 Swap=${size_mb}MB ? (y/n): " confirm
+  mapfile -t old_swaps < <(awk 'NR>1 {print $1}' /proc/swaps)
+  used_kb="$(awk 'NR>1 {sum+=$4} END {printf "%.0f", sum+0}' /proc/swaps)"
+  used_mb=$(( (used_kb + 1023) / 1024 ))
+  available_mb="$(awk '/^MemAvailable:/ {printf "%.0f", $2/1024}' /proc/meminfo)"
+  [[ "$available_mb" =~ ^[0-9]+$ ]] || available_mb=0
+  bridge_mb=$((used_mb + 128))
+  (( bridge_mb < 512 )) && bridge_mb=512
+
+  if (( size_mb + available_mb < used_mb + 64 )); then
+    red "当前已用 SWAP 约 ${used_mb}MiB、可用内存约 ${available_mb}MiB；目标 ${size_mb}MiB 可能无法容纳。"
+    yellow "请先降低内存占用，避免缩小 SWAP 时导致内存耗尽。"
+    return 1
+  fi
+  free_mb="$(df -Pm / | awk 'NR==2 {print $4}')"
+  [[ "$free_mb" =~ ^[0-9]+$ ]] || { red "无法读取磁盘剩余空间。"; return 1; }
+  need_mb=$((size_mb + bridge_mb + 64))
+  if (( free_mb < need_mb )); then
+    red "磁盘空间不足：至少需要约 ${need_mb}MiB 空闲，当前仅 ${free_mb}MiB。"
+    yellow "采用安全过渡方案，不会先删除正在使用的 SWAP 文件。"
+    return 1
+  fi
+
+  cur_file_mb=0
+  if [[ -f "$keep" ]]; then
+    cur_file_mb=$(( $(stat -c %s "$keep") / 1048576 ))
+  fi
+  if (( ${#old_swaps[@]} == 1 )) && [[ "${old_swaps[0]}" == "$keep" ]] &&
+     [[ -f "$keep" ]] && [[ "$(stat -c %s "$keep")" == "$((size_mb * 1048576))" ]]; then
+    green "当前已是唯一活动 SWAP，文件大小正好 ${size_mb}MiB，无需增加或重建。"
+    swap_show_usage "修改后（无需变更）"
+    return 0
+  fi
+
+  echo ""
+  echo "目标文件：$keep（${size_mb}MiB）"
+  echo "当前活跃 SWAP：${#old_swaps[@]} 个；当前已用约 ${used_mb}MiB"
+  echo "安全过渡临时 SWAP：${bridge_mb}MiB（完成后自动关闭和删除）"
+  yellow "本操作会停用其他活动 SWAP，并注释 /etc/fstab 中其余 SWAP 项。"
+  yellow "原有其他 SWAP 文件或分区不会被删除；重启后也只自动启用 /swapfile。"
+  read -rp "确认将 SWAP 最终设置为 ${size_mb}MiB？(y/N): " confirm || return 0
   [[ "$confirm" =~ ^[Yy]$ ]] || { yellow "已取消"; return 0; }
 
-  while read -r sw; do
-    [[ -z "$sw" ]] && continue
-    [[ "$sw" == "$keep" ]] && continue
-    swapoff "$sw" >/dev/null 2>&1 || true
-    if [[ -f /etc/fstab ]]; then
-      sed -i -E "s|^(\s*${sw//\//\\/}\s+.*\s+swap\s+.*)$|# disabled_by_swap_cache: \1|g" /etc/fstab >/dev/null 2>&1 || true
+  stamp="$(date +%Y%m%d_%H%M%S)"
+  stage="/swapfile.sysconf-stage-${stamp}-$$"
+  old_backup="/swapfile.sysconf-old-${stamp}-$$"
+  fstab_backup="/etc/fstab.sysconf-swap-${stamp}-$$.bak"
+  trap 'swap_rollback "$?"' EXIT
+  trap 'exit 1' HUP INT TERM
+
+  cp -p /etc/fstab "$fstab_backup" || { red "无法备份 /etc/fstab"; exit 1; }
+  echo "[1/5] 创建过渡 SWAP ..."
+  swap_make_file "$stage" "$bridge_mb" || { red "临时 SWAP 创建失败。"; exit 1; }
+  swapon "$stage" || { red "临时 SWAP 启用失败。"; exit 1; }
+  stage_active=1
+
+  echo "[2/5] 停用原有 SWAP ..."
+  for sw in "${old_swaps[@]}"; do
+    if ! swapoff "$sw"; then
+      red "无法停用旧 SWAP：$sw，已取消本次设置，防止容量叠加。"
+      exit 1
     fi
-    if [[ "$sw" == /* && -f "$sw" ]]; then
-      rm -f "$sw" >/dev/null 2>&1 || true
-    fi
-  done < <(swapon --noheadings --raw --show=NAME 2>/dev/null)
-
-  if swapon --noheadings --raw --show=NAME 2>/dev/null | grep -qx "$keep"; then
-    swapoff "$keep" >/dev/null 2>&1 || true
-  fi
-  rm -f "$keep" >/dev/null 2>&1 || true
-
-  fs_type="$(stat -f -c %T / 2>/dev/null || true)"
-  touch "$keep" || { red "无法创建 $keep"; return 1; }
-
-  if [[ "$fs_type" == "btrfs" ]] && command -v chattr >/dev/null 2>&1; then
-    chattr +C "$keep" >/dev/null 2>&1 || true
+  done
+  if [[ -e "$keep" ]]; then
+    mv -- "$keep" "$old_backup" || { red "无法保存原有 $keep"; exit 1; }
+    old_saved=1
   fi
 
-  if command -v fallocate >/dev/null 2>&1; then
-    if ! fallocate -l "${size_mb}M" "$keep" 2>/dev/null; then
-      yellow "fallocate 失败，改用 dd 创建（会慢一点）"
-      dd if=/dev/zero of="$keep" bs=1M count="${size_mb}" conv=fsync status=progress || { red "dd 创建失败"; rm -f "$keep"; return 1; }
-    fi
-  else
-    yellow "系统无 fallocate，使用 dd 创建（会慢一点）"
-    dd if=/dev/zero of="$keep" bs=1M count="${size_mb}" conv=fsync status=progress || { red "dd 创建失败"; rm -f "$keep"; return 1; }
+  echo "[3/5] 创建新 SWAP（目标 ${size_mb}MiB）..."
+  new_created=1
+  swap_make_file "$keep" "$size_mb" || { red "目标 SWAP 文件创建失败。"; exit 1; }
+  swapon "$keep" || { red "目标 SWAP 启用失败。"; exit 1; }
+  new_active=1
+
+  echo "[4/5] 更新开机配置 ..."
+  fstab_temp="$(mktemp /etc/.fstab.sysconf-swap.XXXXXX)" || exit 1
+  awk '
+    /^[[:space:]]*#/ {print; next}
+    NF >= 3 && $3 == "swap" {
+      if ($1 == "/swapfile") {
+        if (!found) {print "/swapfile none swap sw 0 0"; found=1}
+      } else {
+        print "# disabled_by_sys_conf_swap: " $0
+      }
+      next
+    }
+    {print}
+    END {if (!found) print "/swapfile none swap sw 0 0"}
+  ' /etc/fstab > "$fstab_temp" || exit 1
+  chmod --reference=/etc/fstab "$fstab_temp" || exit 1
+  chown --reference=/etc/fstab "$fstab_temp" || exit 1
+  mv -f -- "$fstab_temp" /etc/fstab || { red "更新 /etc/fstab 失败。"; exit 1; }
+  fstab_temp=""
+  fstab_changed=1
+
+  echo "[5/5] 停用过渡 SWAP 并校验最终容量 ..."
+  if ! swapoff "$stage"; then
+    red "临时 SWAP 无法停用，未达到目标容量；尝试恢复原状态。"
+    exit 1
   fi
+  stage_active=0
+  rm -f -- "$stage"
 
-  chmod 600 "$keep" || { red "chmod 600 失败"; rm -f "$keep"; return 1; }
-  mkswap "$keep" >/dev/null 2>&1 || { red "mkswap 失败（文件系统可能不支持 swapfile）"; rm -f "$keep"; return 1; }
-  swapon "$keep" >/dev/null 2>&1 || { red "swapon 失败（容器限制或文件系统限制）"; rm -f "$keep"; return 1; }
-
-  if ! grep -qE '^\s*/swapfile\s' /etc/fstab 2>/dev/null; then
-    echo "/swapfile none swap sw 0 0" >> /etc/fstab
+  if ! swap_is_active "$keep" || [[ "$(awk 'END {print NR-1}' /proc/swaps)" != "1" ]] ||
+     [[ "$(stat -c %s "$keep")" != "$((size_mb * 1048576))" ]]; then
+    red "最终状态不符合预期，尝试恢复原状态。"
+    exit 1
   fi
+  committed=1
+  trap - EXIT HUP INT TERM
+  [[ "$old_saved" == 0 ]] || rm -f -- "$old_backup" || yellow "旧文件备份清理失败：$old_backup"
 
-  green "Swap 已启用（只保留 /swapfile）："
+  green "已完成：最终 SWAP 文件大小 = ${size_mb}MiB（非增量）。"
+  echo "注意：系统显示的可用 SWAP 容量可能因文件头预留而略小于 ${size_mb}MiB。"
+  echo "fstab 原始备份：$fstab_backup"
   swapon --show
   free -h | awk 'NR==1 || /Swap:/ {print}'
-  read -rp "回车返回菜单..." _
-}
+  swap_show_usage "修改后"
+  read -rp "回车返回菜单..." _ || true
+)
 
 # -----------------------------
 # 4) IPv4 / IPv6 priority
@@ -2333,7 +2518,7 @@ menu_sys_conf() {
     echo -e " ${GREEN}2.${tianlan} 设置firewall"
     echo -e " ${GREEN}3.${tianlan} 设置时区"
     echo -e " ${GREEN}4.${tianlan} 修改 DNS"
-    echo -e " ${GREEN}5.${tianlan} 设置 Swap"
+    echo -e " ${GREEN}5.${tianlan} 设置 Swap（固定容量，最小512MB）"
     echo -e " ${GREEN}6.${tianlan} 设置 SSH"
     echo -e " ${GREEN}7.${tianlan} 设置系统清理"
     echo -e " ${GREEN}8.${tianlan} 设置IP优先级"
