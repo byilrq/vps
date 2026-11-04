@@ -1,7 +1,7 @@
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/proxy/h.sh && bash h.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/proxy/x.sh && bash x.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/proxy/s.sh && bash s.sh
-wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/ntfy.sh && bash ntfy.sh
+wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/ntfy/ntfy.sh && bash ntfy.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/trafficcop/t.sh && bash t.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/node/node.sh && bash node.sh
 wget -N --no-check-certificate https://raw.githubusercontent.com/byilrq/vps/main/domain/domain.sh && bash domain.sh
