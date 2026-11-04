@@ -924,23 +924,25 @@ firewall() {
           pkg_install ufw || { red "安装 ufw 失败"; read -rp "回车返回..." _; continue; }
         fi
 
-        local sshp ports base_ports all_ports p
+        local sshp ports base_ports all_ports
         sshp="$(get_ssh_port)"
-        # 默认业务端口开放 TCP；另行放行 UDP/443（HTTP/3/QUIC），SSH 保留 TCP/UDP。
         base_ports="2222 443 80 8443 2053 8183 8196 8168"
         yellow "当前 SSH 端口：$sshp，将自动放行 tcp/udp 防止失联。"
-        yellow "默认放行 TCP 端口：${base_ports// /、}"
-        yellow "默认放行 UDP 端口：443（HTTP/3/QUIC）"
+        yellow "默认额外放行端口：2222、443(TCP+UDP)、80、8443、2053、8183、8196、8168 (其余TCP)"
         read -rp "请输入需要额外放行的端口（例如：51000-52000，可留空）: " ports
 
-        # 在启用 UFW 前先放行 SSH，避免远程管理端口被暂时封锁。
+        ufw --force enable
         ufw allow "${sshp}/tcp"
         ufw allow "${sshp}/udp"
-        for p in $base_ports; do
-          ufw allow "${p}/tcp"
-        done
+        ufw allow "2222/tcp"
+        ufw allow "443/tcp"
+        ufw allow "80/tcp"
+        # HTTPS/3 QUIC and the previously requested service ports.
         ufw allow "443/udp"
-        ufw --force enable
+        local default_tcp_port
+        for default_tcp_port in 8443 2053 8183 8196 8168; do
+          ufw allow "${default_tcp_port}/tcp"
+        done
 
         ports="${ports//,/ }"
         ports="${ports//，/ }"
@@ -1981,6 +1983,341 @@ EOF
   read -erp "回车返回菜单..." _
 }
 
+# ---------------------------------------------------------
+# 12) TCP BDP buffer tuning (integrated; no external files)
+# Runs in a subshell so its strict mode and helper functions
+# cannot alter the behavior of other sys_conf.sh menu items.
+# ---------------------------------------------------------
+tcp_bdp_tune() (
+  set -euo pipefail
+export LC_ALL=C
+umask 077
+
+VERSION='1.0.0'
+CONF='/etc/sysctl.d/99-zz-tcp-bdp-lite.conf'
+STATE='/var/lib/tcp-bdp-lite'
+BASE="$STATE/original.sysctl"
+HEADER='# tcp-bdp-lite managed configuration'
+KEYS=(
+  net.core.rmem_max
+  net.core.wmem_max
+  net.ipv4.tcp_rmem
+  net.ipv4.tcp_wmem
+  net.ipv4.tcp_mem
+  net.ipv4.tcp_window_scaling
+  net.ipv4.tcp_moderate_rcvbuf
+)
+
+info() { printf '[i] %s\n' "$*"; }
+ok()   { printf '[+] %s\n' "$*"; }
+warn() { printf '[!] %s\n' "$*" >&2; }
+die()  { warn "$*"; exit 1; }
+ask() {
+  local __name="$1" prompt="$2" default="$3" input=''
+  read -r -p "$prompt" input || :
+  printf -v "$__name" '%s' "${input:-$default}"
+}
+need_root() { (( EUID == 0 )) || die '写入或回滚需要 root，请使用 sudo bash tcp-bdp-lite.sh'; }
+check_num() {
+  local n="$1" lower="$2" upper="$3" label="$4"
+  [[ "$n" =~ ^[1-9][0-9]*$ ]] && ((${#n} <= 6)) && ((n >= lower && n <= upper)) \
+    || die "$label 请输入 $lower 到 $upper 的正整数。"
+}
+
+# Effective memory = min(MemTotal, cgroup v1/v2 quota if one exists).
+mem_kb() {
+  local kb cg bytes
+  kb=$(awk '/^MemTotal:/ {print $2; exit}' /proc/meminfo)
+  [[ "$kb" =~ ^[0-9]+$ ]] || die '无法读取 /proc/meminfo'
+  for cg in /sys/fs/cgroup/memory.max /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    [[ -r "$cg" ]] || continue
+    read -r bytes < "$cg" || :
+    if [[ "$bytes" =~ ^[0-9]+$ ]] && ((${#bytes} <= 16)); then
+      # Use awk for large unsigned cgroup numbers without bash overflow.
+      kb=$(awk -v old="$kb" -v n="$bytes" 'BEGIN{v=int(n/1024); if(v>0 && v<old) print v; else print old}')
+    fi
+  done
+  printf '%s' "$kb"
+}
+
+# Derivation matches the tcpfit 0.5.9 strategy, including RAM/32 cap.
+# Goal: 2x BDP + 2 MiB, but never exceed RAM/32 nor 256 MiB; floor 4 MiB.
+calculate() {
+  local bw="$1" rtt="$2" role="$3" ram_kb="$4" page_size
+  check_num "$bw" 1 10000 '带宽 Mbps'
+  check_num "$rtt" 1 1000 'RTT ms'
+  [[ "$role" == proxy || "$role" == bulk ]] || die '用途只能是 proxy 或 bulk'
+  [[ "$ram_kb" =~ ^[0-9]+$ ]] || die '内存读数不合法'
+  (( ram_kb >= 262144 )) || die '可用内存不足 256 MiB；出于安全考虑，拒绝自动调优。'
+  page_size=$(getconf PAGESIZE) || die '无法获取内存页大小'
+  [[ "$page_size" =~ ^[0-9]+$ ]] && (( page_size >= 4096 )) || die '内存页大小异常'
+
+  read -r BDP_BYTES GOAL_BYTES MAX_BYTES DEFAULT_BYTES CAP_BYTES < <(
+    awk -v bw="$bw" -v rtt="$rtt" -v m="$ram_kb" -v role="$role" 'BEGIN {
+      bdp = bw*1000000*rtt/8000
+      goal = 2*bdp + 2097152
+      cap = m*1024/32
+      if (cap>268435456) cap=268435456
+      max=goal
+      if (max>cap) max=cap
+      if (max<4194304) max=4194304
+      def=1048576
+      if (role=="bulk") { def=bdp; if(def>8388608) def=8388608; if(def<1048576) def=1048576 }
+      if (def>max) def=max
+      printf "%.0f %.0f %.0f %.0f %.0f\n", bdp,goal,max,def,cap
+    }'
+  )
+  # tcp_mem is measured in system pages, not bytes.
+  read -r MEM_LOW MEM_PRESSURE MEM_MAX < <(
+    awk -v m="$ram_kb" -v p="$page_size" 'BEGIN {
+      pages=m*1024/p
+      a=int(pages/16); b=int(pages/8); c=int(pages/4)
+      al=int(16777216/p); bl=int(33554432/p); cl=int(67108864/p)
+      if (a<al) a=al; if (b<bl) b=bl; if (c<cl) c=cl
+      printf "%.0f %.0f %.0f\n", a,b,c
+    }'
+  )
+  BW="$bw" RTT="$rtt" ROLE="$role" RAM_KB="$ram_kb" PAGE_SIZE="$page_size"
+}
+
+mib() { awk -v n="$1" 'BEGIN{printf "%.2f", n/1048576}'; }
+show_calc() {
+  printf '\n===== BDP 计算结果 =====\n'
+  printf '目标带宽           %s Mbps\n' "$BW"
+  printf '目标 RTT          %s ms\n' "$RTT"
+  printf '用途               %s\n' "$ROLE"
+  printf '有效内存           %s MiB\n' "$((RAM_KB / 1024))"
+  printf 'BDP               %s MiB\n' "$(mib "$BDP_BYTES")"
+  printf '2 x BDP + 2 MiB   %s MiB\n' "$(mib "$GOAL_BYTES")"
+  printf '内存保护上限       %s MiB\n' "$(mib "$CAP_BYTES")"
+  printf '最终缓冲区上限     %s MiB (%s 字节)\n' "$(mib "$MAX_BYTES")" "$MAX_BYTES"
+  printf 'TCP 初始缓冲值    %s MiB (%s 字节)\n' "$(mib "$DEFAULT_BYTES")" "$DEFAULT_BYTES"
+  printf 'TCP 内存阈值      %s / %s / %s 页\n' "$MEM_LOW" "$MEM_PRESSURE" "$MEM_MAX"
+  if (( MAX_BYTES < GOAL_BYTES )); then
+    warn '缓冲区上限受到内存预算约束；如小于实际路径需求，单线程无法保证跑满目标带宽。'
+  fi
+  if (( MAX_BYTES < BDP_BYTES )); then
+    warn '缓冲区上限甚至低于目标 BDP；建议降低目标带宽或在更大内存机器上测试。'
+  fi
+  printf '\n只修改 7 个 TCP 缓冲/窗口 sysctl；不改 BBR/fq、路由、initcwnd、整形。\n'
+}
+
+# Capture and restore only keys owned by this script.
+read_value() { sysctl -n "$1" | tr '\t' ' ' | tr -s ' ' | sed 's/^ *//;s/ *$//'; }
+validate_keys() {
+  local key
+  for key in "${KEYS[@]}"; do
+    sysctl -n "$key" >/dev/null 2>&1 || die "当前内核不支持 $key；没有修改任何内容。"
+  done
+}
+save_live() {
+  local file="$1" key value
+  : > "$file"
+  for key in "${KEYS[@]}"; do
+    value=$(read_value "$key") || return 1
+    [[ "$value" =~ ^[0-9]+(\ [0-9]+)*$ ]] || { warn "无法安全备份 $key: $value"; return 1; }
+    printf '%s|%s\n' "$key" "$value" >> "$file"
+  done
+}
+restore_live() {
+  local file="$1" key value failed=0
+  while IFS='|' read -r key value; do
+    [[ -n "$key" ]] || continue
+    [[ " ${KEYS[*]} " == *" $key "* ]] || { warn "跳过未知参数: $key"; failed=1; continue; }
+    [[ "$value" =~ ^[0-9]+(\ [0-9]+)*$ ]] || { warn "备份值异常: $key"; failed=1; continue; }
+    sysctl -q -w "$key=$value" || failed=1
+  done < "$file"
+  (( failed == 0 ))
+}
+write_config() {
+  local output="$1"
+  cat > "$output" <<TEXT
+$HEADER
+# version=$VERSION bandwidth=${BW}Mbps rtt=${RTT}ms role=$ROLE
+# BDP=${BDP_BYTES} bytes, target 2xBDP+2MiB=${GOAL_BYTES} bytes
+# RAM budget limits each buffer to ${CAP_BYTES} bytes; effective max ${MAX_BYTES}
+# This override sorts AFTER /etc/sysctl.d/99-tcpfit.conf.
+net.core.rmem_max = $MAX_BYTES
+net.core.wmem_max = $MAX_BYTES
+net.ipv4.tcp_rmem = 4096 $DEFAULT_BYTES $MAX_BYTES
+net.ipv4.tcp_wmem = 4096 $DEFAULT_BYTES $MAX_BYTES
+net.ipv4.tcp_mem = $MEM_LOW $MEM_PRESSURE $MEM_MAX
+net.ipv4.tcp_window_scaling = 1
+net.ipv4.tcp_moderate_rcvbuf = 1
+TEXT
+}
+apply_values() {
+  sysctl -q -w "net.core.rmem_max=$MAX_BYTES" || return 1
+  sysctl -q -w "net.core.wmem_max=$MAX_BYTES" || return 1
+  sysctl -q -w "net.ipv4.tcp_rmem=4096 $DEFAULT_BYTES $MAX_BYTES" || return 1
+  sysctl -q -w "net.ipv4.tcp_wmem=4096 $DEFAULT_BYTES $MAX_BYTES" || return 1
+  sysctl -q -w "net.ipv4.tcp_mem=$MEM_LOW $MEM_PRESSURE $MEM_MAX" || return 1
+  sysctl -q -w 'net.ipv4.tcp_window_scaling=1' || return 1
+  sysctl -q -w 'net.ipv4.tcp_moderate_rcvbuf=1' || return 1
+}
+check_applied() {
+  [[ "$(read_value net.core.rmem_max)" == "$MAX_BYTES" ]] &&
+  [[ "$(read_value net.core.wmem_max)" == "$MAX_BYTES" ]] &&
+  [[ "$(read_value net.ipv4.tcp_rmem)" == "4096 $DEFAULT_BYTES $MAX_BYTES" ]] &&
+  [[ "$(read_value net.ipv4.tcp_wmem)" == "4096 $DEFAULT_BYTES $MAX_BYTES" ]] &&
+  [[ "$(read_value net.ipv4.tcp_mem)" == "$MEM_LOW $MEM_PRESSURE $MEM_MAX" ]] &&
+  [[ "$(read_value net.ipv4.tcp_window_scaling)" == 1 ]] &&
+  [[ "$(read_value net.ipv4.tcp_moderate_rcvbuf)" == 1 ]]
+}
+
+# Never destroy the tcpfit snapshot or configuration. This script owns its own file only.
+apply() {
+  need_root
+  validate_keys
+  if [[ -f "$CONF" ]] && ! grep -Fxq "$HEADER" "$CONF"; then
+    die "$CONF 已存在但不是本脚本创建的文件；为避免覆盖，操作取消。"
+  fi
+  if [[ -f /etc/sysctl.d/99-tcpfit.conf ]]; then
+    warn '检测到 tcpfit：本脚本仅生成独立覆盖文件，不改动 99-tcpfit.conf。以后重跑 tcpfit tune 会暂时覆盖运行值。'
+  fi
+  mkdir -p -m 0700 "$STATE"
+  chmod 0700 "$STATE"
+  local live tmp old='' first=0 failed=0
+  live=$(mktemp "$STATE/.live.XXXXXX")
+  tmp=$(mktemp /etc/sysctl.d/.tcp-bdp-lite.XXXXXX)
+  if [[ -f "$CONF" ]]; then
+    old=$(mktemp "$STATE/.old.XXXXXX")
+    cp -p -- "$CONF" "$old"
+  fi
+  if ! save_live "$live"; then
+    rm -f -- "$live" "$tmp" "${old:-}"
+    die '无法保存当前内核参数，操作取消。'
+  fi
+  # original.sysctl is immutable until rollback; repeated tune preserves first baseline.
+  if [[ ! -f "$BASE" ]]; then
+    cp -- "$live" "$BASE"
+    chmod 0600 "$BASE"
+    first=1
+  fi
+  write_config "$tmp"
+  chmod 0644 "$tmp"
+  mv -f -- "$tmp" "$CONF"
+  if ! apply_values || ! check_applied; then
+    warn '参数写入或校验失败，正在恢复本次操作前的内核参数和配置。'
+    restore_live "$live" || warn '部分内核参数恢复失败，请手动检查。'
+    if [[ -n "$old" ]]; then cp -p -- "$old" "$CONF"; else rm -f -- "$CONF"; fi
+    (( first == 0 )) || rm -f -- "$BASE"
+    failed=1
+  fi
+  rm -f -- "$live" "${old:-}"
+  (( failed == 0 )) || return 1
+  ok '已立即生效，并写入开机持久化配置。'
+  printf '配置：%s\n首次修改前的备份：%s\n' "$CONF" "$BASE"
+  if [[ -f /etc/sysctl.conf ]]; then
+    warn '若 /etc/sysctl.conf 存在相同参数，部分系统上的 sysctl --system 可能会覆盖此配置。'
+  fi
+  info '修改后新建立的 TCP 连接更适合用于测速；不会自动更换正在运行的 TCP 连接。'
+}
+
+status() {
+  printf '\n===== 当前 TCP 状态 =====\n'
+  local key
+  for key in "${KEYS[@]}"; do
+    printf '%-35s %s\n' "$key" "$(read_value "$key" 2>/dev/null || echo N/A)"
+  done
+  printf '拥塞控制                          %s\n' "$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo N/A)"
+  printf '默认队列                          %s\n' "$(sysctl -n net.core.default_qdisc 2>/dev/null || echo N/A)"
+  if [[ -f "$CONF" ]]; then
+    printf '\n本脚本持久化配置：%s\n' "$CONF"
+    grep '^# version=' "$CONF" || :
+  else
+    printf '\n本脚本持久化配置：未安装\n'
+  fi
+  [[ -f "$BASE" ]] && printf '原始备份：%s\n' "$BASE" || :
+}
+
+rollback() {
+  need_root
+  [[ -f "$BASE" ]] || die '没有找到首次修改前的快照，无法自动回滚。'
+  if [[ -f "$CONF" ]] && ! grep -Fxq "$HEADER" "$CONF"; then
+    die '配置文件的归属标识已改变；为防止误删，拒绝回滚。'
+  fi
+  local answer
+  ask answer '撤销本脚本的 7 个参数修改，并恢复首次执行前快照？[y/N]: ' n
+  [[ "$answer" == [yY] ]] || { info '已取消。'; return 0; }
+  validate_keys
+  local live
+  mkdir -p -m 0700 "$STATE"
+  live=$(mktemp "$STATE/.rollback.XXXXXX")
+  if ! save_live "$live"; then rm -f -- "$live"; die '无法保存回滚前状态。'; fi
+  if ! restore_live "$BASE"; then
+    warn '回滚未全部成功，恢复回滚前状态。'
+    restore_live "$live" || warn '请检查实时 sysctl 参数。'
+    rm -f -- "$live"
+    return 1
+  fi
+  rm -f -- "$CONF" "$BASE" "$live"
+  ok '已恢复到本脚本首次执行前的实时参数，且移除本脚本的开机配置。'
+  info '未动 tcpfit 配置、BBR、fq、路由与原有 initcwnd。'
+}
+
+interactive_apply() {
+  local b r role_sel role confirm ram
+  printf '\n===== TCP BDP 精简调优 =====\n'
+  ask b '输入目标带宽 Mbps [1000]: ' 1000
+  ask r '输入目标链路 RTT 毫秒 [150]: ' 150
+  printf '用途：1) 代理/多并发（默认）  2) 少数大文件传输\n'
+  ask role_sel '选择 [1]: ' 1
+  case "$role_sel" in 1) role=proxy ;; 2) role=bulk ;; *) die '用途请选择 1 或 2。' ;; esac
+  ram=$(mem_kb)
+  calculate "$b" "$r" "$role" "$ram"
+  show_calc
+  ask confirm '确认写入系统并持久化？[y/N]: ' n
+  if [[ "$confirm" == [yY] ]]; then apply; else info '未执行任何修改。'; fi
+}
+
+usage() {
+  cat <<'HELP'
+用法：
+  sudo bash tcp-bdp-lite.sh             # 交互菜单
+  bash tcp-bdp-lite.sh --dry-run 1000 150 proxy
+  sudo bash tcp-bdp-lite.sh --apply     # 直接进入输入向导
+  bash tcp-bdp-lite.sh --status         # 检查当前参数
+  sudo bash tcp-bdp-lite.sh --rollback  # 恢复首次执行前的 7 个参数
+
+说明：脚本只改变 7 个 sysctl 项；不安装 iperf3，不测速，不修改 BBR/fq，
+      不修改 tc 整形、initcwnd 或现有 tcpfit 的配置文件。
+HELP
+}
+main() {
+  local option ram role choice
+  case "${1:-}" in
+    --dry-run)
+      [[ $# == 4 ]] || { usage; exit 1; }
+      ram=$(mem_kb); calculate "$2" "$3" "$4" "$ram"; show_calc
+      ;;
+    --apply) interactive_apply ;;
+    --status) status ;;
+    --rollback) rollback ;;
+    -h|--help) usage ;;
+    '')
+      while :; do
+        printf '\nTCP BDP Lite v%s\n' "$VERSION"
+        printf '1. 根据带宽 + RTT 计算并应用（默认推荐）\n'
+        printf '2. 查看当前参数\n'
+        printf '3. 回滚到首次调整前\n'
+        printf '0. 退出\n'
+        ask choice '选择 [1]: ' 1
+        case "$choice" in
+          1) interactive_apply ;;
+          2) status ;;
+          3) rollback ;;
+          0) break ;;
+          *) warn '请选择 0-3。' ;;
+        esac
+      done
+      ;;
+    *) usage; exit 1 ;;
+  esac
+}
+main "$@"
+)
+
 # -----------------------------
 # Menu
 # -----------------------------
@@ -2003,10 +2340,11 @@ menu_sys_conf() {
     echo -e " ${GREEN}9.${tianlan} 设置定时重启"
     echo -e " ${GREEN}10.${tianlan} 修改主机名"
     echo -e " ${GREEN}11.${tianlan} 修复站点 nginx 配置（域名+端口）"
+    echo -e " ${GREEN}12.${tianlan} TCP BDP 缓冲区调优（带宽 + RTT）"
     echo " ---------------------------------------------------"
     echo -e " ${GREEN}0.${PLAIN} 返回/退出"
     echo ""
-    read -rp "请选择 [0-11]: " choice
+    read -rp "请选择 [0-12]: " choice
     case "$choice" in
       1) bbr ;;
       2) firewall ;;
@@ -2019,6 +2357,7 @@ menu_sys_conf() {
       9) cron_reboot ;;
       10) change_hostname; read -rp "回车返回菜单..." _ ;;
       11) fix_nginx_site ;;
+      12) tcp_bdp_tune || red "TCP BDP 操作失败，请检查上方信息" ;;
       0) break ;;
       *) yellow "无效选项"; sleep 1 ;;
     esac
