@@ -212,12 +212,9 @@ UNINSTALL_XUI() {
     rm -rf "/etc/x-ui/" "/usr/local/x-ui/" "/usr/bin/x-ui/"
     rm -rf /etc/systemd/system/x-ui.service
 
-    # 清理 x-ui 自己添加的 nginx 配置（不影响已有业务）
-    rm -f "/etc/nginx/sites-available/${domain}" 2>/dev/null || true
-    rm -f "/etc/nginx/sites-enabled/${domain}" 2>/dev/null || true
-    rm -f /etc/nginx/sites-available/80.conf /etc/nginx/sites-enabled/80.conf 2>/dev/null || true
-
-    msg_ok "已卸载 x-ui / xray，已保留 nginx 与证书。"
+    # Nginx 伪装站及其所有配置必须持久保留，重装 3X-UI 时直接复用。
+    # 不删除站点文件、80.conf、snippets 或证书，也不停止 nginx。
+    msg_ok "已卸载 x-ui / xray，完整保留 nginx 伪装站配置与证书。"
 }
 
 # -----------------------------
@@ -229,7 +226,7 @@ uninstall_xui_menu() {
     echo "----------------------------------------------------------------"
     echo "卸载确认"
     echo "----------------------------------------------------------------"
-    echo "即将卸载 x-ui / xray 与相关 nginx 配置，但不会删除 nginx、已申请的证书和依赖。"
+    echo "即将卸载 x-ui / xray；完整保留 nginx 及伪装站配置、证书和依赖。"
     read -rp "确认继续卸载？(y/N): " confirm_uninstall
     if [[ ! "$confirm_uninstall" =~ ^[Yy]$ ]]; then
         msg_err "已取消卸载。"
@@ -1658,7 +1655,41 @@ else
     exit 1
 fi
 }
+# Existing Nginx fallback is owned by the site operator, not by panel reinstall.
+# Verify the active configuration rather than merely trusting a stale file.
+reuse_existing_nginx_fallback() {
+    local conf="/etc/nginx/sites-enabled/${domain}"
+    local live_conf=''
+    [[ -f "$conf" ]] || return 1
+    command -v nginx >/dev/null 2>&1 || return 1
+    nginx -t >/dev/null 2>&1 || return 1
+    live_conf="$(nginx -T 2>/dev/null)" || return 1
+    # Match the actual domain and local TLS listener in the enabled site file.
+    grep -Eq "^[[:space:]]*server_name[[:space:]]+${domain//./\.}[[:space:]]*;" "$conf" || return 1
+    grep -Eq "^[[:space:]]*listen[[:space:]]+127\.0\.0\.1:${fallback_port}[[:space:]]+ssl([[:space:];]|$)" "$conf" || return 1
+    printf '%s\n' "$live_conf" | grep -Fq "configuration file ${conf}:" || return 1
+    # Check listener is nginx itself (not an unrelated service).
+    ss -lntp 2>/dev/null | grep -E "127\.0\.0\.1:${fallback_port}[[:space:]]" | grep -q 'nginx' || return 1
+    return 0
+}
+
 configure_nginx() {
+    if reuse_existing_nginx_fallback; then
+        msg_ok "已识别原有 Nginx TLS 回落站点 ${domain}（127.0.0.1:${fallback_port}）。"
+        msg_inf '完全复用现有站点：不覆盖配置、不更改反代规则、不重启 Nginx。'
+        return 0
+    fi
+    # Do not overwrite an existing site, even when it is inactive or malformed.
+    # The operator must repair it explicitly; panel reinstall must not destroy it.
+    if [[ -e "/etc/nginx/sites-available/${domain}" || -e "/etc/nginx/sites-enabled/${domain}" ]]; then
+        msg_err "检测到已有 ${domain} 的 Nginx 站点，但无法确认它正在提供 127.0.0.1:${fallback_port} TLS 回落。"
+        msg_err '为保护伪装站，拒绝覆盖。请检查 nginx -t、ss -lntp 以及 sites-enabled 配置。'
+        return 1
+    fi
+    if ss -lntp 2>/dev/null | grep -E "127\.0\.0\.1:${fallback_port}[[:space:]]" | grep -q 'LISTEN'; then
+        msg_err "端口 ${fallback_port} 已由其他配置或进程监听；不擅自覆盖。"
+        return 1
+    fi
     mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled /etc/nginx/snippets /var/www/html /var/www/acme
 
     cat > "/etc/nginx/sites-available/80.conf" <<EOF
@@ -1677,6 +1708,10 @@ server {
 }
 EOF
 
+    if [[ -e /etc/nginx/snippets/includes.conf ]]; then
+        msg_err '已有共享 Nginx snippets/includes.conf；为避免影响其他站点，拒绝覆盖。'
+        return 1
+    fi
     cat > "/etc/nginx/snippets/includes.conf" <<EOF
     location /${sub2singbox_path}/ {
         proxy_redirect off;
@@ -3133,7 +3168,10 @@ install_xui_pro() {
     fi
 
     UPDATE_XUIDB
-    configure_nginx
+    if ! configure_nginx; then
+        msg_err 'Nginx 原有伪装站保留不变；面板节点已写入，请按提示检查后再继续。'
+        return 1
+    fi
     install_sub2sing_box
     msg_inf "已跳过伪装站点安装；网站内容由用户手动部署。"
     setup_cronjob
