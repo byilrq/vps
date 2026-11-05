@@ -1,10 +1,10 @@
 # 上海三网 IPv4 专用版
 
-修改自 [ibsgss/TcpQuality](https://github.com/ibsgss/TcpQuality)（GPL-3.0-only）。
+修改自 [ibsgss/TcpQuality](https://github.com/ibsgss/TcpQuality)。
 
 ## 启动方式
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/byilrq/vps/main/tcpquality/runTcpQuality.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/byilrq/vps/main/tcpquality/tcp.sh)
 ```
 
 启动菜单只问三项，各自 `y/n`，**直接回车为 `y`**：
@@ -22,7 +22,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/byilrq/vps/main/tcpquality/r
 
 ## 文件
 
-`runTcpQuality.sh`：唯一入口及三个测试选项；
+`tcp.sh`：唯一入口及三个测试选项；
 `runTcpQuality-core.sh`：包含三个检测项目的原有测试实现及独立开关；
 `runTcpQuality-rootfs.sh`：隔离环境运行器；
 `tcpquality-tcpinfo.c`、`tcpquality-retrans-*.bt`：测速时 TCP 重传指标的辅助源文件；
