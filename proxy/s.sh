@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s.sh v6 - standalone sing-box deployment/management (no S-UI, no web panel).
+# s.sh v6.1 - standalone sing-box deployment/management (no S-UI, no web panel).
 # Revised from the user's s(9).sh: SS, HY2, VLESS REALITY; independent protocol submenus.
 # Protocol removal edits only the named sing-box inbound, not other services.
 # Kernel updates preserve configs; full uninstall removes ALL protocols and credentials.
@@ -285,8 +285,10 @@ service_diagnostics() {
     if command_ok systemctl; then
         printf '%s\n' '--- systemd service ExecStart / MainPID ---' >&2
         systemctl show sing-box -p MainPID -p ExecStart -p ActiveState -p SubState --no-pager 2>/dev/null | head -n 8 >&2 || true
-        printf '%s\n' '--- recent sing-box log (max 18 lines) ---' >&2
-        journalctl -u sing-box -n 18 --no-pager --output=cat 2>/dev/null >&2 || true
+        printf '%s\n' '--- sing-box service status (with latest error) ---' >&2
+        systemctl status sing-box --no-pager -l -n 12 2>/dev/null >&2 || true
+        printf '%s\n' '--- recent sing-box journal (max 35 lines) ---' >&2
+        journalctl -u sing-box -n 35 --no-pager -o short-iso 2>/dev/null >&2 || true
     fi
     if command_ok ss; then
         printf '%s\n' '--- matching TCP / UDP listeners ---' >&2
@@ -610,6 +612,95 @@ EOF
     fi
 }
 
+# Detect *retained* inbound sockets BEFORE restarting the shared sing-box service.
+# "sing-box check" only validates syntax; it cannot detect an existing Nginx
+# listener that clashes with an old inbound from an example config.
+# The one automatic migration offered is the inactive, untagged legacy SS/8080
+# entry colliding with Nginx. It is never silently removed: an explicit menu
+# confirmation is required, and the original config is backed up on success.
+preflight_retained_inbounds() {
+    local candidate="$1" installing_tag="$2"
+    local idx typ tag listen port row protocol lines matched_proto collision_lines
+    local only_nginx answer temp now_active=false
+
+    service_active && now_active=true
+    while IFS=$'\t' read -r idx typ tag listen port <&3; do
+        [[ "$port" =~ ^[0-9]+$ ]] || continue
+        case "$typ" in
+            hysteria2|hysteria|tuic) protocol='udp' ;;
+            shadowsocks) protocol='tcp+udp' ;;
+            vless|vmess|trojan|anytls|mixed|socks|http|shadowtls|naive|snell) protocol='tcp' ;;
+            *) continue ;; # Leave unusual/unknown inbound types to sing-box itself.
+        esac
+
+        matched_proto=''; collision_lines=''
+        for row in tcp udp; do
+            case "$protocol:$row" in
+                tcp:tcp|udp:udp|tcp+udp:tcp|tcp+udp:udp) ;;
+                *) continue ;;
+            esac
+            lines="$(listener_lines "$row" "$port")" || return 1
+            [[ -n "$lines" ]] || continue
+            # A running shared sing-box service may already own this retained
+            # inbound. Do not treat its own sockets as an external collision.
+            if $now_active && [[ "$lines" == *'sing-box'* ]]; then
+                if ! grep -qv 'sing-box' <<< "$lines"; then continue; fi
+            fi
+            matched_proto="$row"
+            collision_lines="$lines"
+            break
+        done
+        [[ -n "$matched_proto" ]] || continue
+
+        only_nginx=true
+        while IFS= read -r row; do
+            [[ "$row" == *'users:'* && "$row" == *'nginx'* && "$row" != *'sing-box'* ]] || only_nginx=false
+        done <<< "$collision_lines"
+
+        # Strictly limited to the stale, untagged Shadowsocks listener from the
+        # default/old config. Existing named SS or running inbounds are retained.
+        if [[ "$installing_tag" == 'hy2-in' && "$typ" == 'shadowsocks' \
+           && "$tag" == '__UNNAMED__' && "$port" == '8080' \
+           && ( "$listen" == '::' || "$listen" == '0.0.0.0' || "$listen" == '*' ) \
+           && "$matched_proto" == 'tcp' ]] && $only_nginx && ! $now_active; then
+            warn '发现未命名的旧 Shadowsocks 入站：TCP/8080，当前与 Nginx 伪装站冲突。'
+            printf '%s\n' "$collision_lines" >&2
+            say '此入站目前无法启动；可以只从本次新配置中移除，Nginx 8080、其他协议和 TLS 证书均不修改。'
+            say '成功安装后，原完整配置将保存在 /etc/sing-box/backups/config.before-hy2-in-*.json。'
+            if [[ ! -t 0 ]]; then
+                fail '非交互式安装不自动删除旧 Shadowsocks；请从 HY2 菜单交互安装并确认归档。'
+                return 1
+            fi
+            ask answer '确认归档冲突的旧 Shadowsocks 入站并继续安装 HY2 [Y/n]: ' Y || return 1
+            case "$answer" in
+                Y|y|yes|YES) ;;
+                *) warn '已取消，原配置及运行服务均未修改。'; return 1 ;;
+            esac
+            temp="$(mktemp "$(dirname "$candidate")/.candidate-pruned.XXXXXXXX.json")" || return 1
+            if ! jq --argjson i "$idx" '.inbounds |= (.[0:$i] + .[($i+1):])' "$candidate" > "$temp"; then
+                rm -f "$temp"
+                return 1
+            fi
+            chmod 600 "$temp"
+            mv -f "$temp" "$candidate" || { rm -f "$temp"; return 1; }
+            say '候选配置已排除冲突的旧 SS/8080，原配置备份仍在；继续验证并安装 HY2。'
+            continue
+        fi
+
+        warn "旧入站 [$tag / $typ] 监听的 ${matched_proto}/${port} 已被其他进程占用，禁止覆盖或停止该进程："
+        printf '%s\n' "$collision_lines" >&2
+        fail '请先调整这个旧入站的端口，或处理旧配置后重试；原配置和 Nginx 均未修改。'
+        return 1
+    done 3< <(jq -r --arg tag "$installing_tag" '
+       .inbounds | to_entries | reverse[] |
+       select(.value.tag != $tag) |
+       select((.value.listen_port | type) == "number") |
+       [(.key | tostring), (.value.type // "unknown"),
+        (.value.tag // "__UNNAMED__"), (.value.listen // "default"),
+        (.value.listen_port | tostring)] | @tsv' "$candidate")
+    return 0
+}
+
 # Build candidate with one named inbound replaced; all other inbounds are preserved.
 apply_inbound() {
     local tag="$1" newfile="$2" temp='' snap='' meta_snap='' active_before=false
@@ -626,6 +717,10 @@ apply_inbound() {
       ' "$CONFIG" > "$temp"; then
         rm -f "$temp" "$snap" "$meta_snap"; return 1
     fi
+    if ! preflight_retained_inbounds "$temp" "$tag"; then
+        rm -f "$temp" "$snap" "$meta_snap"
+        return 1
+    fi
     if ! sing-box check -c "$temp"; then
         warn '候选配置未通过 sing-box check，原服务和配置均未改变。'
         rm -f "$temp" "$snap" "$meta_snap"; return 1
@@ -634,7 +729,8 @@ apply_inbound() {
     mv -f "$temp" "$CONFIG"
     if ! service_setup || ! service_enable || ! service_restart; then
         warn 'sing-box 服务重启失败，将恢复安装前配置。'
-        service_diagnostics "unknown" "$(jq -r '.listen_port // 0' "$newfile" 2>/dev/null)"
+        sleep 1  # Let journald flush a short-lived FATAL message before diagnosis.
+        service_diagnostics "$(jq -r 'if .type=="hysteria2" or .type=="tuic" then "udp" else "tcp" end' "$newfile" 2>/dev/null)" "$(jq -r '.listen_port // 0' "$newfile" 2>/dev/null)"
         cp -a "$snap" "$CONFIG"; cp -a "$meta_snap" "$META"
         if $active_before; then service_restart || true; else service_stop || true; fi
         rm -f "$snap" "$meta_snap"
