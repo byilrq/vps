@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s.sh v6.3 - HY2 domain address + h.sh-style TCP/443 HTTPS cover setup.
+# s.sh v6.5 - Auto-detect/reuse local HTTPS fallback; auto-allocate bridge ports for R/H coexistence.
 # Revised from the user's s(9).sh: SS, HY2, VLESS REALITY; independent protocol submenus.
 # Protocol removal edits only the named sing-box inbound, not other services.
 # Kernel updates preserve configs; full uninstall removes ALL protocols and credentials.
@@ -252,7 +252,7 @@ PY_HY2_ADDR
 # address. For NAT/VPS proxies where this cannot be established, confirmation
 # is required rather than silently publishing an unusable domain URI.
 hy2_domain_dns_check() {
-    local d="$1" v4='' v6='' public_v4='' local_v6='' addr=''
+    local d="$1" display_kind="${2:-HY2}" v4='' v6='' public_v4='' local_v6='' addr=''
     local matched=false mismatched=false
     if command_ok getent; then
         v4="$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
@@ -262,8 +262,8 @@ hy2_domain_dns_check() {
     if command_ok ip; then
         local_v6="$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u | paste -sd, - || true)"
     fi
-    printf '  HY2 连接域名：%s\n  DNS A：%s\n  DNS AAAA：%s\n' \
-        "$d" "${v4:-未解析到}" "${v6:-未解析到}"
+    printf '  %s 连接域名：%s\n  DNS A：%s\n  DNS AAAA：%s\n' \
+        "$display_kind" "$d" "${v4:-未解析到}" "${v6:-未解析到}"
     printf '  当前公网 IPv4：%s\n  本机全局 IPv6：%s\n' \
         "${public_v4:-无法确定}" "${local_v6:-无/无法确定}"
     # Any extra A/AAAA pointing elsewhere can cause clients to select the
@@ -283,7 +283,7 @@ hy2_domain_dns_check() {
         fi
     done
     if $matched && ! $mismatched; then
-        say 'HY2 域名解析的 A/AAAA 记录均与已检测到的 VPS 地址一致。'
+        say "${display_kind} 域名解析的 A/AAAA 记录均与已检测到的 VPS 地址一致。"
         return 0
     fi
     warn '无法确认域名的所有 A/AAAA 都直接指向本 VPS；若存在多余的 AAAA，客户端可能优先访问错误 IPv6。'
@@ -994,19 +994,23 @@ add_hy2() {
     if ! apply_inbound hy2-in "$node"; then rm -f "$node"; return 1; fi
     rm -f "$node"
     # Do not overwrite the global .connect_host used by SS/REALITY.
+    local wanted=false
+    [[ "$tcp443_mode" != off ]] && wanted=true
     if ! set_meta_values --arg sni "$CERT_DOMAIN" --argjson insecure "$CERT_INSECURE" \
-        --arg h "$HY2_CONNECT_HOST" \
-        '.hy2={sni:$sni,insecure:$insecure,connect_host:$h}'; then
+        --arg h "$HY2_CONNECT_HOST" --arg mode "$tcp443_mode" --argjson wanted "$wanted" \
+        '.hy2={sni:$sni,insecure:$insecure,connect_host:$h,tcp443_mode:$mode,tcp443_wanted:$wanted}'; then
         warn 'HY2 已安装，但节点地址元数据保存失败，请从菜单 6 修复。'
         return 1
     fi
-    if [[ "$tcp443_mode" == 'true' ]]; then
+    if [[ "$tcp443_mode" == 'nginx' ]]; then
         if ! enable_hy2_tcp443_site "$CERT_DOMAIN" "$masq"; then
             warn 'HY2 的 UDP 入站已成功安装，但 TCP/443 HTTPS 伪装站启用失败。'
             warn '可以先使用 HY2 节点，修复 Nginx 后通过 HY2 菜单 5 再启用回落。'
             protocol_report hy2
             return 1
         fi
+    elif [[ "$tcp443_mode" == 'reality' ]]; then
+        say '已复用 REALITY TCP/443 的 HTTPS 握手回落；HY2 UDP/443 独立运行。'
     else
         if hy2_443_owned_site_exists "$CERT_DOMAIN"; then
             disable_hy2_tcp443_site || warn '无法关闭旧的 s.sh 专属 TCP/443 站点，请手动在菜单 5 检查。'
@@ -1016,50 +1020,107 @@ add_hy2() {
 }
 
 check_tls_endpoint() {
-    local address="$1" port="$2" sni="$3" pem=''
+    local address="$1" port="$2" sni="$3" timeout_sec="${4:-8}" pem=''
     command_ok timeout || { fail 'timeout missing'; return 1; }
-    pem="$(timeout 8 openssl s_client -connect "$address:$port" -servername "$sni" \
+    pem="$(timeout "$timeout_sec" openssl s_client -connect "$address:$port" -servername "$sni" \
         -showcerts < /dev/null 2>/dev/null | sed -n '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/p' || true)"
     [[ "$pem" == *'-----BEGIN CERTIFICATE-----'* ]] || return 1
     openssl x509 -noout -checkhost "$sni" <<< "$pem" 2>/dev/null | grep -qi 'does match'
 }
 
 # Optionally create a new isolated HTTPS bridge. Never edit the existing HTTP site.
+bridge_port_reserved_by_inbound() {
+    local port="$1"
+    jq -e --argjson p "$port" '.inbounds[]? |
+      select(.listen_port==$p and (.type!="hysteria2" and .type!="hysteria" and .type!="tuic"))' \
+      "$CONFIG" >/dev/null 2>&1
+}
+
+# Automatically discover an already-running loopback HTTPS endpoint whose
+# certificate matches the REALITY SNI. No internal port is requested from the
+# user. Only inspect ports in the bridge allocation range; skip ports already
+# reserved by sing-box inbounds. If none matches, add_reality() creates a
+# managed bridge and create_bridge() selects a free port automatically.
+find_local_https_fallback_port() {
+    local sni="$1" line endpoint candidate bind_addr
+    command_ok ss || return 1
+    while IFS= read -r line; do
+        endpoint="$(awk '{print $4}' <<< "$line")"
+        candidate="${endpoint##*:}"
+        bind_addr="${endpoint%:*}"
+        [[ "$candidate" =~ ^[0-9]+$ ]] || continue
+        (( 10#$candidate >= 8081 && 10#$candidate <= 8199 )) || continue
+        [[ "$candidate" != 8090 ]] || continue
+        # This fallback is configured as 127.0.0.1 in sing-box, so only
+        # reuse listeners reachable through IPv4 loopback/wildcard sockets.
+        [[ "$bind_addr" != \[* ]] || continue
+        bridge_port_reserved_by_inbound "$candidate" && continue
+        if check_tls_endpoint 127.0.0.1 "$candidate" "$sni" 3; then
+            printf '%s' "$candidate"
+            return 0
+        fi
+    done < <(ss -H -ltnp 2>/dev/null)
+    return 1
+}
 BRIDGE_NEW_PATH=''
 BRIDGE_NEW_BACKUP=''
 create_bridge() {
-    local d="$1" target_port=8080 bridge_port='' file='' temp='' existing=''
-    [[ -n "$(listener_lines tcp "$target_port" 2>/dev/null || true)" ]] || {
-        fail "No local HTTP site at 127.0.0.1:$target_port"; return 1;
+    local d="$1" fallback_url="${2:-http://127.0.0.1:8080}" bridge_port='' file='' temp='' existing='' other=''
+    local header_host='$host'
+    hy2_masq_validate "$fallback_url" "$d" || {
+        fail '本机 TLS 桥接的回落 URL 无效或可能导致代理回环。'; return 1;
     }
-    command_ok nginx || { fail 'Nginx is not installed'; return 1; }
+    if [[ "$fallback_url" == http://127.0.0.1:8080* || "$fallback_url" == http://localhost:8080* ]]; then
+        [[ -n "$(listener_lines tcp 8080 2>/dev/null || true)" ]] || {
+            fail '没有本机伪装站 127.0.0.1:8080'; return 1;
+        }
+    else
+        header_host='$proxy_host'
+    fi
+    command_ok nginx || { fail 'Nginx 尚未安装'; return 1; }
     [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]] || return 1
-    if ! nginx -t; then
-        fail 'Existing Nginx config already fails nginx -t. Site files were not changed.'
-        return 1
-    fi
-    # Reuse an already-valid independently managed loopback TLS bridge if present.
-    for bridge_port in $(seq 8081 8199); do
-        [[ "$bridge_port" == 8090 ]] && continue
-        if check_tls_endpoint 127.0.0.1 "$bridge_port" "$d"; then
-            BRIDGE_PORT="$bridge_port"; BRIDGE_NEW_PATH=''
-            say "Reusing valid local HTTPS fallback 127.0.0.1:$bridge_port"
-            return 0
-        fi
-        [[ -z "$(listener_lines tcp "$bridge_port" 2>/dev/null || true)" ]] && break
-    done
-    if [[ -n "$(listener_lines tcp "$bridge_port" 2>/dev/null || true)" ]]; then
-        fail "No free TLS bridge port in 8081..8199"; return 1
-    fi
+    nginx -t >/dev/null 2>&1 || { fail '现有 Nginx 配置错误，拒绝修改。'; return 1; }
     file="/etc/nginx/conf.d/s-script-reality-bridge-$d.conf"
     if [[ -e "$file" || -L "$file" ]]; then
-        head -n 1 "$file" | grep -Fqx "$OWN_BRIDGE_MARKER" || {
-            fail "User-owned Nginx config exists: $file"; return 1;
+        [[ ! -L "$file" ]] && head -n 1 "$file" | grep -Fqx "$OWN_BRIDGE_MARKER" || {
+            fail "发现不属于 s.sh 的 Nginx 文件：$file"; return 1;
         }
+        # Reuse only the bridge defined in our own file and verify its cert.
+        bridge_port="$(sed -nE 's/^[[:space:]]*listen[[:space:]]+127[.]0[.]0[.]1:([0-9]+)[[:space:]]+ssl;.*/\1/p' "$file" | head -n1)"
+        if port_valid "$bridge_port" && ! bridge_port_reserved_by_inbound "$bridge_port" &&
+            grep -Fq "proxy_pass $fallback_url;" "$file" &&
+            check_tls_endpoint 127.0.0.1 "$bridge_port" "$d"; then
+            BRIDGE_PORT="$bridge_port"; BRIDGE_NEW_PATH=''; BRIDGE_NEW_BACKUP=''
+            say "复用 s.sh 本机 HTTPS 桥接：127.0.0.1:$bridge_port"
+            return 0
+        fi
         existing="$(mktemp /tmp/s-nginx-previous.XXXXXXXX)" || return 1
-        cp -a "$file" "$existing"
+        cp -a "$file" "$existing" || { rm -f "$existing"; return 1; }
+        if port_valid "$bridge_port" && ! bridge_port_reserved_by_inbound "$bridge_port"; then
+            other="$(listener_lines tcp "$bridge_port" 2>/dev/null || true)"
+            if [[ -z "$other" || "$other" == *nginx* ]]; then
+                : # Recreate previously owned bridge on its original port.
+            else
+                bridge_port=''
+            fi
+        else
+            bridge_port=''
+        fi
     fi
-    temp="$(mktemp /etc/nginx/conf.d/.s-bridge.XXXXXXXX)" || return 1
+    if [[ -z "$bridge_port" ]]; then
+        for other in $(seq 8081 8199); do
+            [[ "$other" == 8090 ]] && continue
+            if ! bridge_port_reserved_by_inbound "$other" &&
+                [[ -z "$(listener_lines tcp "$other" 2>/dev/null || true)" ]]; then
+                bridge_port="$other"; break
+            fi
+        done
+    fi
+    if ! port_valid "$bridge_port"; then
+        rm -f "$existing"
+        fail '8081..8199 无空闲本机 TLS 桥接端口。'; return 1
+    fi
+    temp="$(mktemp /etc/nginx/conf.d/.s-bridge.XXXXXXXX)" || { rm -f "$existing"; return 1; }
     cat > "$temp" <<EOF
 $OWN_BRIDGE_MARKER
 server {
@@ -1068,53 +1129,138 @@ server {
     ssl_certificate $CERT_FILE;
     ssl_certificate_key $KEY_FILE;
     location / {
-        proxy_pass http://127.0.0.1:$target_port;
-        proxy_set_header Host \$host;
+        proxy_pass $fallback_url;
+        proxy_ssl_server_name on;
+        proxy_set_header Host $header_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
 }
 EOF
+    chmod 644 "$temp"
     mv -f "$temp" "$file"
-    if ! nginx -t; then
-        warn 'Rolling back invalid s.sh bridge (existing site stays untouched).'
+    if ! nginx -t >/dev/null 2>&1 || ! nginx_reload_safely; then
         if [[ -n "$existing" ]]; then cp -a "$existing" "$file"; else rm -f "$file"; fi
+        nginx_reload_safely || true
         rm -f "$existing"; return 1
     fi
-    if command_ok systemctl; then
-        if systemctl is-active --quiet nginx; then
-            if ! systemctl reload nginx; then
-                if [[ -n "$existing" ]]; then cp -a "$existing" "$file"; else rm -f "$file"; fi
-                rm -f "$existing"; return 1
-            fi
-        else
-            if ! systemctl start nginx; then
-                if [[ -n "$existing" ]]; then cp -a "$existing" "$file"; else rm -f "$file"; fi
-                rm -f "$existing"; return 1
-            fi
-        fi
-    else
-        if ! nginx -s reload; then
-            if [[ -n "$existing" ]]; then cp -a "$existing" "$file"; else rm -f "$file"; fi
-            rm -f "$existing"; return 1
-        fi
-    fi
     if ! check_tls_endpoint 127.0.0.1 "$bridge_port" "$d"; then
-        warn 'Bridge TLS probe failed; removing only newly created s.sh Nginx config.'
+        warn '本机 TLS 桥接握手检查失败，已恢复 Nginx 原配置。'
         if [[ -n "$existing" ]]; then cp -a "$existing" "$file"; else rm -f "$file"; fi
-        if command_ok systemctl; then systemctl reload nginx || true; else nginx -s reload || true; fi
+        nginx_reload_safely || true
         rm -f "$existing"; return 1
     fi
     BRIDGE_PORT="$bridge_port"
     BRIDGE_NEW_PATH="$file"
     BRIDGE_NEW_BACKUP="$existing"
-    say "Local HTTPS bridge ready 127.0.0.1:$bridge_port -> HTTP 127.0.0.1:$target_port"
+    say "本机 HTTPS 桥接就绪：127.0.0.1:$bridge_port → $fallback_url"
 }
+
+# REALITY occupies only TCP; HY2 occupies UDP. When REALITY listens on
+# TCP/443, its REALITY handshake target is the only legitimate TCP/443 HTTPS
+# fallback path. Nginx must listen on loopback TLS, never concurrently on 443.
+reality_tcp443_configured() {
+    [[ -f "$CONFIG" ]] || return 1
+    jq -e '.inbounds[]? | select(.tag=="vless-in" and .type=="vless" and
+        .listen_port==443 and .tls.reality.enabled==true)' "$CONFIG" >/dev/null 2>&1
+}
+reality_handshake_params() {
+    [[ -f "$CONFIG" ]] || return 1
+    jq -r '[.inbounds[]? | select(.tag=="vless-in") |
+      [(.tls.reality.handshake.server//""),
+       ((.tls.reality.handshake.server_port//0)|tostring),
+       (.tls.server_name//"") ] | @tsv][0] // empty' "$CONFIG"
+}
+reality_tcp443_fallback_check() {
+    reality_tcp443_configured || return 1
+    local target port sni
+    IFS=$'\t' read -r target port sni <<< "$(reality_handshake_params)"
+    [[ -n "$target" && -n "$sni" ]] && port_valid "$port" || return 1
+    if [[ "$target" == '127.0.0.1' || "$target" == '::1' || "$target" == 'localhost' ]]; then
+        # An unreachable internal TLS site means the REALITY fallback is broken.
+        check_tls_endpoint "$target" "$port" "$sni"
+    else
+        # A remote handshake target belongs to REALITY itself; do not rewrite
+        # its SNI or credentials when HY2 is installed afterwards.
+        say "REALITY TCP/443 已配置远程 HTTPS 握手回落：$target:$port（SNI $sni）。"
+        check_tls_endpoint "$target" "$port" "$sni"
+    fi
+}
+
+# Preserve an s.sh-owned HY2 public HTTPS site while handing TCP/443 to
+# REALITY. Never touch user-owned Nginx sites or another listener on this port.
+REALITY_MIGRATED_HY2_FILE=''
+REALITY_MIGRATED_HY2_BACKUP=''
+release_hy2_public443_for_reality() {
+    local domain="$1" file='' occupied='' backup=''
+    file="$(hy2_443_path "$domain")" || return 1
+    hy2_443_owned_site_exists "$domain" || return 0
+    occupied="$(listener_lines tcp 443)" || return 1
+    if [[ -z "$occupied" ]]; then
+        warn '发现旧 HY2 专属 TCP/443 站点文件，但未发现监听；将暂时归档并验证 Nginx。'
+    elif [[ "$occupied" != *nginx* ]] || grep -qv nginx <<< "$occupied"; then
+        fail 'TCP/443 不是纯 Nginx 监听，拒绝迁移以免影响其他服务。'; return 1
+    fi
+    command_ok nginx && nginx -t >/dev/null 2>&1 || { fail 'Nginx 配置未通过检查，不迁移。'; return 1; }
+    backup="$(mktemp /tmp/s-sh-hy2-public443.XXXXXXXX)" || return 1
+    cp -a -- "$file" "$backup" || { rm -f "$backup"; return 1; }
+    rm -f -- "$file" || { rm -f "$backup"; return 1; }
+    if ! nginx -t >/dev/null 2>&1 || ! nginx_reload_safely; then
+        cp -a -- "$backup" "$file"
+        nginx_reload_safely || true
+        rm -f "$backup"
+        fail '迁移 HY2 HTTPS 站点失败，已恢复 TCP/443 原站点。'; return 1
+    fi
+    # A graceful Nginx reload may take a moment to close the old listener.
+    # REALITY must not restart until TCP/443 is genuinely released.
+    local retry=0
+    while (( retry < 10 )); do
+        occupied="$(listener_lines tcp 443)" || occupied=''
+        [[ -z "$occupied" || "$occupied" == *sing-box* && "$occupied" != *nginx* ]] && break
+        sleep 1
+        (( retry += 1 ))
+    done
+    if [[ -n "$occupied" && "$occupied" != *sing-box* ]]; then
+        cp -a -- "$backup" "$file"
+        nginx_reload_safely || true
+        rm -f "$backup"
+        fail 'Nginx 仍监听 TCP/443（可能有其他站点）；安全取消迁移并恢复原配置。'; return 1
+    fi
+    REALITY_MIGRATED_HY2_FILE="$file"
+    REALITY_MIGRATED_HY2_BACKUP="$backup"
+    say '已将 s.sh 自建 HY2 TCP/443 网站转为 REALITY 回落使用的本机 HTTPS 桥接；HY2 UDP/443 不受影响。'
+}
+restore_reality_migrated_site() {
+    if [[ -n "$REALITY_MIGRATED_HY2_FILE" && -f "$REALITY_MIGRATED_HY2_BACKUP" ]]; then
+        cp -a -- "$REALITY_MIGRATED_HY2_BACKUP" "$REALITY_MIGRATED_HY2_FILE" || return 1
+        nginx -t >/dev/null 2>&1 && nginx_reload_safely || warn '回滚了 HY2 站点文件，但 Nginx reload 未成功，请检查 nginx -t。'
+        rm -f -- "$REALITY_MIGRATED_HY2_BACKUP"
+    fi
+    REALITY_MIGRATED_HY2_FILE=''; REALITY_MIGRATED_HY2_BACKUP=''
+}
+commit_reality_migrated_site() {
+    if [[ -n "$REALITY_MIGRATED_HY2_BACKUP" && -f "$REALITY_MIGRATED_HY2_BACKUP" ]]; then
+        local when
+        when="$(date +%Y%m%d_%H%M%S)"
+        cp -a -- "$REALITY_MIGRATED_HY2_BACKUP" "$BACKUPS/hy2-public443.before-reality-${when}.conf" || true
+        rm -f -- "$REALITY_MIGRATED_HY2_BACKUP"
+    fi
+    REALITY_MIGRATED_HY2_FILE=''; REALITY_MIGRATED_HY2_BACKUP=''
+}
+nginx_reload_safely() {
+    if command_ok systemctl; then
+        if systemctl is-active --quiet nginx; then systemctl reload nginx
+        else systemctl start nginx; fi
+    else
+        nginx -s reload
+    fi
+}
+
 # Hysteria2 standalone (h.sh) supports masquerade.listenHTTPS directly.
 # sing-box's HY2 inbound only provides HTTP/3 masquerade; implement its
 # optional TCP/443 counterpart with a separately owned Nginx HTTPS site.
-# Both send unauthenticated requests to the SAME proxy target. No existing
-# Nginx/Reality/Xray site is stopped or rewritten.
+# With REALITY/443, the HTTPS handshake is instead forwarded to a loopback
+# Nginx TLS bridge; no second public TCP/443 listener is created.
 HY2_443_MARKER='# S_SH_MANAGED_HY2_TCP443_V1'
 HY2_TCP443_MODE='false'
 hy2_443_path() {
@@ -1170,6 +1316,10 @@ hy2_tcp443_preflight() {
     hy2_masq_validate "$target" "$domain" || { warn '伪装目标 URL 不安全/不支持（可能形成自身代理循环）。'; return 1; }
     command_ok nginx || { warn 'Nginx 未安装，无法提供 TCP/443 HTTPS 伪装站。'; return 1; }
     nginx -t >/dev/null 2>&1 || { warn '现有 Nginx 配置检查失败，不能安全开启新的 HTTPS 站点。'; return 1; }
+    if reality_tcp443_configured; then
+        warn 'REALITY 正在使用 TCP/443；HY2 不能另外创建 Nginx TCP/443，须复用 REALITY 的 HTTPS 握手回落。'
+        return 1
+    fi
     occupied="$(listener_lines tcp 443)" || return 1
     if [[ -n "$occupied" ]]; then
         if hy2_443_owned_site_exists "$domain" && \
@@ -1196,25 +1346,42 @@ hy2_tcp443_preflight() {
 # Mirror h.sh's install-time 1=enable(default), 2=disable choice. Keep UDP
 # completely independent of the TCP camouflage switch.
 select_hy2_tcp443_mode() {
-    local domain="$1" insecure="$2" target="$3" choice=''
-    printf '\n%s\n' '========== HY2 TCP/443 HTTPS 伪装 / 回落（与 h.sh 选项一致） =========='
-    printf '%s\n' '1) 启用：TCP/443 HTTPS 网站（默认，与 HY2 UDP 端口独立）' \
-        '2) 关闭：仅保留 HY2 UDP 端口' \
-        '说明：sing-box 使用独立 Nginx HTTPS 站点实现，与 h.sh 的内核 listenHTTPS 行为等效。'
+    local domain="$1" insecure="$2" target="$3" choice='' real_sni=''
+    printf '\n%s\n' '========== HY2 TCP/443 HTTPS 伪装 / 回落 =========='
+    if reality_tcp443_configured; then
+        real_sni="$(jq -r '[.inbounds[]? | select(.tag=="vless-in") | .tls.server_name][0]//empty' "$CONFIG")"
+        printf '%s\n' '检测到 REALITY 已配置 TCP/443（HY2 仍使用 UDP/443）。' \
+          '1) 复用 REALITY 的 TCP/443 HTTPS 握手回落（默认，不启动第二个监听）' \
+          '2) 不要求 HY2 额外的 TCP HTTPS 伪装' \
+          "说明：浏览器走 REALITY 的 SNI ($real_sni) 和其回落站点；HY2 HTTP/3 伪装保持独立。"
+        [[ "$real_sni" == "$domain" ]] || warn "REALITY SNI=$real_sni 与 HY2 SNI=$domain 不同；不会自动修改 REALITY 客户端参数。"
+        while true; do
+            ask choice '请选择 [1/2，默认 1]: ' 1 || return 1
+            case "$choice" in
+                1)
+                    if reality_tcp443_fallback_check; then
+                        HY2_TCP443_MODE='reality'; return 0
+                    fi
+                    warn 'REALITY 的内部 HTTPS 握手目标检测失败；请先修复 REALITY 回落，或选择 2。'
+                    ;;
+                2) HY2_TCP443_MODE='off'; return 0 ;;
+                *) warn '请输入 1 或 2。' ;;
+            esac
+        done
+    fi
+    printf '%s\n' '1) 启用 Nginx TCP/443 HTTPS 伪装站（默认，HY2 UDP 独立）' \
+        '2) 关闭 TCP/443 HTTPS 伪装站（仅保留 HY2 UDP）' \
+        '说明：如果之后安装 REALITY TCP/443，脚本将迁移 s.sh 自建 HTTPS 站点到本机 TLS 桥接。'
     while true; do
         ask choice '请选择 [1/2，默认 1]: ' 1 || return 1
         case "$choice" in
             1)
                 if hy2_tcp443_preflight "$domain" "$insecure" "$target"; then
-                    HY2_TCP443_MODE='true'
-                    return 0
+                    HY2_TCP443_MODE='nginx'; return 0
                 fi
-                warn '无法启用 TCP/443 HTTPS 伪装；可选择 2 保留 HY2 UDP 功能。'
+                warn '无法启用独立 TCP/443 HTTPS 伪装；可选择 2 仅部署 HY2 UDP。'
                 ;;
-            2)
-                HY2_TCP443_MODE='false'
-                return 0
-                ;;
+            2) HY2_TCP443_MODE='off'; return 0 ;;
             *) warn '请输入 1 或 2。' ;;
         esac
     done
@@ -1228,6 +1395,13 @@ enable_hy2_tcp443_site() {
     cert="$(get_meta '.cert_file')"
     key="$(get_meta '.key_file')"
     [[ -n "$target" ]] || target="$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.masquerade][0]//empty' "$CONFIG")"
+    if reality_tcp443_configured; then
+        if reality_tcp443_fallback_check; then
+            say 'REALITY TCP/443 已接管 HTTPS 回落；不会额外创建 Nginx TCP/443 监听。'
+            return 0
+        fi
+        fail 'REALITY TCP/443 回落未通过检查，不能创建第二个 TCP/443 监听。'; return 1
+    fi
     [[ -n "$domain" && -f "$cert" && -f "$key" ]] || {
         fail '请先在菜单 1 配置有效证书，并安装 HY2。'; return 1;
     }
@@ -1333,21 +1507,31 @@ disable_hy2_tcp443_site() {
 }
 
 manage_hy2_tcp443_site() {
-    local choice='' domain='' target=''
+    local choice='' domain='' target='' mode=''
     domain="$(get_meta '.hy2.sni')"
     [[ -n "$domain" ]] || domain="$(get_meta '.cert_domain')"
     target="$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.masquerade][0]//empty' "$CONFIG" 2>/dev/null || true)"
     printf '%s\n' 'HY2 TCP/443 HTTPS 伪装/回落（与 UDP/443 独立）：' \
-        '1) 启用 / 修复（使用 HY2 当前 masquerade 目标）' \
-        '2) 关闭（仅移除 s.sh 创建的 HTTPS 配置）' \
+        '1) 启用 / 修复（若 REALITY 占用 TCP/443，则复用其回落）' \
+        '2) 关闭 HY2 自建的公开 HTTPS 站点（不改 REALITY）' \
         '0) 返回'
+    if reality_tcp443_configured; then
+        say 'REALITY 已接管 TCP/443，此菜单不会停止其 HTTPS 握手回落。'
+    fi
     ask choice '请选择 [0]: ' 0 || return 1
     case "$choice" in
         1)
             protocol_installed hy2 || { fail 'HY2 尚未安装。'; return 1; }
-            enable_hy2_tcp443_site "$domain" "$target"
+            if enable_hy2_tcp443_site "$domain" "$target"; then
+                mode=nginx
+                reality_tcp443_configured && mode=reality
+                set_meta_values --arg m "$mode" '.hy2.tcp443_wanted=true | .hy2.tcp443_mode=$m'
+            fi
             ;;
-        2) disable_hy2_tcp443_site ;;
+        2)
+            disable_hy2_tcp443_site || return 1
+            set_meta_values '.hy2.tcp443_wanted=false | .hy2.tcp443_mode="off"'
+            ;;
         *) return 0 ;;
     esac
 }
@@ -1359,7 +1543,31 @@ rollback_bridge_if_new() {
     else
         rm -f "$BRIDGE_NEW_PATH"
     fi
-    if command_ok systemctl; then systemctl reload nginx || true; else nginx -s reload || true; fi
+    nginx_reload_safely || true
+    [[ -z "$BRIDGE_NEW_BACKUP" ]] || rm -f "$BRIDGE_NEW_BACKUP"
+    BRIDGE_NEW_PATH=''; BRIDGE_NEW_BACKUP=''
+}
+
+REALITY_CONNECT_HOST=''
+select_reality_connect_host() {
+    local sni="$1" mode="$2" default='' chosen='' answer=''
+    default="$(get_meta '.reality.connect_host')"
+    if [[ "$mode" == 2 || "$mode" == 3 ]] && domain_valid "$sni"; then
+        default="$sni"
+    fi
+    [[ -n "$default" ]] || default="$(get_meta '.connect_host')"
+    [[ -n "$default" ]] || default="$(get_public_ip || true)"
+    printf '\n%s\n' '========== REALITY 客户端连接地址 =========='
+    say "REALITY TLS SNI：$sni；远程回落 SNI 不是你服务器的连接地址。"
+    ask chosen "REALITY 客户端连接域名/IP [${default:-required}]: " "$default" || return 1
+    hy2_address_valid "$chosen" || { fail '无效连接地址（需要 IP 或域名）'; return 1; }
+    if domain_valid "$chosen" && [[ ! "$chosen" =~ ^[0-9.]+$ ]]; then
+        if ! hy2_domain_dns_check "$chosen" REALITY; then
+            ask answer '仍强制使用该域名作为 REALITY 连接地址？[y/N]: ' N || return 1
+            [[ "$answer" == [Yy] ]] || return 1
+        fi
+    fi
+    REALITY_CONNECT_HOST="$chosen"
 }
 
 add_reality() {
@@ -1367,81 +1575,183 @@ add_reality() {
     ensure_singbox || return 1
     ensure_state || return 1
     local port='' mode='' sni='' target='' targetport=443 uuid='' sid='' keys='' priv='' pub='' node=''
-    local saved_sni="$(get_meta '.reality.sni')"
+    local default_mode=2 owned_hy2_site=false old_hy2_sni='' saved_sni=''
+    local reality_before='' was_active=false
+    saved_sni="$(get_meta '.reality.sni')"
+    old_hy2_sni="$(get_meta '.hy2.sni')"
+    [[ -n "$old_hy2_sni" ]] || old_hy2_sni="$(get_meta '.cert_domain')"
     ask port 'REALITY TCP 监听端口 [443]: ' 443 || return 1
-    check_port_available tcp "$port" vless-in || return 1
+    port_valid "$port" || { fail "无效 TCP 端口：$port"; return 1; }
     port=$((10#$port))
-    if jq -e ".inbounds[] | select(.tag==\"vless-in\")" "$CONFIG" >/dev/null; then
-        confirm "Replace existing REALITY node and rotate its UUID and key?" || return 0
+    if jq -e '.inbounds[]? | select(.tag=="vless-in")' "$CONFIG" >/dev/null; then
+        confirm '替换现有 REALITY？将重新生成 UUID、密钥和短 ID。' || return 0
     fi
-    printf '%s\n' 'REALITY 握手失败后的回落方式：' \
-        '1) 远程 HTTPS 网站 443（默认，不修改 Nginx）' \
-        '2) 复用已有本机 HTTPS 回落（证书须匹配 SNI）' \
-        '3) 创建独立本机 HTTPS→HTTP 8080 桥接（仅管理自建配置）' \
+    if [[ "$port" == 443 ]] && hy2_443_owned_site_exists "$old_hy2_sni"; then
+        owned_hy2_site=true
+        say '检测到 s.sh 自建 HY2 TCP/443 HTTPS 网站。将先建立本机 TLS 桥接，再安全移交 TCP/443 给 REALITY。'
+    fi
+    # Mode 2 is now the automatic local-fallback mode and is the default:
+    # discover a matching HTTPS listener, otherwise create a managed bridge.
+    # Mode 3 explicitly forces the managed Nginx -> HTTP/8080 bridge.
+    $owned_hy2_site && default_mode=2
+    printf '%s\n' 'REALITY TLS 握手失败后的 HTTPS 回落方式：' \
+        '1) 远程 HTTPS 网站 443（不修改 Nginx）' \
+        '2) 自动复用本机 HTTPS；未发现则自动创建桥接（内部端口自动分配）' \
+        '3) 强制创建/更新 Nginx 本机 HTTPS→HTTP/8080 桥接（内部端口自动分配）' \
         '0) 取消'
-    ask mode '请选择 [1]: ' 1 || return 1
+    ask mode "请选择 [$default_mode]: " "$default_mode" || return 1
+    if $owned_hy2_site && [[ "$mode" == 1 ]]; then
+        fail 'HY2 已占用 TCP/443 的自建伪装网站；为保留原网站，请选择模式 2 或 3。'
+        return 1
+    fi
     case "$mode" in
         1)
             ask sni "远程 REALITY SNI [${saved_sni:-addons.mozilla.org}]: " "${saved_sni:-addons.mozilla.org}" || return 1
-            domain_valid "$sni" || { fail "Invalid SNI: $sni"; return 1; }
+            domain_valid "$sni" || { fail "无效 SNI：$sni"; return 1; }
             ask target "远程 HTTPS 目标站 [$sni]: " "$sni" || return 1
+            domain_valid "$target" || { fail "无效回落目标：$target"; return 1; }
             ask targetport '远程 HTTPS 端口 [443]: ' 443 || return 1
             port_valid "$targetport" || return 1
             if ! check_tls_endpoint "$target" "$targetport" "$sni"; then
-                fail 'Remote HTTPS target does not present a valid matching SNI certificate; try another target.'
-                return 1
+                fail '目标 HTTPS 的证书未匹配 SNI，不能使用该远程握手目标。'; return 1
             fi
             ;;
         2)
-            local expected_sni="$(get_meta '.cert_domain')"
+            ensure_shared_cert || return 1
+            [[ "$CERT_INSECURE" != true ]] || {
+                fail 'REALITY 本机 HTTPS 回落要求可信证书；请先准备正式证书。'; return 1;
+            }
+            local expected_sni="${old_hy2_sni:-$CERT_DOMAIN}"
+            [[ -n "$expected_sni" ]] || expected_sni="$CERT_DOMAIN"
             ask sni "本机 HTTPS 证书域名 / SNI [${expected_sni:-required}]: " "$expected_sni" || return 1
             domain_valid "$sni" || return 1
             target=127.0.0.1
-            ask targetport '已有本机 HTTPS 端口 [8081]: ' 8081 || return 1
-            port_valid "$targetport" || return 1
-            check_tls_endpoint "$target" "$targetport" "$sni" || {
-                fail "127.0.0.1:$targetport TLS unavailable or certificate does not match $sni"; return 1;
-            }
+            local auto_fallback_url='http://127.0.0.1:8080'
+            if $owned_hy2_site; then
+                # Preserve the exact HY2 cover destination when handing public
+                # TCP/443 from Nginx to REALITY. Internal bridge port is dynamic.
+                auto_fallback_url="$(jq -r '[.inbounds[]? | select(.tag=="hy2-in") | .masquerade][0] // "http://127.0.0.1:8080"' "$CONFIG")"
+                cert_valid "$sni" "$CERT_FILE" "$KEY_FILE" || {
+                    fail "共享证书与 HY2 原伪装站 SNI ($sni) 不匹配，不能安全迁移。"; return 1;
+                }
+                create_bridge "$sni" "$auto_fallback_url" || return 1
+                targetport="$BRIDGE_PORT"
+            else
+                targetport="$(find_local_https_fallback_port "$sni" || true)"
+                if [[ -n "$targetport" ]]; then
+                    say "自动发现并复用本机 HTTPS 回落：127.0.0.1:$targetport（证书匹配 $sni）"
+                else
+                    say '未发现证书匹配的本机 HTTPS 服务，自动创建 Nginx TLS 桥接并分配空闲内部端口。'
+                    cert_valid "$sni" "$CERT_FILE" "$KEY_FILE" || {
+                        fail "未找到与 $sni 匹配的本机 HTTPS 服务，且共享证书不匹配；请使用证书域名或先配置匹配证书。"; return 1;
+                    }
+                    create_bridge "$sni" "$auto_fallback_url" || return 1
+                    targetport="$BRIDGE_PORT"
+                fi
+            fi
             ;;
         3)
             ensure_shared_cert || return 1
             [[ "$CERT_INSECURE" != true ]] || {
-                fail 'REALITY local HTTPS bridge needs a publicly trusted certificate; self-signed not supported here.'; return 1;
+                fail 'REALITY 本机 HTTPS 桥接要求可信证书；请先申请正式证书。'; return 1;
             }
             sni="$CERT_DOMAIN"
-            create_bridge "$sni" || return 1
+            local fallback_url='http://127.0.0.1:8080'
+            if $owned_hy2_site; then
+                fallback_url="$(jq -r '[.inbounds[]? | select(.tag=="hy2-in") | .masquerade][0] // "http://127.0.0.1:8080"' "$CONFIG")"
+            fi
+            create_bridge "$sni" "$fallback_url" || return 1
             target=127.0.0.1; targetport="$BRIDGE_PORT"
             ;;
-        *) return 1 ;;
+        0) return 0 ;;
+        *) fail '请输入 1、2、3 或 0。'; return 1 ;;
     esac
-    keys="$(sing-box generate reality-keypair)" || return 1
+    if ! select_reality_connect_host "$sni" "$mode"; then
+        rollback_bridge_if_new; return 1
+    fi
+    if $owned_hy2_site; then
+        if [[ "$sni" != "$old_hy2_sni" ]]; then
+            rollback_bridge_if_new
+            fail 'REALITY 与已有 HY2 自建 HTTPS 站点 SNI 不一致，拒绝迁移。'; return 1
+        fi
+        if ! release_hy2_public443_for_reality "$old_hy2_sni"; then
+            rollback_bridge_if_new; return 1
+        fi
+    fi
+    # Release only the s.sh owned HTTPS vhost, not Nginx itself; reject any
+    # remaining external TCP listener or another sing-box TCP inbound.
+    if ! check_port_available tcp "$port" vless-in; then
+        restore_reality_migrated_site
+        rollback_bridge_if_new
+        return 1
+    fi
+    keys="$(sing-box generate reality-keypair)" || {
+        restore_reality_migrated_site; rollback_bridge_if_new; return 1;
+    }
     priv="$(sed -nE 's/^[[:space:]]*PrivateKey:[[:space:]]*//p' <<< "$keys" | head -n 1)"
     pub="$(sed -nE 's/^[[:space:]]*PublicKey:[[:space:]]*//p' <<< "$keys" | head -n 1)"
     if [[ -z "$priv" || -z "$pub" ]]; then
-        warn 'Unable to parse Reality keys'; rollback_bridge_if_new; return 1
+        warn 'REALITY 公私钥解析失败。'
+        restore_reality_migrated_site; rollback_bridge_if_new; return 1
     fi
     uuid="$(cat /proc/sys/kernel/random/uuid)"
     sid="$(openssl rand -hex 4)"
-    node="$(make_node_file)" || return 1
-    jq -n --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg target "$target" \
+    node="$(make_node_file)" || { restore_reality_migrated_site; rollback_bridge_if_new; return 1; }
+    if ! jq -n --argjson port "$port" --arg uuid "$uuid" --arg sni "$sni" --arg target "$target" \
         --argjson targetport "$targetport" --arg priv "$priv" --arg sid "$sid" \
         '{type:"vless",tag:"vless-in",listen:"::",listen_port:$port,
          users:[{uuid:$uuid,flow:"xtls-rprx-vision"}],
          tls:{enabled:true,server_name:$sni,reality:{enabled:true,
-            handshake:{server:$target,server_port:$targetport},private_key:$priv,short_id:[$sid]}}}' > "$node"
+            handshake:{server:$target,server_port:$targetport},private_key:$priv,short_id:[$sid]}}}' > "$node"; then
+        rm -f "$node"; restore_reality_migrated_site; rollback_bridge_if_new; return 1
+    fi
+    reality_before="$(mktemp /tmp/s-sh-reality-before.XXXXXXXX)" || {
+        rm -f "$node"; restore_reality_migrated_site; rollback_bridge_if_new; return 1;
+    }
+    cp -a "$CONFIG" "$reality_before" || {
+        rm -f "$node" "$reality_before"; restore_reality_migrated_site; rollback_bridge_if_new; return 1;
+    }
+    service_active && was_active=true
     if ! apply_inbound vless-in "$node"; then
-        rm -f "$node"; rollback_bridge_if_new; return 1
+        rm -f "$node" "$reality_before"
+        restore_reality_migrated_site; rollback_bridge_if_new
+        return 1
     fi
     rm -f "$node"
-    if [[ -n "$BRIDGE_NEW_BACKUP" ]]; then rm -f "$BRIDGE_NEW_BACKUP"; fi
+    # For either auto-detected local HTTPS or a managed TLS bridge, verify
+    # REALITY's public TCP/443 route reaches the HTTPS website, not merely
+    # that its socket is bound.
+    if [[ "$port" == 443 && ( "$mode" == 2 || "$mode" == 3 ) ]] &&
+       ! check_tls_endpoint 127.0.0.1 443 "$sni"; then
+        warn 'REALITY 已监听 TCP/443，但实际 HTTPS 握手回落未通过验证；恢复原配置。'
+        cp -a "$reality_before" "$CONFIG"
+        if $was_active; then service_restart || true; else service_stop || true; fi
+        restore_reality_migrated_site
+        rollback_bridge_if_new
+        rm -f "$reality_before"
+        fail 'REALITY 回落测试失败，旧配置和 HY2 网站已恢复。'; return 1
+    fi
+    rm -f "$reality_before"
+    # From here both Reality and (if installed) HY2 are live; website traffic
+    # reaches the loopback TLS bridge via the Reality handshake.
+    commit_reality_migrated_site
+    [[ -z "$BRIDGE_NEW_BACKUP" ]] || rm -f "$BRIDGE_NEW_BACKUP"
     BRIDGE_NEW_PATH=''; BRIDGE_NEW_BACKUP=''
-    set_meta_values --arg p "$pub" --arg sni "$sni" --arg target "$target" \
-        --argjson targetport "$targetport" \
-        '.reality={public_key:$p,sni:$sni,fallback_host:$target,fallback_port:$targetport}'
-    # Keep legacy sb compatibility without exposing private key.
+    if ! set_meta_values --arg p "$pub" --arg sni "$sni" --arg target "$target" \
+        --argjson targetport "$targetport" --arg mode "$mode" --arg h "$REALITY_CONNECT_HOST" \
+        '.reality={public_key:$p,sni:$sni,connect_host:$h,fallback_host:$target,fallback_port:$targetport,fallback_mode:$mode}'; then
+        warn 'REALITY 服务已启动，但元数据记录失败，请检查输出链接的 PublicKey。'
+    fi
     printf '%s' "$pub" > /etc/sing-box/.reality_pub
     chmod 600 /etc/sing-box/.reality_pub
-    ensure_connect_host || return 1
+    if [[ "$port" == 443 ]] && protocol_installed hy2; then
+        # No longer publicly bind TCP/443 in HY2's Nginx vhost; the H public
+        # cover preference is preserved so it can be restored if R is removed.
+        if [[ "$(get_meta '.hy2.tcp443_wanted')" != false ]]; then
+            set_meta_values '.hy2.tcp443_wanted=true | .hy2.tcp443_mode="reality"' || true
+        fi
+        say '共存成功：REALITY TCP/443、HY2 UDP/443；普通浏览器由 REALITY 回落至 HTTPS 网站。'
+    fi
     protocol_report reality
 }
 
@@ -1506,7 +1816,7 @@ show_links() {
         if [[ -n "$port" ]]; then
             method="$(jq -r '[.inbounds[]|select(.tag=="ss-in")|.method][0]//empty' "$CONFIG")"
             password="$(jq -r '[.inbounds[]|select(.tag=="ss-in")|.password][0]//empty' "$CONFIG")"
-            name="$(urlenc "ss${label:+-$label}")"
+            name="$(urlenc 'S')"
             uri="ss://$(base64one "$method:$password")@$authority_host:$port#$name"
             say 'Base64 仅为链接编码；在 X-UI 出站中填写下方落地参数，保存后重启生效。'
             print_ss_landing_params "$host" "$port" "$method" "$password"
@@ -1531,7 +1841,7 @@ show_links() {
             local hy2_insecure="$(get_meta '.hy2.insecure')"
             [[ -n "$hy2_insecure" ]] || hy2_insecure="$(get_meta '.hy2_insecure')"
             [[ "$hy2_insecure" == true ]] && query+='&insecure=1'
-            uri="hy2://$(urlenc "$password")@$hy2_authority:$port/?${query}#$(urlenc "hy2${label:+-$label}")"
+            uri="hy2://$(urlenc "$password")@$hy2_authority:$port/?${query}#$(urlenc 'H')"
             printf '\n=== Hysteria2 (UDP/%s) ===\n%s\n' "$port" "$uri"
             printf '  地址/域名：%s\n  UDP 端口：%s\n  HY2 原始密码：%s\n  TLS SNI：%s\n  传输：UDP / QUIC，ALPN h3\n' \
                 "$hy2_host" "$port" "$password" "$sni"
@@ -1550,10 +1860,15 @@ show_links() {
             if [[ -z "$key" ]]; then
                 warn 'Public key missing for existing REALITY node; cannot safely generate a link.'
             else
-                uri="vless://$uuid@$authority_host:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(urlenc "$sni")&fp=chrome&pbk=$(urlenc "$key")&sid=$sid&type=tcp#$(urlenc "reality${label:+-$label}")"
+                local reality_host reality_authority
+                reality_host="$(get_meta '.reality.connect_host')"
+                [[ -n "$reality_host" ]] || reality_host="$host"
+                reality_authority="$reality_host"
+                [[ "$reality_host" != *:* || "$reality_host" == \[* ]] || reality_authority="[$reality_host]"
+                uri="vless://$uuid@$reality_authority:$port?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$(urlenc "$sni")&fp=chrome&pbk=$(urlenc "$key")&sid=$sid&type=tcp#$(urlenc 'R')"
                 printf '\n=== VLESS REALITY (TCP/%s) ===\n%s\n' "$port" "$uri"
                 printf '  地址/域名：%s\n  TCP 端口：%s\n  UUID：%s\n  SNI：%s\n  PublicKey：%s\n  ShortID：%s\n  Flow：xtls-rprx-vision\n  传输：TCP / REALITY\n' \
-                    "$host" "$port" "$uuid" "$sni" "$key" "$sid"
+                    "$reality_host" "$port" "$uuid" "$sni" "$key" "$sid"
                 printf '  Fallback: %s:%s\n' \
                     "$(jq -r '[.inbounds[]|select(.tag=="vless-in")|.tls.reality.handshake.server][0]//empty' "$CONFIG")" \
                     "$(jq -r '[.inbounds[]|select(.tag=="vless-in")|.tls.reality.handshake.server_port][0]//empty' "$CONFIG")"
@@ -1655,6 +1970,18 @@ remove_protocol() {
     say "已卸载 $(protocol_name "$kind") 入站。其他入站保留，sing-box 服务状态未更改。"
     if [[ "$kind" == hy2 ]]; then
         say '如启用了 HY2 专属 TCP/443 伪装站，可在 HY2 子菜单单独关闭；默认不改 Nginx。'
+    elif [[ "$kind" == reality && "$active_before" == true ]] && protocol_installed hy2; then
+        if [[ "$(get_meta '.hy2.tcp443_wanted')" == true ]]; then
+            local hy2_domain='' hy2_target=''
+            hy2_domain="$(get_meta '.hy2.sni')"
+            hy2_target="$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.masquerade][0]//empty' "$CONFIG")"
+            say 'REALITY 已卸载；尝试恢复 HY2 原有的 Nginx TCP/443 HTTPS 伪装。'
+            if enable_hy2_tcp443_site "$hy2_domain" "$hy2_target"; then
+                set_meta_values '.hy2.tcp443_mode="nginx"' || true
+            else
+                warn 'REALITY 已卸载、HY2 UDP 仍运行，但 HTTPS 网站未能恢复；可在 HY2 菜单 5 手动修复。'
+            fi
+        fi
     fi
 }
 
@@ -1680,6 +2007,9 @@ protocol_status() {
         if [[ "$kind" == hy2 ]]; then
             local recorded_hy2_host="$(get_meta '.hy2.connect_host')"
             [[ -z "$recorded_hy2_host" ]] || connect_host="$recorded_hy2_host"
+        elif [[ "$kind" == reality ]]; then
+            local recorded_reality_host="$(get_meta '.reality.connect_host')"
+            [[ -z "$recorded_reality_host" ]] || connect_host="$recorded_reality_host"
         fi
         [[ -n "$connect_host" ]] || connect_host="$(get_public_ip || true)"
         if [[ "$kind" == ss ]]; then
@@ -1707,7 +2037,13 @@ protocol_status() {
                     "$(jq -r '.tls.certificate_path // empty' <<< "$line")" \
                     "$(jq -r '.masquerade // "未设置"' <<< "$line")"
                 printf '传输说明：UDP / QUIC / TLS，ALPN h3；出站需支持 Hysteria2\n'
-                if domain_valid "$sni" && hy2_443_owned_site_exists "$sni" && check_tls_endpoint 127.0.0.1 443 "$sni"; then
+                if reality_tcp443_configured; then
+                    if reality_tcp443_fallback_check; then
+                        printf 'TCP/443 HTTPS 回落：由 REALITY 握手转发（无需第二个 Nginx 443 监听）\n'
+                    else
+                        printf 'TCP/443 HTTPS 回落：REALITY 已占用 TCP/443，但握手目标未通过检测\n'
+                    fi
+                elif domain_valid "$sni" && hy2_443_owned_site_exists "$sni" && check_tls_endpoint 127.0.0.1 443 "$sni"; then
                     printf 'TCP/443 HTTPS 回落：已启用（Nginx）\n'
                 else
                     printf 'TCP/443 HTTPS 回落：未启用 / 未通过检测（可用菜单 5 管理）\n'
@@ -2218,15 +2554,14 @@ common_setup_all() {
     if command_ok sing-box; then sing-box version | head -n 2 || true; fi
     say '[3/5] 设置通用节点连接 IP / DDNS（HY2 安装时可单独使用证书域名）'
     select_host || return 1
-    say '[4/5] 设置客户端节点名称后缀'
-    set_node_name || return 1
+    say '[4/5] 节点链接名固定为 R（REALITY）、H（HY2）、S（SS），不再设置名称后缀。'
     say '[5/5] 申请或复用 TLS 证书（参照 x.sh 的 Y/n/q 流程）'
     say '请直接输入证书域名进入 Y/n/q 选择；如果仅用 SS，可在域名提示处留空或在证书选项输入 q。'
     prepare_domain_cert || warn '证书尚未准备，可在之后重新运行菜单 1 处理；不影响 SS。'
     printf '\n'
-    say '通用环境完成：独立 sing-box 内核、二维码依赖、节点地址及名称已经准备。'
-    printf '  节点连接地址：%s\n  节点名称：%s\n  证书域名：%s\n' \
-        "$(get_meta '.connect_host')" "$(get_meta '.node_name')" "$(get_meta '.cert_domain')"
+    say '通用环境完成：独立 sing-box 内核、二维码依赖和证书已经准备。'
+    printf '  节点连接地址：%s\n  导入名称：R / H / S\n  证书域名：%s\n' \
+        "$(get_meta '.connect_host')" "$(get_meta '.cert_domain')"
 }
 show_menu() {
     local active_label='' version=''
