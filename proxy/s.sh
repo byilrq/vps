@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# s.sh v6.1 - standalone sing-box deployment/management (no S-UI, no web panel).
+# s.sh v6.3 - HY2 domain address + h.sh-style TCP/443 HTTPS cover setup.
 # Revised from the user's s(9).sh: SS, HY2, VLESS REALITY; independent protocol submenus.
 # Protocol removal edits only the named sing-box inbound, not other services.
 # Kernel updates preserve configs; full uninstall removes ALL protocols and credentials.
@@ -213,6 +213,126 @@ select_host() {
     [[ -n "$picked" && "$picked" =~ ^([a-zA-Z0-9.-]+|[a-fA-F0-9:]+|\[[a-fA-F0-9:]+\])$ ]] || fail 'Invalid client address' 
     CONNECT_HOST="$picked"
     set_meta_values --arg h "$picked" '.connect_host=$h'
+}
+
+# HY2 can use its certificate/SNI domain as the actual connection address,
+# independently of the shared SS/REALITY connection host. In contrast to SNI,
+# this address MUST resolve directly to the VPS (Cloudflare orange cloud does
+# not proxy generic Hysteria2 UDP/QUIC traffic).
+hy2_address_valid() {
+    local h="$1" part
+    [[ "$h" != *$'\n'* && "$h" != *$'\r'* && "$h" != *' '* ]] || return 1
+    if [[ "$h" == \[*\] ]]; then h="${h:1:${#h}-2}"; fi
+    if [[ "$h" == *:* ]]; then
+        command_ok python3 || return 1
+        python3 - "$h" <<'PY_HY2_ADDR'
+import ipaddress
+import sys
+try:
+    addr = ipaddress.IPv6Address(sys.argv[1])
+    if addr.is_unspecified or addr.is_multicast:
+        raise ValueError('unsuitable client endpoint')
+except ValueError:
+    sys.exit(1)
+PY_HY2_ADDR
+    elif [[ "$h" =~ ^[0-9.]+$ ]]; then
+        local o1 o2 o3 o4 rest
+        IFS=. read -r o1 o2 o3 o4 rest <<< "$h"
+        [[ -z "$rest" && -n "$o4" ]] || return 1
+        for part in "$o1" "$o2" "$o3" "$o4"; do
+            [[ "$part" =~ ^[0-9]{1,3}$ ]] && (( 10#$part <= 255 )) || return 1
+        done
+    else
+        domain_valid "$h"
+    fi
+}
+
+# Read DNS without changing the system resolver, DDNS or Cloudflare settings.
+# Returns 0 only if one DNS A/AAAA record matches an identifiable local/public
+# address. For NAT/VPS proxies where this cannot be established, confirmation
+# is required rather than silently publishing an unusable domain URI.
+hy2_domain_dns_check() {
+    local d="$1" v4='' v6='' public_v4='' local_v6='' addr=''
+    local matched=false mismatched=false
+    if command_ok getent; then
+        v4="$(getent ahostsv4 "$d" 2>/dev/null | awk '{print $1}' | sort -u | paste -sd, - || true)"
+        v6="$(getent ahostsv6 "$d" 2>/dev/null | awk '{print $1}' | grep -v '^::ffff:' | sort -u | paste -sd, - || true)"
+    fi
+    public_v4="$(get_public_ip || true)"
+    if command_ok ip; then
+        local_v6="$(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | sort -u | paste -sd, - || true)"
+    fi
+    printf '  HY2 连接域名：%s\n  DNS A：%s\n  DNS AAAA：%s\n' \
+        "$d" "${v4:-未解析到}" "${v6:-未解析到}"
+    printf '  当前公网 IPv4：%s\n  本机全局 IPv6：%s\n' \
+        "${public_v4:-无法确定}" "${local_v6:-无/无法确定}"
+    # Any extra A/AAAA pointing elsewhere can cause clients to select the
+    # wrong address (especially AAAA over A), even when one record is valid.
+    for addr in ${v4//,/ }; do
+        if [[ -n "$public_v4" && "$addr" == "$public_v4" ]]; then
+            matched=true
+        else
+            mismatched=true
+        fi
+    done
+    for addr in ${v6//,/ }; do
+        if [[ -n "$local_v6" ]] && [[ ",${local_v6,,}," == *",${addr,,},"* ]]; then
+            matched=true
+        else
+            mismatched=true
+        fi
+    done
+    if $matched && ! $mismatched; then
+        say 'HY2 域名解析的 A/AAAA 记录均与已检测到的 VPS 地址一致。'
+        return 0
+    fi
+    warn '无法确认域名的所有 A/AAAA 都直接指向本 VPS；若存在多余的 AAAA，客户端可能优先访问错误 IPv6。'
+    warn 'Cloudflare 橙云/CDN、错误 A/AAAA 或 DNS 尚未生效都会使 HY2 域名连接失败。'
+    warn '请使用 DNS only（灰云）或直连的 A/AAAA，并确保对应 IP 的 UDP 端口可访问。'
+    return 1
+}
+
+HY2_CONNECT_HOST=''
+select_hy2_connect_host() {
+    local sni="$1" insecure="$2" default='' chosen='' answer=''
+    default="$(get_meta '.hy2.connect_host')"
+    if [[ "$insecure" != true ]] && domain_valid "$sni"; then
+        default="$sni"
+    fi
+    [[ -n "$default" ]] || default="$(get_meta '.connect_host')"
+    [[ -n "$default" ]] || default="$(get_public_ip || true)"
+    printf '\n%s\n' '========== HY2 专用连接地址（不修改 SS/REALITY 的地址） =========='
+    say "TLS SNI / 证书域名：$sni"
+    ask chosen "HY2 客户端连接地址（建议同 SNI）[${default:-required}]: " "$default" || return 1
+    hy2_address_valid "$chosen" || { fail 'HY2 连接地址无效（需要有效 IPv4/IPv6/域名）'; return 1; }
+    if domain_valid "$chosen" && [[ ! "$chosen" =~ ^[0-9.]+$ ]]; then
+        if ! hy2_domain_dns_check "$chosen"; then
+            ask answer '仍强制使用该域名作为连接地址？[y/N]: ' N || return 1
+            [[ "$answer" == [Yy] ]] || { warn '已取消使用该域名。请检查 DNS，或重新选择实际可达的连接 IP。'; return 1; }
+        fi
+    fi
+    if [[ "$chosen" != "$sni" ]]; then
+        warn "连接地址 $chosen 与 TLS SNI $sni 不同。只要地址实际可达且证书匹配 SNI，协议仍可正常使用。"
+    fi
+    HY2_CONNECT_HOST="$chosen"
+}
+
+# Update only the client address. No HY2 password rotation, config rewrite,
+# service restart or unrelated protocol changes are involved.
+change_hy2_connect_host() {
+    ensure_state || return 1
+    protocol_installed hy2 || { fail 'HY2 尚未安装。'; return 1; }
+    local sni insecure
+    sni="$(get_meta '.hy2.sni')"
+    [[ -n "$sni" ]] || sni="$(get_meta '.cert_domain')"
+    [[ -n "$sni" ]] || { fail 'HY2 TLS SNI 未记录，无法安全修改客户端地址。'; return 1; }
+    insecure="$(get_meta '.hy2.insecure')"
+    [[ -n "$insecure" ]] || insecure="$(get_meta '.hy2_insecure')"
+    select_hy2_connect_host "$sni" "$insecure" || return 1
+    set_meta_values --arg h "$HY2_CONNECT_HOST" \
+        '.hy2 = (.hy2 // {}) | .hy2.connect_host=$h' || return 1
+    say "HY2 分享链接的连接地址已更新为 $HY2_CONNECT_HOST，服务端和密码均未变化。"
+    protocol_report hy2
 }
 
 # Avoid asking the connection address again after menu 1 already saved it.
@@ -612,6 +732,28 @@ EOF
     fi
 }
 
+# Sing-box's official v1.14.4 package ships with a 635-byte demo config
+# containing an untagged Shadowsocks TCP/8080 inbound. It is not a user-
+# installed SS node. Match the COMPLETE official JSON, including its public
+# sample password, to avoid mistaking a user-configured SS node for a demo.
+# We do not rewrite an active service's configuration automatically.
+is_official_singbox_sample_config() {
+    local file="$1"
+    [[ -s "$file" ]] || return 1
+    jq -e '. == {
+      "log": {"level": "info"},
+      "dns": {"servers": [{"type":"tls","tag":"google","server":"8.8.8.8"}]},
+      "inbounds": [{
+        "type":"shadowsocks", "listen":"::", "listen_port":8080,
+        "network":"tcp", "method":"2022-blake3-aes-128-gcm",
+        "password":"Gn1JUS14bLUHgv1cWDDp4A==",
+        "multiplex":{"enabled":true,"padding":true}
+      }],
+      "outbounds": [{"type":"direct"}],
+      "route": {"rules":[{"port":53,"action":"hijack-dns"}]}
+    }' "$file" >/dev/null 2>&1
+}
+
 # Detect *retained* inbound sockets BEFORE restarting the shared sing-box service.
 # "sing-box check" only validates syntax; it cannot detect an existing Nginx
 # listener that clashes with an old inbound from an example config.
@@ -712,10 +854,26 @@ apply_inbound() {
     cp -a "$CONFIG" "$snap" || return 1
     cp -a "$META" "$meta_snap" || return 1
     service_active && active_before=true
-    if ! jq --arg tag "$tag" --slurpfile node "$newfile" '
-        .inbounds = ([.inbounds[] | select(.tag != $tag)] + [$node[0]])
-      ' "$CONFIG" > "$temp"; then
-        rm -f "$temp" "$snap" "$meta_snap"; return 1
+    # Fresh package installs have a demo Shadowsocks/8080 entry even if the
+    # operator only ever chose HY2. Build a clean candidate (not a second
+    # inbound added to the demo). On success, preserve the original full
+    # sample config in BACKUPS; on failure, restore it and the former state.
+    if [[ "$active_before" == false ]] && is_official_singbox_sample_config "$CONFIG"; then
+        say '检测到 sing-box 官方默认演示配置（并非你安装的 SS 协议）。'
+        say '将使用纯净配置安装所选协议，移除示例 SS/8080；Nginx 8080 不变。原配置会备份。'
+        if ! jq -n --slurpfile node "$newfile" '
+            {log:{level:"info",timestamp:true},
+             inbounds:[$node[0]],
+             outbounds:[{type:"direct",tag:"direct-out"}]}
+        ' > "$temp"; then
+            rm -f "$temp" "$snap" "$meta_snap"; return 1
+        fi
+    else
+        if ! jq --arg tag "$tag" --slurpfile node "$newfile" '
+            .inbounds = ([.inbounds[] | select(.tag != $tag)] + [$node[0]])
+          ' "$CONFIG" > "$temp"; then
+            rm -f "$temp" "$snap" "$meta_snap"; return 1
+        fi
     fi
     if ! preflight_retained_inbounds "$temp" "$tag"; then
         rm -f "$temp" "$snap" "$meta_snap"
@@ -809,19 +967,23 @@ add_hy2() {
     ensure_singbox || return 1
     ensure_state || return 1
     local port='' password='' masq='' default_masq='https://www.bing.com' node=''
+    local tcp443_mode=''
     say 'Hysteria2 is QUIC/UDP; default UDP port is 443, independent of TCP/443.'
     ask port 'HY2 UDP 监听端口 [443]: ' 443 || return 1
     check_port_available udp "$port" hy2-in || return 1
     port=$((10#$port))
-    if jq -e ".inbounds[] | select(.tag==\"hy2-in\")" "$CONFIG" >/dev/null; then
-        confirm "Replace existing HY2 node and rotate its password?" || return 0
+    if jq -e '.inbounds[] | select(.tag=="hy2-in")' "$CONFIG" >/dev/null; then
+        confirm 'Replace existing HY2 node and rotate its password?' || return 0
     fi
     ensure_shared_cert || return 1
+    select_hy2_connect_host "$CERT_DOMAIN" "$CERT_INSECURE" || return 1
     if [[ -n "$(listener_lines tcp 8080 2>/dev/null || true)" ]]; then
         default_masq='http://127.0.0.1:8080'
     fi
     ask masq "未认证 HTTP/3 伪装网站 URL [$default_masq]: " "$default_masq" || return 1
-    [[ "$masq" =~ ^https?://[^[:space:]]+$ ]] || { fail 'Masquerade requires http:// or https:// URL'; return 1; }
+    hy2_masq_validate "$masq" "$CERT_DOMAIN" || { fail '伪装 URL 无效或会导致本机回环'; return 1; }
+    select_hy2_tcp443_mode "$CERT_DOMAIN" "$CERT_INSECURE" "$masq" || return 1
+    tcp443_mode="$HY2_TCP443_MODE"
     password="$(openssl rand -base64 24 | tr -d '\r\n')"
     node="$(make_node_file)" || return 1
     jq -n --argjson port "$port" --arg password "$password" --arg cert "$CERT_FILE" \
@@ -831,9 +993,25 @@ add_hy2() {
          tls:{enabled:true,alpn:["h3"],certificate_path:$cert,key_path:$key}}' > "$node"
     if ! apply_inbound hy2-in "$node"; then rm -f "$node"; return 1; fi
     rm -f "$node"
-    set_meta_values --arg sni "$CERT_DOMAIN" --argjson insecure "$CERT_INSECURE" \
-        '.hy2={sni:$sni,insecure:$insecure}' || warn 'HY2 元数据写入失败，请核对节点链接。'
-    ensure_connect_host || return 1
+    # Do not overwrite the global .connect_host used by SS/REALITY.
+    if ! set_meta_values --arg sni "$CERT_DOMAIN" --argjson insecure "$CERT_INSECURE" \
+        --arg h "$HY2_CONNECT_HOST" \
+        '.hy2={sni:$sni,insecure:$insecure,connect_host:$h}'; then
+        warn 'HY2 已安装，但节点地址元数据保存失败，请从菜单 6 修复。'
+        return 1
+    fi
+    if [[ "$tcp443_mode" == 'true' ]]; then
+        if ! enable_hy2_tcp443_site "$CERT_DOMAIN" "$masq"; then
+            warn 'HY2 的 UDP 入站已成功安装，但 TCP/443 HTTPS 伪装站启用失败。'
+            warn '可以先使用 HY2 节点，修复 Nginx 后通过 HY2 菜单 5 再启用回落。'
+            protocol_report hy2
+            return 1
+        fi
+    else
+        if hy2_443_owned_site_exists "$CERT_DOMAIN"; then
+            disable_hy2_tcp443_site || warn '无法关闭旧的 s.sh 专属 TCP/443 站点，请手动在菜单 5 检查。'
+        fi
+    fi
     protocol_report hy2
 }
 
@@ -932,71 +1110,176 @@ EOF
     BRIDGE_NEW_BACKUP="$existing"
     say "Local HTTPS bridge ready 127.0.0.1:$bridge_port -> HTTP 127.0.0.1:$target_port"
 }
-# Optional HY2-only TCP/443 cover website. HY2 itself uses UDP/443; when
-# Reality also uses TCP/443, do NOT enable this separate HTTPS listener.
+# Hysteria2 standalone (h.sh) supports masquerade.listenHTTPS directly.
+# sing-box's HY2 inbound only provides HTTP/3 masquerade; implement its
+# optional TCP/443 counterpart with a separately owned Nginx HTTPS site.
+# Both send unauthenticated requests to the SAME proxy target. No existing
+# Nginx/Reality/Xray site is stopped or rewritten.
 HY2_443_MARKER='# S_SH_MANAGED_HY2_TCP443_V1'
+HY2_TCP443_MODE='false'
 hy2_443_path() {
     local domain="$1"
     domain_valid "$domain" || return 1
     printf '/etc/nginx/conf.d/s-script-hy2-tcp443-%s.conf' "$domain"
 }
+hy2_443_owned_site_exists() {
+    local file
+    file="$(hy2_443_path "$1")" || return 1
+    [[ -f "$file" ]] && head -n 1 "$file" | grep -Fqx "$HY2_443_MARKER"
+}
+
+# Strict URL validation; never interpolate untrusted semicolons, newlines,
+# dollar signs or other Nginx syntax into a generated configuration file.
+# Also reject local HTTPS/443 recursion (same SNI, same TCP cover).
+hy2_masq_validate() {
+    local url="$1" domain="${2:-}"
+    command_ok python3 || { fail 'python3 is required for masquerade URL validation'; return 1; }
+    python3 - "$url" "$domain" <<'PY_VALIDATE_URL'
+import re
+import sys
+from urllib.parse import urlsplit
+url, domain = sys.argv[1:]
+if len(url) > 2048 or not re.fullmatch(r'[a-zA-Z0-9:/._~%?&=+,-]+', url):
+    sys.exit(1)
+try:
+    u = urlsplit(url)
+    if u.scheme not in ('http', 'https') or not u.hostname or u.username or u.password or u.fragment:
+        sys.exit(1)
+    port = u.port
+    host = u.hostname.lower()
+    # Host may be FQDN or IPv4; the server's local fallback can use loopback.
+    if not re.fullmatch(r'[a-z0-9.-]+', host):
+        sys.exit(1)
+    if port is not None and not (1 <= port <= 65535):
+        sys.exit(1)
+    if u.scheme == 'https' and port in (None, 443) and host in (
+        domain.lower(), '127.0.0.1', 'localhost', '0.0.0.0'
+    ):
+        sys.exit(1)
+except ValueError:
+    sys.exit(1)
+PY_VALIDATE_URL
+}
+
+# Check whether TCP 443 belongs to our previously created website. This
+# avoids treating a reinstallation as an external port conflict.
+hy2_tcp443_preflight() {
+    local domain="$1" insecure="$2" target="$3" occupied=''
+    [[ "$insecure" != true ]] || { warn '自签证书不能提供浏览器可信的 TCP/443 HTTPS 网站，请选择关闭回落。'; return 1; }
+    domain_valid "$domain" || return 1
+    hy2_masq_validate "$target" "$domain" || { warn '伪装目标 URL 不安全/不支持（可能形成自身代理循环）。'; return 1; }
+    command_ok nginx || { warn 'Nginx 未安装，无法提供 TCP/443 HTTPS 伪装站。'; return 1; }
+    nginx -t >/dev/null 2>&1 || { warn '现有 Nginx 配置检查失败，不能安全开启新的 HTTPS 站点。'; return 1; }
+    occupied="$(listener_lines tcp 443)" || return 1
+    if [[ -n "$occupied" ]]; then
+        if hy2_443_owned_site_exists "$domain" && \
+           [[ "$occupied" == *nginx* ]] && \
+           ! grep -qv 'nginx' <<< "$occupied" && \
+           check_tls_endpoint 127.0.0.1 443 "$domain"; then
+            say 'TCP/443 已由本脚本之前创建的 HY2 HTTPS 伪装站监听；将安全复用。'
+        else
+            warn 'TCP/443 已被其它进程/网站占用，不会停止 Xray、REALITY 或 Nginx 已有网站。'
+            printf '%s\n' "$occupied" >&2
+            return 1
+        fi
+    fi
+    # For local HTTP masquerade, verify there is a backend; remote URLs are
+    # handled by Nginx's proxy_pass and do not require local TCP 8080.
+    if [[ "$target" == http://127.0.0.1:8080* || "$target" == http://localhost:8080* ]]; then
+        [[ -n "$(listener_lines tcp 8080)" ]] || {
+            warn '伪装目标是本地 HTTP/8080，但没有监听该端口的网站。'; return 1;
+        }
+    fi
+    return 0
+}
+
+# Mirror h.sh's install-time 1=enable(default), 2=disable choice. Keep UDP
+# completely independent of the TCP camouflage switch.
+select_hy2_tcp443_mode() {
+    local domain="$1" insecure="$2" target="$3" choice=''
+    printf '\n%s\n' '========== HY2 TCP/443 HTTPS 伪装 / 回落（与 h.sh 选项一致） =========='
+    printf '%s\n' '1) 启用：TCP/443 HTTPS 网站（默认，与 HY2 UDP 端口独立）' \
+        '2) 关闭：仅保留 HY2 UDP 端口' \
+        '说明：sing-box 使用独立 Nginx HTTPS 站点实现，与 h.sh 的内核 listenHTTPS 行为等效。'
+    while true; do
+        ask choice '请选择 [1/2，默认 1]: ' 1 || return 1
+        case "$choice" in
+            1)
+                if hy2_tcp443_preflight "$domain" "$insecure" "$target"; then
+                    HY2_TCP443_MODE='true'
+                    return 0
+                fi
+                warn '无法启用 TCP/443 HTTPS 伪装；可选择 2 保留 HY2 UDP 功能。'
+                ;;
+            2)
+                HY2_TCP443_MODE='false'
+                return 0
+                ;;
+            *) warn '请输入 1 或 2。' ;;
+        esac
+    done
+}
 
 enable_hy2_tcp443_site() {
     ensure_tools && ensure_state || return 1
-    local domain cert key existing tmp dest before='' lines
-    domain="$(get_meta '.cert_domain')"
+    local domain="${1:-}" cert key target="${2:-}" existing='' tmp='' dest='' before='' lines='' v6listen=''
+    [[ -n "$domain" ]] || domain="$(get_meta '.hy2.sni')"
+    [[ -n "$domain" ]] || domain="$(get_meta '.cert_domain')"
     cert="$(get_meta '.cert_file')"
     key="$(get_meta '.key_file')"
+    [[ -n "$target" ]] || target="$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.masquerade][0]//empty' "$CONFIG")"
     [[ -n "$domain" && -f "$cert" && -f "$key" ]] || {
-        fail 'Configure a valid certificate through menu 1 or install HY2 first.'; return 1;
+        fail '请先在菜单 1 配置有效证书，并安装 HY2。'; return 1;
     }
-    [[ "$(get_meta '.hy2_insecure')" != true ]] || {
-        fail 'Refusing TCP/443 public disguise with an untrusted self-signed certificate.'; return 1;
-    }
-    command_ok nginx || { fail 'Nginx not installed; no user website changed'; return 1; }
-    lines="$(listener_lines tcp 443)" || return 1
-    [[ -z "$lines" ]] || { fail 'TCP/443 is already in use, perhaps by REALITY, Xray or a website.'; return 1; }
-    [[ -n "$(listener_lines tcp 8080)" ]] || {
-        fail 'No HTTP website listening on 8080; not creating an empty TCP/443 decoy.'; return 1;
-    }
-    if ! nginx -t; then
-        fail 'Existing nginx -t already fails; refusing to edit any original site.'; return 1
-    fi
+    cert_valid "$domain" "$cert" "$key" || { fail 'TCP/443 回落需要有效且匹配 SNI 的证书。'; return 1; }
+    hy2_tcp443_preflight "$domain" "$(get_meta '.hy2_insecure')" "$target" || return 1
     dest="$(hy2_443_path "$domain")" || return 1
     if [[ -e "$dest" || -L "$dest" ]]; then
         head -n 1 "$dest" | grep -Fqx "$HY2_443_MARKER" || {
-            fail "Found non-owned Nginx site: $dest"; return 1;
+            fail "发现非 s.sh 所属的 Nginx 配置：$dest"; return 1;
         }
         before="$(mktemp /tmp/s-hy2-nginx.XXXXXXXX)" || return 1
-        cp -a "$dest" "$before"
+        cp -a "$dest" "$before" || { rm -f "$before"; return 1; }
     fi
+    # Nginx generally supports IPv6 sockets. Only add the IPv6 listener when
+    # the kernel exposes IPv6; otherwise the IPv4 listener remains sufficient.
+    [[ -s /proc/net/if_inet6 ]] && v6listen='    listen [::]:443 ssl;'
     tmp="$(mktemp /etc/nginx/conf.d/.s-hy2-cover.XXXXXXXX)" || return 1
+    local header_host='$host'
+    if [[ "$target" != http://127.0.0.1:8080* && "$target" != http://localhost:8080* ]]; then
+        header_host='$proxy_host'
+    fi
     cat > "$tmp" <<EOF
 $HY2_443_MARKER
-# Optional TCP camouflage for HY2-only machines; cannot coexist with Reality TCP/443.
+# HY2 TCP/443 HTTPS cover; mirrors sing-box HY2 HTTP/3 masquerade target.
+# Managed exclusively by s.sh; user-owned sites are never rewritten.
 server {
     listen 443 ssl;
+$v6listen
     server_name $domain;
     ssl_certificate $cert;
     ssl_certificate_key $key;
     location / {
-        proxy_pass http://127.0.0.1:8080;
-        proxy_set_header Host \$host;
+        proxy_pass $target;
+        proxy_ssl_server_name on;
+        proxy_set_header Host $header_host;
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-Proto https;
     }
 }
 EOF
+    chmod 644 "$tmp"
     mv -f "$tmp" "$dest"
     if ! nginx -t; then
         if [[ -n "$before" ]]; then cp -a "$before" "$dest"; else rm -f "$dest"; fi
         rm -f "$before"
-        fail 'Nginx config rejected new TCP/443 cover. New file rolled back.'; return 1
+        fail 'Nginx 拒绝新的 TCP/443 配置，已恢复原配置。'; return 1
     fi
     if command_ok systemctl; then
         if systemctl is-active --quiet nginx; then
             if ! systemctl reload nginx; then
                 if [[ -n "$before" ]]; then cp -a "$before" "$dest"; else rm -f "$dest"; fi
+                if nginx -t >/dev/null 2>&1; then systemctl reload nginx || true; fi
                 rm -f "$before"; return 1
             fi
         else
@@ -1012,23 +1295,24 @@ EOF
         fi
     fi
     if ! check_tls_endpoint 127.0.0.1 443 "$domain"; then
-        warn 'HTTPS TCP/443 did not present expected certificate; rolling back our Nginx file.'
+        warn 'TCP/443 HTTPS 证书验证失败，撤回本次 s.sh 创建/更新的网站。'
         if [[ -n "$before" ]]; then cp -a "$before" "$dest"; else rm -f "$dest"; fi
         if command_ok systemctl; then systemctl reload nginx || true; else nginx -s reload || true; fi
         rm -f "$before"; return 1
     fi
     rm -f "$before"
-    say "Optional HY2 TCP/443 HTTPS cover active. To install Reality on TCP/443, disable this cover first."
+    say "HY2 TCP/443 HTTPS 伪装已启用：$domain → $target（UDP 监听独立）"
 }
 
 disable_hy2_tcp443_site() {
-    local file='' backup=''
-    file="$(get_meta '.cert_domain')"
-    [[ -n "$file" ]] || { fail 'No recorded domain for an s.sh HY2 TCP/443 site'; return 1; }
-    file="$(hy2_443_path "$file")" || return 1
-    [[ -f "$file" ]] || { say 'No s.sh HY2 TCP/443 Nginx site is present.'; return 0; }
+    local file='' backup='' d=''
+    d="$(get_meta '.hy2.sni')"
+    [[ -n "$d" ]] || d="$(get_meta '.cert_domain')"
+    [[ -n "$d" ]] || { fail '没有记录 HY2 证书域名'; return 1; }
+    file="$(hy2_443_path "$d")" || return 1
+    [[ -f "$file" ]] || { say '未发现 s.sh 创建的 HY2 TCP/443 伪装站。'; return 0; }
     head -n 1 "$file" | grep -Fqx "$HY2_443_MARKER" || {
-        fail 'Site is not owned by s.sh; refusing to remove it.'; return 1;
+        fail '该网站不属于 s.sh，拒绝删除。'; return 1;
     }
     command_ok nginx || return 1
     backup="$(mktemp /tmp/s-hy2-cover-backup.XXXXXXXX)" || return 1
@@ -1037,24 +1321,32 @@ disable_hy2_tcp443_site() {
     if ! nginx -t; then cp -a "$backup" "$file"; rm -f "$backup"; return 1; fi
     if command_ok systemctl; then
         if systemctl is-active --quiet nginx; then
-            if ! systemctl reload nginx; then cp -a "$backup" "$file"; rm -f "$backup"; return 1; fi
+            if ! systemctl reload nginx; then
+                cp -a "$backup" "$file"; systemctl reload nginx || true; rm -f "$backup"; return 1
+            fi
         fi
     else
-        nginx -s reload || warn 'Nginx not active; site file was disabled safely.'
+        if ! nginx -s reload; then cp -a "$backup" "$file"; rm -f "$backup"; return 1; fi
     fi
     rm -f "$backup"
-    say 'Only the s.sh-owned HY2 TCP/443 camouflage Nginx file was disabled; original website untouched.'
+    say '已关闭 s.sh 专属 HY2 TCP/443 网站；UDP HY2、原 Nginx 网站和其他协议均未改动。'
 }
 
 manage_hy2_tcp443_site() {
-    printf '%s\n' 'Optional HTTPS website on TCP/443 for HY2-only deployment:' \
-        '1) Enable (needs real certificate, local HTTP/8080 and free TCP/443)' \
-        '2) Disable only this s.sh-owned Nginx site (frees TCP/443 for REALITY)' \
-        '0) Cancel'
-    local choice=''
-    ask choice 'Select [0]: ' 0 || return 1
+    local choice='' domain='' target=''
+    domain="$(get_meta '.hy2.sni')"
+    [[ -n "$domain" ]] || domain="$(get_meta '.cert_domain')"
+    target="$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.masquerade][0]//empty' "$CONFIG" 2>/dev/null || true)"
+    printf '%s\n' 'HY2 TCP/443 HTTPS 伪装/回落（与 UDP/443 独立）：' \
+        '1) 启用 / 修复（使用 HY2 当前 masquerade 目标）' \
+        '2) 关闭（仅移除 s.sh 创建的 HTTPS 配置）' \
+        '0) 返回'
+    ask choice '请选择 [0]: ' 0 || return 1
     case "$choice" in
-        1) enable_hy2_tcp443_site ;;
+        1)
+            protocol_installed hy2 || { fail 'HY2 尚未安装。'; return 1; }
+            enable_hy2_tcp443_site "$domain" "$target"
+            ;;
         2) disable_hy2_tcp443_site ;;
         *) return 0 ;;
     esac
@@ -1201,8 +1493,9 @@ show_links() {
     if [[ -z "$host" && -f /etc/sing-box/.config_cache ]]; then
         host="$(sed -n 's/^CUSTOM_IP=//p' /etc/sing-box/.config_cache | head -n 1)"
     fi
+    [[ -n "$host" ]] || host="$(get_meta '.hy2.connect_host')"
     [[ -n "$host" ]] || host="$(get_public_ip || true)"
-    if [[ -z "$host" ]]; then warn 'No public connect address. Set it in menu 1.'; return 1; fi
+    if [[ -z "$host" ]]; then warn 'No public connect address. Set it in menu 1 or HY2 menu 6.'; return 1; fi
     local authority_host="$host" label="$(get_meta '.node_name')"
     if [[ -z "$label" && -f /root/node_names.txt ]]; then
         label="$(head -n 1 /root/node_names.txt 2>/dev/null | sed 's/^-//')"
@@ -1224,6 +1517,12 @@ show_links() {
     if [[ "$only" == all || "$only" == hy2 ]]; then
         port="$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.listen_port][0]//empty' "$CONFIG")"
         if [[ -n "$port" ]]; then
+            # HY2 has its own DNS connection host, not the shared SS/REALITY IP.
+            local hy2_host hy2_authority
+            hy2_host="$(get_meta '.hy2.connect_host')"
+            [[ -n "$hy2_host" ]] || hy2_host="$host"
+            hy2_authority="$hy2_host"
+            [[ "$hy2_host" != *:* || "$hy2_host" == \[* ]] || hy2_authority="[$hy2_host]"
             password="$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.users[0].password][0]//empty' "$CONFIG")"
             sni="$(get_meta '.hy2.sni')"
             [[ -n "$sni" ]] || sni="$(get_meta '.cert_domain')"
@@ -1232,10 +1531,10 @@ show_links() {
             local hy2_insecure="$(get_meta '.hy2.insecure')"
             [[ -n "$hy2_insecure" ]] || hy2_insecure="$(get_meta '.hy2_insecure')"
             [[ "$hy2_insecure" == true ]] && query+='&insecure=1'
-            uri="hy2://$(urlenc "$password")@$authority_host:$port/?${query}#$(urlenc "hy2${label:+-$label}")"
+            uri="hy2://$(urlenc "$password")@$hy2_authority:$port/?${query}#$(urlenc "hy2${label:+-$label}")"
             printf '\n=== Hysteria2 (UDP/%s) ===\n%s\n' "$port" "$uri"
             printf '  地址/域名：%s\n  UDP 端口：%s\n  HY2 原始密码：%s\n  TLS SNI：%s\n  传输：UDP / QUIC，ALPN h3\n' \
-                "$host" "$port" "$password" "$sni"
+                "$hy2_host" "$port" "$password" "$sni"
             printf '  HTTP/3 masquerade: %s\n' "$(jq -r '[.inbounds[]|select(.tag=="hy2-in")|.masquerade][0]//""' "$CONFIG")"
             show_qr "$uri"
         fi
@@ -1378,6 +1677,10 @@ protocol_status() {
         line="$(protocol_inbound "$kind")"
         port="$(jq -r '.listen_port // empty' <<< "$line")"
         local connect_host="$(get_meta '.connect_host')"
+        if [[ "$kind" == hy2 ]]; then
+            local recorded_hy2_host="$(get_meta '.hy2.connect_host')"
+            [[ -z "$recorded_hy2_host" ]] || connect_host="$recorded_hy2_host"
+        fi
         [[ -n "$connect_host" ]] || connect_host="$(get_public_ip || true)"
         if [[ "$kind" == ss ]]; then
             printf '安装状态：已配置\n'
@@ -1396,11 +1699,19 @@ protocol_status() {
             hy2)
                 sni="$(get_meta '.hy2.sni')"
                 [[ -n "$sni" ]] || sni="$(get_meta '.cert_domain')"
+                local hy2_connect="$(get_meta '.hy2.connect_host')"
+                [[ -n "$hy2_connect" ]] || hy2_connect="$connect_host"
+                printf 'HY2 专用连接地址：%s\n' "$hy2_connect"
                 printf 'TLS 域名/SNI：%s\nHY2 密码：%s\nTLS 证书：%s\nHTTP/3 伪装：%s\n' \
                     "${sni:-未记录}" "$(jq -r '.users[0].password // empty' <<< "$line")" \
                     "$(jq -r '.tls.certificate_path // empty' <<< "$line")" \
                     "$(jq -r '.masquerade // "未设置"' <<< "$line")"
                 printf '传输说明：UDP / QUIC / TLS，ALPN h3；出站需支持 Hysteria2\n'
+                if domain_valid "$sni" && hy2_443_owned_site_exists "$sni" && check_tls_endpoint 127.0.0.1 443 "$sni"; then
+                    printf 'TCP/443 HTTPS 回落：已启用（Nginx）\n'
+                else
+                    printf 'TCP/443 HTTPS 回落：未启用 / 未通过检测（可用菜单 5 管理）\n'
+                fi
                 ;;
             reality)
                 sni="$(jq -r '.tls.server_name // empty' <<< "$line")"
@@ -1475,7 +1786,8 @@ protocol_menu() {
         ui_item 3 '重启当前协议（共用 sing-box 服务）'
         ui_item 4 '输出节点详细信息、链接与二维码（含运行状态）'
         if [[ "$kind" == hy2 ]]; then
-            ui_item 5 'HY2 TCP/443 HTTPS 伪装站（可选）'
+            ui_item 5 'HY2 TCP/443 HTTPS 伪装/回落开关'
+            ui_item 6 '设置 HY2 连接域名/IP（不重置密码）'
         fi
         ui_item 0 '返回主菜单'
         ui_rule
@@ -1493,6 +1805,7 @@ protocol_menu() {
             3) protocol_restart "$kind" || true ;;
             4) protocol_report "$kind" || true; pause_after_node_output ;;
             5) if [[ "$kind" == hy2 ]]; then manage_hy2_tcp443_site || true; else warn '无效选项。'; fi ;;
+            6) if [[ "$kind" == hy2 ]]; then change_hy2_connect_host || true; else warn '无效选项。'; fi ;;
             0|q|Q) return 0 ;;
             *) warn '无效选项。' ;;
         esac
@@ -1903,7 +2216,7 @@ common_setup_all() {
     say '[2/5] 安装或检查独立 sing-box 内核（不包含 S-UI）'
     ensure_tools && ensure_singbox && ensure_state || return 1
     if command_ok sing-box; then sing-box version | head -n 2 || true; fi
-    say '[3/5] 设置节点连接 IP / DDNS 域名'
+    say '[3/5] 设置通用节点连接 IP / DDNS（HY2 安装时可单独使用证书域名）'
     select_host || return 1
     say '[4/5] 设置客户端节点名称后缀'
     set_node_name || return 1
