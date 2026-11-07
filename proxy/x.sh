@@ -3180,6 +3180,210 @@ install_xui_pro() {
 }
 
 # -----------------------------
+#  3X-UI 配置快照：手动备份 / 选择恢复（最多保留 5 份）
+#  只操作 /etc/x-ui，不碰 nginx、网站和证书目录。
+# -----------------------------
+XUI_BACKUP_DIR='/root/x-ui-config-backups'
+XUI_BACKUP_KEEP=5
+
+xui_backup_init() {
+    mkdir -p "$XUI_BACKUP_DIR" || return 1
+    chmod 700 "$XUI_BACKUP_DIR" || return 1
+}
+
+xui_backup_list() {
+    # 仅识别此功能生成的、以时间戳命名的备份
+    find "$XUI_BACKUP_DIR" -maxdepth 1 -type f \
+      -name 'xui-config-????????_??????*.tar.gz' -printf '%f\n' 2>/dev/null | LC_ALL=C sort -r
+}
+
+xui_backup_rotate() {
+    local idx=0 name
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        idx=$((idx + 1))
+        if ((idx > XUI_BACKUP_KEEP)); then
+            rm -f -- "$XUI_BACKUP_DIR/$name" || return 1
+        fi
+    done < <(xui_backup_list)
+}
+
+xui_backup_now() {
+    local stage archive stamp db_check
+    if [[ ! -s "$XUIDB" ]]; then
+        msg_err "找不到正在使用的 3X-UI 数据库：$XUIDB"
+        return 1
+    fi
+    command -v sqlite3 >/dev/null 2>&1 || { msg_err '缺少 sqlite3，无法执行安全快照。'; return 1; }
+    command -v tar >/dev/null 2>&1 || { msg_err '缺少 tar。'; return 1; }
+    xui_backup_init || return 1
+    stage="$(mktemp -d "$XUI_BACKUP_DIR/.build.XXXXXXXX")" || return 1
+    mkdir -p "$stage/x-ui"
+    # 拷贝数据库以外的面板配置，数据库使用 SQLite online backup 避免 WAL 不一致。
+    if ! cp -a /etc/x-ui/. "$stage/x-ui/"; then
+        msg_err '复制面板配置失败。'
+        rm -rf -- "$stage"; return 1
+    fi
+    rm -f -- "$stage/x-ui/x-ui.db" "$stage/x-ui/x-ui.db-wal" "$stage/x-ui/x-ui.db-shm" "$stage/x-ui/x-ui.db-journal"
+    if ! sqlite3 -cmd '.timeout 10000' "$XUIDB" ".backup '$stage/x-ui/x-ui.db'"; then
+        msg_err 'SQLite 一致性快照失败。'
+        rm -rf -- "$stage"; return 1
+    fi
+    db_check="$(sqlite3 "$stage/x-ui/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null || true)"
+    if [[ "$db_check" != 'ok' ]]; then
+        msg_err "数据库完整性校验失败：${db_check:-未知错误}"
+        rm -rf -- "$stage"; return 1
+    fi
+    if ! sqlite3 "$stage/x-ui/x-ui.db" \
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbounds';" | grep -qx 1; then
+        msg_err '快照缺少 inbounds 表，已取消。'
+        rm -rf -- "$stage"; return 1
+    fi
+    printf 'backup_time=%s\ndatabase=%s\n' "$(date '+%Y-%m-%d %H:%M:%S %z')" "$XUIDB" > "$stage/manifest.txt"
+    chmod 600 "$stage/x-ui/x-ui.db"
+    stamp="$(date '+%Y%m%d_%H%M%S')"
+    archive="$XUI_BACKUP_DIR/xui-config-${stamp}.tar.gz"
+    if [[ -e "$archive" ]]; then
+        archive="$XUI_BACKUP_DIR/xui-config-${stamp}_$$.tar.gz"
+    fi
+    if ! tar -czf "$stage/archive.tar.gz" -C "$stage" x-ui manifest.txt \
+        || ! tar -tzf "$stage/archive.tar.gz" >/dev/null; then
+        msg_err '创建或校验压缩包失败。'
+        rm -rf -- "$stage"; return 1
+    fi
+    if ! mv -- "$stage/archive.tar.gz" "$archive"; then
+        msg_err '保存备份文件失败。'
+        rm -rf -- "$stage"; return 1
+    fi
+    chmod 600 "$archive"
+    rm -rf -- "$stage"
+    xui_backup_rotate || msg_err '旧备份轮转失败，请手动检查目录。'
+    msg_ok "3X-UI 配置备份成功：$archive"
+    msg_inf '包括：节点/用户/UUID/密钥、累计流量、到期时间、面板配置等数据库数据及 /etc/x-ui 配置。'
+    msg_inf '不包含：Nginx 网站文件、证书私钥、3X-UI/Xray 程序二进制文件。'
+}
+
+xui_restore_now() {
+    local -a choices=()
+    local name i=0 choice selected stage db_check confirm olddir newdir had_old=n
+    xui_backup_init || return 1
+    while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        choices+=("$name")
+    done < <(xui_backup_list)
+    if ((${#choices[@]} == 0)); then
+        msg_err "没有可恢复的备份文件：$XUI_BACKUP_DIR"
+        return 1
+    fi
+    echo '-------------- 可恢复的 3X-UI 配置备份（最新优先）--------------'
+    for name in "${choices[@]}"; do
+        i=$((i + 1))
+        printf ' %d) %s\n' "$i" "$name"
+    done
+    echo ' 0) 取消恢复'
+    read -rp "请选择备份序号 [0-${#choices[@]}]: " choice || return 1
+    [[ "$choice" =~ ^[0-9]+$ ]] || { msg_err '序号无效'; return 1; }
+    ((10#$choice == 0)) && return 0
+    ((10#$choice >= 1 && 10#$choice <= ${#choices[@]})) || { msg_err '序号超出范围'; return 1; }
+    selected="$XUI_BACKUP_DIR/${choices[10#$choice-1]}"
+    [[ -f "$selected" && ! -L "$selected" ]] || { msg_err '备份不存在或不是普通文件'; return 1; }
+    if [[ ! -x /usr/local/x-ui/x-ui && ! -x /usr/bin/x-ui ]]; then
+        msg_err '未检测到已安装的 3X-UI。请先安装兼容版本的面板，再恢复配置（不要用安装菜单重建节点）。'
+        return 1
+    fi
+    command -v sqlite3 >/dev/null 2>&1 || { msg_err '缺少 sqlite3'; return 1; }
+    stage="$(mktemp -d /etc/.xui-restore.XXXXXXXX)" || return 1
+    chmod 700 "$stage"
+    if ! tar -tzf "$selected" >/dev/null 2>&1; then
+        msg_err '备份压缩包损坏。'; rm -rf -- "$stage"; return 1
+    fi
+    # 防止意外把档案中的其它绝对/相对路径写入服务器。
+    if tar -tzf "$selected" | awk '
+        ($0 != "manifest.txt" && $0 != "x-ui" && $0 !~ /^x-ui\//) ||
+        $0 ~ /^\// || $0 ~ /(^|\/)\.\.(\/|$)/ { bad=1 }
+        END { exit !bad }
+    '; then
+        msg_err '备份包含异常路径，拒绝恢复。'; rm -rf -- "$stage"; return 1
+    fi
+    if ! tar -xzf "$selected" -C "$stage" || [[ ! -s "$stage/x-ui/x-ui.db" ]]; then
+        msg_err '解压失败或备份中缺少数据库。'; rm -rf -- "$stage"; return 1
+    fi
+    db_check="$(sqlite3 "$stage/x-ui/x-ui.db" 'PRAGMA integrity_check;' 2>/dev/null || true)"
+    if [[ "$db_check" != 'ok' ]] || ! sqlite3 "$stage/x-ui/x-ui.db" \
+      "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbounds';" 2>/dev/null | grep -qx 1; then
+        msg_err '备份数据库校验失败，未修改现有配置。'
+        rm -rf -- "$stage"; return 1
+    fi
+    echo "已选择：$selected"
+    msg_inf '恢复将覆盖当前 /etc/x-ui 配置，恢复节点、用户、流量、到期时间、面板设置。'
+    msg_inf '不修改 Nginx、伪装站、证书或 Xray 内核；面板/Xray 必须与备份数据兼容。'
+    read -rp '确认覆盖当前 3X-UI 配置？请输入 RESTORE：' confirm || { rm -rf -- "$stage"; return 1; }
+    if [[ "$confirm" != 'RESTORE' ]]; then
+        msg_inf '已取消恢复，未修改现有配置。'
+        rm -rf -- "$stage"; return 0
+    fi
+    # 抢救当前状态：若自动备份失败则绝不覆盖。
+    if [[ -s "$XUIDB" ]]; then
+        if ! xui_backup_now; then
+            msg_err '恢复前自动保护备份失败，取消恢复。'
+            rm -rf -- "$stage"; return 1
+        fi
+    fi
+    if ! systemctl stop x-ui; then
+        msg_err '无法停止 3X-UI，取消恢复。'
+        rm -rf -- "$stage"; return 1
+    fi
+    olddir="$stage/old-x-ui"
+    if [[ -e /etc/x-ui ]]; then
+        if ! mv -- /etc/x-ui "$olddir"; then
+            msg_err '无法保存当前配置目录，尝试重新启动服务。'
+            systemctl start x-ui 2>/dev/null || true
+            rm -rf -- "$stage"; return 1
+        fi
+        had_old=y
+    fi
+    if ! mv -- "$stage/x-ui" /etc/x-ui; then
+        msg_err '写入恢复配置失败，正在回滚。'
+        [[ "$had_old" == y ]] && mv -- "$olddir" /etc/x-ui || true
+        systemctl start x-ui 2>/dev/null || true
+        rm -rf -- "$stage"; return 1
+    fi
+    rm -f -- /etc/x-ui/x-ui.db-wal /etc/x-ui/x-ui.db-shm /etc/x-ui/x-ui.db-journal
+    if ! systemctl start x-ui || ! systemctl is-active --quiet x-ui; then
+        msg_err '3X-UI 启动失败，正在恢复先前配置。'
+        systemctl stop x-ui 2>/dev/null || true
+        rm -rf -- /etc/x-ui
+        [[ "$had_old" == y ]] && mv -- "$olddir" /etc/x-ui || true
+        systemctl start x-ui 2>/dev/null || true
+        rm -rf -- "$stage"
+        return 1
+    fi
+    rm -rf -- "$stage"
+    msg_ok "配置恢复完成：${selected##*/}"
+    msg_inf '请核对面板、节点连接与 Xray 日志；正常启动不代表所有协议都兼容当前内核。'
+    msg_inf 'Nginx 和已有伪装站未修改。'
+}
+
+xui_backup_restore_menu() {
+    local choice
+    while true; do
+        echo
+        echo '========== 3X-UI 配置备份 / 重建 =========='
+        echo "备份目录：$XUI_BACKUP_DIR（最新 $XUI_BACKUP_KEEP 份）"
+        echo '1) 手动备份当前完整配置'
+        echo '2) 从时间戳备份恢复配置（显示备份列表）'
+        echo '0) 返回主菜单'
+        read -rp '请选择 [0-2]: ' choice || return 0
+        case "$choice" in
+            1) xui_backup_now || true; pause ;;
+            2) xui_restore_now || true; pause ;;
+            0) return 0 ;;
+            *) msg_err '无效选项' ;;
+        esac
+    done
+}
+
+# -----------------------------
 #  主菜单
 # -----------------------------
 menu() {
@@ -3207,11 +3411,12 @@ menu() {
         echo -e " ${yellow}${bold}9)${none} ${yellow}IP质量检测${none}"
         echo -e " ${yellow}${bold}10)${none} ${yellow}系统查询${none}"
 		echo -e " ${green}${bold}11)${none} ${green}更新域名/SNI${none}"   # 新增行
+        echo -e " ${green}${bold}12)${none} ${green}备份 / 重建 3X-UI 配置（最新 5 份）${none}"
         echo -e " ${red}${bold}0)${none} 退出"
 
         echo -e "${gray}--------------------------------------------------${none}"
         echo -e "${dim}${gray}提示：输入数字后回车${none}"
-        echo -ne "${green}${bold}请选择 [0-11]${none}${green}: ${none}"
+        echo -ne "${green}${bold}请选择 [0-12]${none}${green}: ${none}"
 
         local choice=""
 
@@ -3229,6 +3434,7 @@ menu() {
             9) ip_quality_check ;;
             10) system_query ;;
             11) update_domain_sni ;;
+            12) xui_backup_restore_menu ;;
             0) exit 0 ;;
             *) msg_err "无效输入，请重新选择。"; pause ;;
         esac
