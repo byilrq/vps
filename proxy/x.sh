@@ -1271,7 +1271,7 @@ xray_updata() {
     xray_install_selected_core || return 1
     if [[ -n "$(xray_auto_cron_listing)" ]]; then
         echo -e "${yellow}[WARN] 检测到仍在生效的 Xray 定时更新任务，未来可能覆盖本次手动选择的内核。${none}"
-        echo '若需固定当前版本，请使用菜单 3 → 2（版本更新）→ 3 取消定时任务。'
+        echo '如需固定当前版本，请进入 3 → 2 → 3 取消自动更新。'
     else
         msg_inf '本次手动更新没有创建定时任务。'
     fi
@@ -1368,11 +1368,11 @@ xray_core_version_menu() {
     local choice=''
     while true; do
         echo
-        echo -e "${cyan}========== 内核版本更新 ==========${none}"
-        echo '1) 手动升级/回退 Xray-core（v26.6 系列最新 / latest 最新版）'
-        echo '2) 设置定时自动更新（默认关闭，需确认风险）'
-        echo '3) 查看 / 取消定时自动更新'
-        echo '0) 返回 Xray 内核管理'
+        echo -e "${cyan}========== 版本更新 ==========${none}"
+        echo '1) 手动更新/回退'
+        echo '2) 设置自动更新'
+        echo '3) 查看/取消自动更新'
+        echo '0) 返回'
         echo -e "${yellow}[WARN] 自动更新后可能导致 NekoBox 等客户端代理协议失效。${none}"
         read_tty_edit '请选择 [0-3]: ' choice || return 0
         case "$choice" in
@@ -2044,11 +2044,11 @@ setup_cronjob() {
     fi
 
     echo
-    msg_inf 'Xray-core 自动更新默认关闭；如需开启，请进入菜单 3 → 2（版本更新）→ 2。'
+    msg_inf '内核自动更新默认关闭；需要时进入 3 → 2 → 2 开启。'
     if [[ -n "$(xray_auto_cron_listing)" ]]; then
         echo -e "${yellow}[WARN] 检测到先前的 Xray 自动更新任务，会覆盖本次选定的 ${XRAY_REQUESTED_CORE_VERSION:-v26.6.27}。${none}"
         echo '为保留本次安装的兼容内核，安装流程将关闭旧 Xray 内核定时更新任务。'
-        xray_clear_managed_cron || msg_err '未能清理旧定时任务，请进入菜单 3 → 2（版本更新）→ 3 检查。'
+        xray_clear_managed_cron || msg_err '旧任务清理失败，请进入 3 → 2 → 3 检查。'
     fi
 }
 
@@ -2154,11 +2154,11 @@ setup_ufw() {
   while true; do
     clear
     echo "---------------- 防火墙设置 (ufw) ----------------"
-    echo " 1) 开启防火墙并设置放行端口（默认放行 SSH/80/443/8443/2053）"
+    echo " 1) 开启防火墙（默认端口）"
     echo " 2) 关闭防火墙"
-    echo " 3) 查看当前防火墙状态/规则（并检查监听）"
-    echo " 4) 清除除 SSH 以外的所有放行规则"
-    echo " 0) 返回上级菜单"
+    echo " 3) 查看规则"
+    echo " 4) 清空规则（保留 SSH）"
+    echo " 0) 返回"
     echo "-------------------------------------------------"
     read -rp " 请选择 [0-4]: " ans
 
@@ -3386,11 +3386,11 @@ xui_backup_restore_menu() {
     local choice
     while true; do
         echo
-        echo '========== 3X-UI 配置备份 / 重建 =========='
-        echo "备份目录：$XUI_BACKUP_DIR（最新 $XUI_BACKUP_KEEP 份）"
-        echo '1) 手动备份当前完整配置'
-        echo '2) 从时间戳备份恢复配置（显示备份列表）'
-        echo '0) 返回主菜单'
+        echo '========== 配置备份/恢复 =========='
+        echo "备份目录：$XUI_BACKUP_DIR（保留 $XUI_BACKUP_KEEP 份）"
+        echo '1) 立即备份'
+        echo '2) 选择恢复'
+        echo '0) 返回'
         read_tty_edit '请选择 [0-2]: ' choice || return 0
         case "$choice" in
             1) xui_backup_now || true; pause ;;
@@ -3482,11 +3482,11 @@ TimeoutStartSec=30
 XUI_XRAY_SERVICE_EOF
     cat > "$XUI_XRAY_GUARD_TIMER" <<'XUI_XRAY_TIMER_EOF'
 [Unit]
-Description=Check Xray Reality health every minute
+Description=Check Xray Reality health every three minutes
 
 [Timer]
-OnBootSec=120s
-OnUnitActiveSec=60s
+OnActiveSec=180s
+OnUnitActiveSec=180s
 AccuracySec=5s
 Unit=xui-xray-watchdog.service
 
@@ -3502,48 +3502,69 @@ XUI_XRAY_TIMER_EOF
         return 1
     fi
     if ! systemctl enable --now xui-xray-watchdog.timer; then
-        msg_err '无法启用 Xray 健康检查定时器。'
+        msg_err '无法启用内核自动恢复。'
         return 1
     fi
-    msg_ok '已开启：3X-UI 开机启动 + 每分钟检查 Xray 443，异常时仅重载内核。'
-    msg_inf '最多连续尝试 3 次；持续故障后冷却 15 分钟，防止重启循环。'
-    msg_inf '注意：开启后，面板内手动停止 Xray 也会被判定为异常并自动恢复。'
-}
-
-xui_xray_guard_disable() {
-    if systemctl list-unit-files xui-xray-watchdog.timer --no-legend 2>/dev/null | grep -q '^xui-xray-watchdog.timer'; then
-        systemctl disable --now xui-xray-watchdog.timer || return 1
+    # 已有旧版定时器在运行时，enable --now 不会重算间隔；显式重启应用 180 秒。
+    if ! systemctl restart xui-xray-watchdog.timer; then
+        msg_err '未能应用新的 3 分钟检测间隔。'
+        return 1
     fi
-    msg_ok '已关闭 Xray 异常自动恢复检查。'
-    msg_inf 'x-ui.service 的原有开机启动状态保持不变，不影响面板登录。'
+    # 旧版的失败计数不能影响用户重新启用后的第一次检查。
+    rm -f /run/xui-xray-watchdog/failures /run/xui-xray-watchdog/last_attempt 2>/dev/null || true
+    msg_ok '已开启自启：开机启动，每 3 分钟检查一次内核，异常时自动恢复。'
+    msg_inf '连续恢复失败 3 次后冷却 15 分钟。'
+    msg_inf '提示：在面板中手动停止内核后，定时检查也会将其重新拉起。'
+    if ! systemctl is-active --quiet x-ui.service; then
+        msg_inf '当前面板未运行，本次仅设置开机自启；如需立即运行，请手动启动面板。'
+    fi
 }
 
-xui_xray_autostart_menu() {
-    local choice=''
-    while true; do
-        echo
-        echo '========== 内核自启动 =========='
-        if systemctl is-enabled --quiet x-ui.service 2>/dev/null; then
-            echo '3X-UI 开机自启：已开启'
-        else
-            echo '3X-UI 开机自启：未开启'
+# 取消自启同时关闭面板的开机启动和内核自动恢复；不停止当前运行的代理。
+xui_xray_guard_disable() {
+    local answer=''
+    echo '将关闭面板开机自启及内核自动恢复，当前代理连接不会中断。'
+    read_tty_edit '确认取消自启？[y/N]: ' answer || return 1
+    if [[ ! "$answer" =~ ^[Yy]$ ]]; then
+        msg_inf '已取消操作。'
+        return 0
+    fi
+    if systemctl list-unit-files xui-xray-watchdog.timer --no-legend 2>/dev/null | grep -q '^xui-xray-watchdog.timer'; then
+        if ! systemctl disable --now xui-xray-watchdog.timer; then
+            msg_err '关闭内核自动恢复失败。'
+            return 1
         fi
-        if systemctl is-enabled --quiet xui-xray-watchdog.timer 2>/dev/null; then
-            echo 'Xray 异常自动恢复：已开启（每分钟检测 443）'
-        else
-            echo 'Xray 异常自动恢复：已关闭'
+    fi
+    if systemctl cat x-ui.service >/dev/null 2>&1; then
+        if ! systemctl disable x-ui.service; then
+            msg_err '关闭面板开机自启失败。'
+            return 1
         fi
-        echo '1) 开启内核自启动（开机自启 + 异常自动恢复）'
-        echo '2) 关闭内核异常自动恢复（保留面板开机自启）'
-        echo '0) 返回'
-        read_tty_edit '请选择 [0-2]: ' choice || return 0
-        case "$choice" in
-            1) xui_xray_guard_install || true; pause ;;
-            2) xui_xray_guard_disable || true; pause ;;
-            0) return 0 ;;
-            *) msg_err '无效输入。' ;;
-        esac
-    done
+    fi
+    msg_ok '已取消自启和异常恢复；现有面板、代理服务保持运行。'
+    msg_inf '下次开机不会自动启动 x-ui；如需恢复，请使用“开启自启”。'
+}
+
+# 简洁显示 3X-UI 服务自启和 Xray 自动恢复的当前状态。
+xui_xray_boot_status() {
+    if systemctl is-enabled --quiet x-ui.service 2>/dev/null; then
+        echo '开机自启：已开启'
+    else
+        echo '开机自启：已关闭'
+    fi
+    if systemctl is-enabled --quiet xui-xray-watchdog.timer 2>/dev/null; then
+        if systemctl is-active --quiet xui-xray-watchdog.timer 2>/dev/null; then
+            if systemctl cat xui-xray-watchdog.timer 2>/dev/null | grep -Eq '^OnUnitActiveSec=180s$'; then
+                echo '异常恢复：已开启（每 3 分钟）'
+            else
+                echo '异常恢复：已开启（旧配置，重新开启可设为 3 分钟）'
+            fi
+        else
+            echo '异常恢复：已启用但未运行'
+        fi
+    else
+        echo '异常恢复：已关闭'
+    fi
 }
 
 xui_xray_restart_core() {
@@ -3560,24 +3581,21 @@ xui_xray_restart_core() {
     if ss -H -ltnp '( sport = :443 )' 2>/dev/null | grep -Eq 'users:\(\("xray[^"]*",pid=[0-9]+'; then
         msg_ok 'Xray 已重新启动，Reality TCP/443 已由 Xray 监听。'
     else
-        msg_err '已执行 reload，但未检测到 Xray 监听 443；请进入 Check Status 或 Logs Management 排查。'
+        msg_err '内核重启后未监听 443；请查看状态和日志。'
         return 1
     fi
 }
 
 xui_xray_check_status() {
-    local bin='' ver='' boot_state='' guard_state=''
+    local bin='' ver=''
     echo
     echo '========== Xray / 3X-UI 状态 =========='
     if systemctl is-active --quiet x-ui.service; then
-        msg_ok '面板服务：running'
+        msg_ok '面板服务：运行中'
     else
-        msg_err '面板服务：not running'
+        msg_err '面板服务：已停止'
     fi
-    boot_state="$(systemctl is-enabled x-ui.service 2>/dev/null)" || true
-    guard_state="$(systemctl is-enabled xui-xray-watchdog.timer 2>/dev/null)" || true
-    echo "面板开机启动：${boot_state:-unknown}"
-    echo "异常自动恢复：${guard_state:-disabled}"
+    xui_xray_boot_status
     bin="$(xray_panel_core_path 2>/dev/null || true)"
     if [[ -n "$bin" && -x "$bin" ]]; then
         ver="$(xray_core_installed_version "$bin" 2>/dev/null || true)"
@@ -3597,12 +3615,12 @@ xui_xray_logs_menu() {
     local choice=''
     while true; do
         echo
-        echo '========== Logs Management =========='
-        echo '1) 最近 100 条面板 / Xray 日志'
-        echo '2) 最近 24 小时错误和警告'
-        echo '3) 实时日志（Ctrl+C 返回）'
-        echo '4) 最近 100 条内核自动恢复日志'
-        echo '5) 系统 OOM / 内核崩溃记录（最近 24 小时）'
+        echo '========== 日志管理 =========='
+        echo '1) 最新日志'
+        echo '2) 错误日志'
+        echo '3) 实时日志'
+        echo '4) 恢复日志'
+        echo '5) 系统异常'
         echo '0) 返回'
         read_tty_edit '请选择 [0-5]: ' choice || return 0
         case "$choice" in
@@ -3629,18 +3647,21 @@ xui_xray_runtime_menu() {
     local choice=''
     while true; do
         echo
-        echo -e "${cyan}========== 内核运行维护 ==========${none}"
-        echo '1) 内核自启动（开机自启 / 异常自动恢复）'
-        echo '2) Restart Xray（仅重启核心）'
-        echo '3) Check Status（进程 / 端口 / 运行状态）'
-        echo '4) Logs Management（错误 / 实时 / 自动恢复日志）'
-        echo '0) 返回 Xray 内核管理'
-        read_tty_edit '请选择 [0-4]: ' choice || return 0
+        echo -e "${cyan}========== 内核维护 ==========${none}"
+        xui_xray_boot_status
+        echo '1) 开启自启'
+        echo '2) 取消自启'
+        echo '3) 重启内核'
+        echo '4) 查看状态'
+        echo '5) 日志管理'
+        echo '0) 返回'
+        read_tty_edit '请选择 [0-5]: ' choice || return 0
         case "$choice" in
-            1) xui_xray_autostart_menu ;;
-            2) xui_xray_restart_core || true; pause ;;
-            3) xui_xray_check_status || true; pause ;;
-            4) xui_xray_logs_menu ;;
+            1) xui_xray_guard_install || true; pause ;;
+            2) xui_xray_guard_disable || true; pause ;;
+            3) xui_xray_restart_core || true; pause ;;
+            4) xui_xray_check_status || true; pause ;;
+            5) xui_xray_logs_menu ;;
             0) return 0 ;;
             *) msg_err '无效输入。' ;;
         esac
@@ -3655,10 +3676,10 @@ xray_core_menu() {
     local choice=''
     while true; do
         echo
-        echo -e "${cyan}========== Xray 内核管理 ==========${none}"
-        echo '1) 内核运行维护（自启动 / 重启 / 状态 / 日志）'
-        echo '2) 内核版本更新（手动升级 / 定时更新 / 取消任务）'
-        echo '0) 返回主菜单'
+        echo -e "${cyan}========== 内核管理 ==========${none}"
+        echo '1) 运行维护'
+        echo '2) 版本更新'
+        echo '0) 返回'
         read_tty_edit '请选择 [0-2]: ' choice || return 0
         case "$choice" in
             1) xui_xray_runtime_menu ;;
@@ -3688,16 +3709,16 @@ menu() {
         echo -e " ${blue}${bold}1)${none} ${blue}安装${none}"
         echo -e " ${red}${bold}2)${none} ${red}卸载${none}"
         echo -e "${gray}--------------------------------------------------${none}"
-        echo -e " ${yellow}${bold}3)${none} ${yellow}Xray 内核管理（运行维护 / 版本更新）${none}"
-        echo -e " ${yellow}${bold}4)${none} ${yellow}查看状态${none}"
-        echo -e " ${yellow}${bold}5)${none} ${yellow}打印节点信息${none}"
-        echo -e " ${yellow}${bold}6)${none} ${yellow}目标网站检测${none}"
-        echo -e " ${yellow}${bold}7)${none} ${yellow}系统参数配置${none}"
-        echo -e " ${yellow}${bold}8)${none} ${yellow}回程路由测试${none}"
-        echo -e " ${yellow}${bold}9)${none} ${yellow}IP质量检测${none}"
-        echo -e " ${yellow}${bold}10)${none} ${yellow}系统查询${none}"
+        echo -e " ${yellow}${bold}3)${none} ${yellow}内核管理${none}"
+        echo -e " ${yellow}${bold}4)${none} ${yellow}服务状态${none}"
+        echo -e " ${yellow}${bold}5)${none} ${yellow}节点信息${none}"
+        echo -e " ${yellow}${bold}6)${none} ${yellow}站点检测${none}"
+        echo -e " ${yellow}${bold}7)${none} ${yellow}系统设置${none}"
+        echo -e " ${yellow}${bold}8)${none} ${yellow}回程测试${none}"
+        echo -e " ${yellow}${bold}9)${none} ${yellow}IP 检测${none}"
+        echo -e " ${yellow}${bold}10)${none} ${yellow}系统信息${none}"
 		echo -e " ${green}${bold}11)${none} ${green}更新域名/SNI${none}"   # 新增行
-        echo -e " ${green}${bold}12)${none} ${green}备份 / 重建 3X-UI 配置（最新 5 份）${none}"
+        echo -e " ${green}${bold}12)${none} ${green}配置备份/恢复${none}"
         echo -e " ${red}${bold}0)${none} 退出"
 
         echo -e "${gray}--------------------------------------------------${none}"
